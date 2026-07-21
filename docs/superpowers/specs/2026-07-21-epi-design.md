@@ -221,37 +221,28 @@ Every later record is a level-one Org headline appended at end of file:
 :EPI_RECORD_SHA256: 3fe5...
 :END:
 #+begin_epi-json
-{
-  "at": "2026-07-21T18:43:02-07:00",
-  "id": "6615e449-...",
-  "parent": "b328db4d-...",
-  "previous_hash": "7b91...",
-  "schema": 1,
-  "turn": "4dfd2fe1-...",
-  "type": "message",
-  "payload": {
-    "role": "user",
-    "content": [
-      {
-        "type": "text",
-        "text": "Implement the approved change."
-      }
-    ]
-  }
-}
+{"at":"2026-07-21T18:43:02-07:00","id":"6615e449-...","parent":"b328db4d-...","payload":{"content":[{"text":"Implement the approved change.","type":"text"}],"role":"user"},"previous_hash":"7b91...","schema":1,"turn":"4dfd2fe1-...","type":"message"}
 #+end_epi-json
 ~~~
 
 The JSON block carries the complete typed record envelope. The property drawer
 duplicates fields needed for Org indexing and inspection, and loading rejects
-any disagreement. JSON string escaping prevents message text from being
-interpreted as Org structure. EPI_RECORD_SHA256 covers the envelope serialized
-with the JSON Canonicalization Scheme (RFC 8785); EPI_PREV_SHA256 covers the
-preceding record hash, with a canonical header hash serving as the chain root.
-The chain detects altered metadata, interior deletion, and reordering as well
-as payload modification. After a fresh restart, deletion of a complete valid
-suffix is indistinguishable from an earlier valid head unless an external
-trusted witness exists; Epi does not claim adversarial rollback detection.
+any disagreement. Its body is exactly one line of UTF-8 JSON Canonicalization
+Scheme (RFC 8785) output, with no BOM or surrounding whitespace. JSON string
+escaping prevents message text from being interpreted as Org structure.
+EPI_RECORD_SHA256 covers the exact stored UTF-8 bytes of that canonical JSON
+line, excluding the Org block delimiters and line terminator; the append path
+canonicalizes once, while cold validation hashes the stored byte range without
+parsing and reserializing it. EPI_PREV_SHA256 covers the preceding record hash,
+with a canonical header hash serving as the chain root. Every append, import,
+and migration passes through the same canonical writer. A dedicated Epi
+canonicalizer validates I-JSON, orders object member names by UTF-16 code units,
+and implements ECMAScript number serialization; output from json-serialize is
+not assumed to be JCS. The chain detects altered metadata, interior deletion,
+and reordering as well as payload modification. After a fresh restart, deletion
+of a complete valid suffix is indistinguishable from an earlier valid head
+unless an external trusted witness exists; Epi does not claim adversarial
+rollback detection.
 
 Physical Org nesting does not encode branches. All records remain at level
 one so that a new child of an old node can still be appended at end of file.
@@ -268,8 +259,8 @@ The schema contains the following families:
 | Configuration | model-change, thinking-change, active-tools-change, resource-change, session-config | No; reduced according to declared branch or session scope |
 | Checkpoint | compaction, branch-summary | Yes, through projection rules |
 | Queue | queue-enqueued, queue-consumed, queue-cleared | No until delivery creates context |
-| Operation | operation-started, operation-finished, operation-interrupted | No |
-| Turn | turn-started, turn-finished, turn-failed, turn-cancelled | No |
+| Operation | operation-started, operation-finished, operation-failed, operation-cancelled, operation-interrupted | No |
+| Turn | turn-started, turn-finished, turn-failed, turn-cancelled, turn-interrupted | No |
 | Tool | tool-planned, tool-approved, tool-denied, tool-started, tool-checkpoint, tool-finished | Tool calls and results project through their associated messages |
 | Retry | retry-scheduled, retry-started, retry-finished | No |
 | Extension | custom, extension-write-enqueued, extension-write-applied, extension-write-failed | No unless an explicit projector converts it |
@@ -290,6 +281,10 @@ order. Structural and operational records carry a target ID, operation ID,
 turn ID, or cause ID as appropriate. An explicit leaf record changes the
 selection without rewriting history.
 
+turn-started carries intended-message and intended-queue-item IDs as typed
+payload fields. These are forward intents, not parent or target edges, and may
+name records that are not present yet or never arrive after a crash.
+
 ### 4.3 Ledger invariants
 
 The store enforces these invariants:
@@ -297,7 +292,10 @@ The store enforces these invariants:
 1. The header precedes every record and has a supported format version.
 2. Record IDs are unique.
 3. A parent or target refers only to an earlier valid record, except where a
-   typed record explicitly permits an external session reference.
+   typed record explicitly permits an external session reference. Only payload
+   fields declared by the schema as forward intents may name later or absent
+   records; format version one permits this for turn-started's intended-message
+   and intended-queue-item IDs.
 4. Physical record order never changes.
 5. Existing properties and payloads are never edited or removed.
 6. Labels, names, configuration, corrections, and leaf selection are later
@@ -473,6 +471,13 @@ pinned pause/resume shim specified in Section 6.3. Until that shim or an
 equivalent stable upstream API passes its contract suite, the adapter freezes
 one snapshot for the complete GPTel request loop and disables those features.
 
+Independently of that shim, each provider leg has a finite progress deadline.
+If GPTel becomes nonterminal without producing a documented callback or other
+contracted progress before the deadline, the adapter invalidates the operation
+generation, aborts the hidden request buffer through public gptel-abort, and
+fails the turn. A watchdog can stop a stalled leg; it can never authorize a
+tool or continue to another provider leg.
+
 ### 5.4 Settlement
 
 Message completion and agent settlement are distinct. A completed assistant
@@ -546,13 +551,24 @@ signal carries a monotonic volatile sequence but has no replay or durability
 guarantee. Should Emacs stop in the middle of a stream, recovery observes an
 unfinished turn and marks it interrupted.
 
+At every tool callback and leg boundary, the adapter reconciles the raw
+provider proposals with the complete tool registry in the turn snapshot. An
+undeclared name never reaches an Epi executor or authorization path. The pinned
+GPTel snapshot may synthesize an unavailable-tool result before Epi receives a
+tool-call callback; that behavior is accepted only while contract tests prove
+that undeclared-only and mixed declared/undeclared responses both settle. If a
+proposal cannot be reconciled or GPTel makes no observable progress, the leg
+watchdog fails the turn and aborts it rather than waiting indefinitely.
+
 Every transition that can permit a tool side effect or another provider leg
 has a commit barrier. The adapter does not rely on callback exceptions,
 because GPTel may demote them and continue. If ledger persistence fails, the
-adapter invalidates the operation generation and drives the pinned FSM shim to
-error or abort before any continuation. If the ledger itself cannot record
-that failure, Epi stops the session and reports an out-of-ledger diagnostic;
-it never advances the model loop.
+adapter invalidates the operation generation and withholds every wrapped
+tool-result continuation. Before the pause/resume shim is enabled, it aborts
+the hidden request through public gptel-abort and rejects every late callback;
+after the shim is enabled, it may additionally drive that shim to error or
+abort. If the ledger itself cannot record the failure, Epi stops the session
+and reports an out-of-ledger diagnostic; it never advances the model loop.
 
 ### 6.3 Typed history and save-point seam
 
@@ -565,15 +581,16 @@ individual prompt, response, and tool entries; it cannot by itself reproduce
 all reasoning history or original parallel grouping.
 
 The current GPTel snapshot also advances immediately from tool results to its
-next provider request. Exact steering, a commit barrier, and configuration
+next provider request. Exact steering, save-point pausing, and configuration
 refresh therefore require a pause/resume FSM seam rather than the stock
-callback alone.
+callback alone. The baseline commit barrier does not: it withholds the guarded
+continuation and aborts through public gptel-abort as specified above.
 
 The design therefore adopts five rules:
 
 1. All typed-history and FSM handling remains in epi-gptel.el.
-2. The target explicitly depends on a pinned, tested pause/resume FSM shim
-   until GPTel supplies an equivalent stable API.
+2. Save-point continuation capabilities explicitly depend on a pinned, tested
+   pause/resume FSM shim until GPTel supplies an equivalent stable API.
 3. The tested GPTel revision and enabled capability matrix are recorded in
    compatibility diagnostics.
 4. Contract tests cover text, supported reasoning and media, duplicate
@@ -634,8 +651,10 @@ Cancellation proceeds as follows:
 3. Abort the active Curl request through GPTel when one exists.
 4. Reject or ignore late callbacks from the cancelled generation.
 5. Preserve pending writes and next-turn context according to policy.
-6. Append exactly one terminal record for each affected entity: a terminal
-   turn record followed by a terminal operation record.
+6. Append exactly one terminal record for each affected entity. Ordinary
+   cancellation appends turn-cancelled followed by operation-cancelled. An
+   outcome that cannot be classified as cancelled uses the matching failed or
+   interrupted record type once determined; it never reuses a cancelled type.
 
 Synchronous Elisp cannot be safely preempted. Tools expected to block therefore
 use asynchronous processes or cooperative continuations.
@@ -660,9 +679,12 @@ allows at most one controlled replay of the failed model leg.
 On opening a ledger, Epi reduces the complete record sequence and reconciles
 unfinished work:
 
-- An unfinished provider request or turn becomes interrupted.
-- A turn-started record whose intended message is absent becomes interrupted;
-  its announced queue items remain pending because no message consumed them.
+- An unfinished provider request or turn appends turn-interrupted. If its
+  enclosing operation is also nonterminal, operation-interrupted follows it;
+  recovery never appends a second terminal record for either entity.
+- A turn-started record whose intended message is absent uses those same
+  interruption records; its announced queue items remain pending because no
+  message consumed them.
 - A started mutable tool without a result, or one cancelled after a possible
   side effect, becomes uncertain and requires user reconciliation.
 - An idempotent tool may be offered for explicit retry; it is not retried
@@ -836,6 +858,19 @@ A mutation:
     change provenance before provider continuation.
 11. Presents the realized result outside the critical section.
 
+The single-edit path has explicit work bounds. Epi caches the current buffer
+hash only while buffer identity, coding, bounds, and
+buffer-chars-modified-tick remain unchanged; under-lock disk revalidation is
+never skipped on the strength of that cache. The proposed-result hash is
+computed with the approved diff. After save, if the disk hash equals that
+proposed hash and buffer identity, coding, and modification tick prove that no
+save hook changed the content, the approved diff is also the realized diff and
+is reused rather than recomputed. Any mismatch takes the full verification
+path and may produce an uncertain outcome. A configurable byte ceiling rejects
+automatic mutation of oversized files with epi-limit-exceeded unless the user
+explicitly raises it for that operation. Batch mutation remains a later-slice
+capability, not a requirement of the first minimal mutation tool.
+
 Epi never reverts, overwrites, or silently merges a modified user buffer. An
 interaction request before disk mutation rolls back the buffer edit, releases
 the lock, and may be presented outside the critical section; acceptance starts
@@ -851,13 +886,16 @@ whose history remains visible.
 Process tools prefer argument vectors and make-process over shell evaluation.
 They use an explicit working directory, separate standard output and error,
 timeouts, and cancellation. Output streams directly into private mode-0600
-temporary files while byte counts and hashes update incrementally; it is not
-accumulated without bound in Emacs strings. Per-call and aggregate session
-quotas, together with a free-space reserve, constrain artifact growth. Crossing
-a hard limit cancels the process and commits an output-limit terminal result
-containing captured byte counts, truncation state, and hashes. Successful
-temporary files promote into immutable objects; model-facing output remains
-separately bounded.
+temporary files while byte counts update incrementally; it is not accumulated
+without bound in Emacs strings. Per-call and aggregate session quotas, together
+with a free-space reserve, constrain artifact growth. When the stream closes,
+Epi computes the ordinary SHA-256 content hash once from the quota-bounded file
+in a unibyte temporary buffer, then promotes successful output under that same
+hash into the immutable object store. Crossing a hard limit cancels the
+process, closes and hashes the captured file by the same procedure, and commits
+an output-limit terminal result containing byte counts, truncation state, and
+hashes. Model-facing output remains separately bounded. Process tools and this
+promotion contract enter their own later implementation slice.
 
 Allowed roots and confirmation are policy controls, not a process sandbox. A
 shell may access every resource available to the Emacs process unless an
@@ -1170,7 +1208,8 @@ The slice includes:
 
 1. Version-one Org header and record parser.
 2. Locked append, semantic hash-chain validation, and final-tail recovery.
-3. User, assistant, reasoning, tool, turn, leaf, and interruption records.
+3. User, assistant, reasoning, tool, turn, operation, leaf, interruption, and
+   recovery-origin records.
 4. Pure active-branch and model-context reduction.
 5. One live session object and one hidden GPTel request buffer.
 6. Streaming one GPTel-backed turn through the Epi outer lifecycle.
@@ -1265,12 +1304,18 @@ features do not gate the first slice.
   modified-buffer override, atomic undo, save hooks, and process cancellation
   with their respective slices. Mutation tests include a save hook that tries
   to query the user and prove that no prompt blocks while the path lock is held.
+  They instrument hash and diff passes, exercise the oversized-file ceiling,
+  and prove that the unchanged-save-hook path reuses the approved diff. When
+  process tools land, a quota-sized promotion fixture compares the object name
+  with an independent SHA-256 of the exact captured bytes.
 - Crash-point tests after each durable transition.
 - Rendering tests proving that a view rebuilds from records and does not
   mutate them.
 - Large-ledger fixtures asserting tail-only warm append, bounded initial
   rendering, incremental reduction, bounded callback queues, linear metadata
-  memory, and recorded reference-host performance.
+  memory, and recorded reference-host performance. A cold-validation fixture
+  proves record-chain hashing consumes stored canonical JSON byte ranges and
+  does not invoke record reserialization.
 - Byte-compilation, checkdoc, and warning-free package checks.
 
 No paid provider request forms part of the required suite. Optional live
@@ -1311,10 +1356,13 @@ A GPTel upgrade is accepted only after the adapter contract suite proves:
 6. Cancellation during model I/O, approval, and tool execution.
 7. Commit-barrier behavior when ledger append fails at stream completion,
    tool proposal, and tool result.
-8. Duplicate identical parallel proposals remain distinct by provider call
+8. Undeclared-only and mixed declared/undeclared tool proposals reach one
+   terminal Epi state within the leg-watchdog bound without unauthorized
+   execution or a hung GPTel FSM.
+9. Duplicate identical parallel proposals remain distinct by provider call
    ID when parallel capability is enabled.
-9. Redacted diagnostic behavior.
-10. No reliance on serialized GPTel continuations.
+10. Redacted diagnostic behavior.
+11. No reliance on serialized GPTel continuations.
 
 Failure closes the affected capability. Epi does not silently downgrade a
 typed session to flattened text.
@@ -1353,7 +1401,10 @@ the architectural decision:
    explicit pause/resume FSM shim or replace it with an equivalent stable
    upstream hook.
 3. Confirm Org special-block framing and checksum normalization against
-   arbitrary Unicode and adversarial message text.
+   arbitrary Unicode and adversarial message text. Prove the dedicated
+   canonicalizer against RFC 8785 Appendix B, including its number vectors,
+   and compare canonical bytes and digests with an independent JCS
+   implementation.
 4. Measure reducer and rendering behavior on large ledgers before introducing
    any persistent index.
 5. Download and audit a pinned mcp.el snapshot before enabling resources,
