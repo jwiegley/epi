@@ -17,9 +17,12 @@ interface or TypeScript extension ABI.
 
 GPTel remains the sole model-communication substrate. It supplies provider
 implementations, authentication, request construction, HTTP streaming,
-reasoning and tool-call parsing, model metadata, and the GPTel/mcp.el path to
-MCP servers. Epi owns the durable and policy-bearing layers above that
-substrate.
+semantic response parsing, model metadata, and the GPTel/mcp.el path to MCP
+servers. Epi owns the durable and policy-bearing layers above that substrate.
+The pinned adapter may inspect bounded raw transport bytes and outer streaming
+envelopes solely to enforce fail-closed capability limits before GPTel decodes
+inner tool arguments; that safety audit neither emits provider semantics nor
+replaces GPTel's parser or request/FSM loop.
 
 The first objective of this document is architectural: define the complete
 target and the invariants that every implementation slice preserves. The
@@ -36,6 +39,7 @@ or upstream prose differs from implementation.
 |---|---|---|
 | [Pi](https://github.com/earendil-works/pi/tree/dd6bea41efa8caa7a10fe5a6401676dc5699f83f) | dd6bea41efa8caa7a10fe5a6401676dc5699f83f | packages/agent, packages/coding-agent, session, compaction, trust, resource, extension, SDK, and RPC tests |
 | [GPTel](https://github.com/karthink/gptel/tree/8701e2bd80c5d2091ce2decef5d34d6fce4a3ada) | 8701e2bd80c5d2091ce2decef5d34d6fce4a3ada | gptel-request.el, gptel.el, gptel-org.el, provider implementations, and gptel-integrations.el |
+| [JSON Canonicalization](https://github.com/cyberphone/json-canonicalization/tree/19d51d7fe467d4706a3ff08adf8a748f29fc21e0) | 19d51d7fe467d4706a3ff08adf8a748f29fc21e0 | Official test data and the development-only Node ES6 reference used to generate checked-in JCS goldens |
 | [gptel-agent](https://github.com/karthink/gptel-agent/tree/e833bcaf617baf8c8075eac098231c4457386814) | e833bcaf617baf8c8075eac098231c4457386814 | gptel-agent.el and gptel-agent-tools.el |
 | [Superpowers](https://github.com/obra/superpowers/tree/d884ae04edebef577e82ff7c4e143debd0bbec99) | d884ae04edebef577e82ff7c4e143debd0bbec99 | brainstorming, specification, and parallel-analysis methods |
 
@@ -59,6 +63,12 @@ Several findings materially constrain the design:
   settled agent turn. GPTel's custom FSM and advanced typed-history input are
   explicitly less stable than its ordinary request entry point (GPTel:
   gptel-request.el:2038-2219,2446-2480).
+- At the pinned revision, the OpenAI streaming parser decodes accumulated
+  inner tool arguments before the TOOL-state handler, examines only
+  `tool_calls[0]`, and treats nonempty content as excluding tool handling for
+  that delta. Sequential-only and no-mixed-content promises therefore require
+  a narrow pre-parse outer-envelope audit in the adapter; the later TOOL guard
+  remains a second defense, not the first opportunity to reject.
 - GPTel's saved Org chat is editable text plus positional role metadata. It is
   useful as a chat format, but it is not an append-only agent ledger (GPTel:
   gptel.el:693-798; gptel-org.el:530-677).
@@ -238,8 +248,19 @@ with a canonical header hash serving as the chain root. Every append, import,
 and migration passes through the same canonical writer. A dedicated Epi
 canonicalizer validates I-JSON, orders object member names by UTF-16 code units,
 and implements ECMAScript number serialization; output from json-serialize is
-not assumed to be JCS. The chain detects altered metadata, interior deletion,
-and reordering as well as payload modification. After a fresh restart, deletion
+not assumed to be JCS. It accepts Unicode scalar values only: lone surrogates,
+characters above U+10FFFF, malformed multibyte strings, and raw non-ASCII bytes
+in unibyte strings are rejected before hashing. The chain detects altered
+metadata, interior deletion, and reordering as well as payload modification.
+The first slice limits canonical JSON to 15 MiB and the complete framed record
+to 16 MiB, leaving framing overhead explicit. A torn-tail fragment is bounded
+by the complete-frame limit, independently of the immutable-object limit.
+Both the canonical writer and the pre-decode lexical validator cap JSON nesting
+at 32 containers and the sum of object members plus array elements at 131,072
+per record. The validator enforces those structural limits before invoking
+Emacs's JSON decoder, so a size-compliant depth or breadth bomb is rejected
+without materializing it.
+After a fresh restart, deletion
 of a complete valid suffix is indistinguishable from an earlier valid head
 unless an external trusted witness exists; Epi does not claim adversarial
 rollback detection.
@@ -247,6 +268,14 @@ rollback detection.
 Physical Org nesting does not encode branches. All records remain at level
 one so that a new child of an old node can still be appended at end of file.
 The EPI_PARENT property supplies the logical edge.
+
+The first record in a version-one session is `session-info`. It durably freezes
+the working directory, unexpanded base system prompt, backend/model names,
+request parameters, tool descriptors, and capability before session creation
+returns. Header plus this record publish as one create barrier, so a session
+closed before its first prompt remains independently reopenable. Runtime
+objects rebind these durable descriptors and never reconstruct creation
+defaults from a previous expanded turn prompt or current Emacs defaults.
 
 ### 4.2 Record families
 
@@ -270,7 +299,15 @@ transcript. Before a side effect begins, Epi commits an assistant message whose
 typed content contains the proposed call IDs, names, arguments, order, and
 grouping. After the terminal tool record commits, Epi appends the corresponding
 typed tool-result message. Projection uses those messages and correlates them
-with lifecycle records by call ID.
+with lifecycle records by call ID. Epi, not GPTel, assigns durable order as a
+zero-based counter for the complete turn; a provider-local list position is
+not an order oracle. The first sequential-only capability stores null grouping.
+Ledger validation requires exact equality across these duplicates: proposal
+call ID/name/arguments/order, lifecycle target/turn/operation/call ID, and
+result parent/turn/call/name/model-result/status. Denial maps to a denied model
+result; success to success; error, timeout, and provable cancellation to error;
+uncertainty forbids a guessed result. A mismatch is corruption even when each
+individual record and the record hash chain are otherwise valid.
 
 Conversation, checkpoint, and branch-scoped configuration entries carry a
 parent ID and form the logical tree. Appending one selects it as the active
@@ -281,7 +318,8 @@ order. Structural and operational records carry a target ID, operation ID,
 turn ID, or cause ID as appropriate. An explicit leaf record changes the
 selection without rewriting history.
 
-turn-started carries intended-message and intended-queue-item IDs as typed
+turn-started carries intended-message and intended-queue-item IDs, and
+extension-write-enqueued carries its deterministic target-record ID, as typed
 payload fields. These are forward intents, not parent or target edges, and may
 name records that are not present yet or never arrive after a crash.
 
@@ -289,13 +327,15 @@ name records that are not present yet or never arrive after a crash.
 
 The store enforces these invariants:
 
-1. The header precedes every record and has a supported format version.
+1. The header has a supported format version and is followed immediately by
+   exactly one `session-info` record before any other record.
 2. Record IDs are unique.
 3. A parent or target refers only to an earlier valid record, except where a
    typed record explicitly permits an external session reference. Only payload
    fields declared by the schema as forward intents may name later or absent
    records; format version one permits this for turn-started's intended-message
-   and intended-queue-item IDs.
+   and intended-queue-item IDs and extension-write-enqueued's deterministic
+   target-record ID.
 4. Physical record order never changes.
 5. Existing properties and payloads are never edited or removed.
 6. Labels, names, configuration, corrections, and leaf selection are later
@@ -318,12 +358,21 @@ Users edit sessions through Epi commands and derived views.
 Before an append, Epi acquires an Epi-owned lock by exclusive lock-file
 creation, independently of the user's create-lockfiles setting. The lock spans
 comparison of file identity and the last canonical hash, append, flush, and
-post-write verification. Epi binds write-region-inhibit-fsync to nil for the
-append. If the lock cannot be acquired or the comparison changes, the append
-fails without writing. This contract provides process-crash and competing
+post-write verification. Every canonical write uses one private local-byte
+primitive over unibyte data with no conversion, write annotations disabled,
+and explicit exclusive-create/append/replace modes; Epi binds
+write-region-inhibit-fsync to nil at durability barriers. If the lock cannot
+be acquired or the comparison changes, the append fails without writing.
+This contract provides process-crash and competing
 Emacs-process safety; a torn final write remains possible after machine or
 filesystem failure and is handled as recovery rather than described as an
 atomic append.
+
+Session creation uses the same discipline with expected file identity
+`absent`: write and verify the complete header plus `session-info` at a hidden
+sibling, revalidate absence, and publish by a no-clobber same-filesystem rename
+under the create lock. A process crash can expose a recognized hidden
+temporary or a complete normal ledger, never a header-only normal session.
 
 Where several adjacent records share one crash barrier, Epi writes their
 complete hash-linked forms under one lock and performs one flush. This does
@@ -341,12 +390,39 @@ fragment, because that would turn it into interior corruption. The explicit
 recovery command preserves the original unchanged, copies the valid prefix
 into a new ledger, stores the fragment as a recovery artifact, and appends a
 recovery-origin record containing the original path, session ID, and hashes.
-The recovered ledger receives a new session ID. The original moves, without
+The recovered ledger receives a new session ID. Its valid prefix is re-sealed
+under the new root while preserving semantic fields, except that the first
+session-info payload's session ID changes to agree with the new header; the
+recovery-origin record retains the source identity. The original moves, without
 content alteration, into a quarantine directory excluded from normal resume;
 reachable objects are copied or linked by verified hash. A malformed interior
 record, duplicate ID, backward-inconsistent schema, hash-chain failure, or
 impossible parent likewise stops normal loading. Epi never guesses past
 interior corruption.
+
+Recovery is a restartable multi-file transaction. A canonical fsynced manifest
+at `<quarantine-directory>/.epi-recovery/<recovery-id>/manifest.jcs` binds the
+exact source file identity/size, header and valid-prefix chain head, exact
+fragment offset/size/hash, destination identity/head, reachable-object set,
+staging paths, final quarantine path, and last completed phase. Its monotonic
+phases are prepared, objects transferred, destination objects published,
+destination ledger published, source ledger staged, source objects staged, and
+quarantine published. Destination objects publish and verify before the
+destination ledger; source ledger and object directory then move into a hidden
+quarantine staging directory whose final rename publishes quarantine. Normal
+discovery ignores hidden recovery paths. Re-entry verifies and resumes each
+idempotent phase, including a crash between source moves, and removes the
+manifest only after destination and final quarantine have both been verified.
+No extra whole-ledger digest is needed: validation already hashes each record
+into the chain head, while the bounded fragment digest covers every trailing
+byte. Re-entry revalidates those components cooperatively.
+For a default-store ledger the quarantine is under the session directory; for
+a custom ledger it defaults to a sibling `.epi-quarantine`. An explicit
+quarantine override must be proven on the same filesystem device as the source
+parent before recovery creates anything. Source staging and final quarantine
+publication are therefore rename-only on one filesystem. The recovered
+destination may be elsewhere because it is built and published independently
+on its own filesystem.
 
 Schema migration reads the old ledger and writes a new ledger beside it. It
 does not rewrite the original. The migrated ledger receives a new session ID
@@ -381,16 +457,30 @@ The principal projections are the full ledger, logical tree, active branch,
 model context, conversation view, and diagnostic operation view. Each has one
 defined reducer path; no view independently interprets raw records.
 
-Cold open validates the ledger in order and yields between bounded parsing
-chunks. Thereafter an in-memory, disposable index keyed by file identity,
+Cold open validates the ledger in order through a private records/bytes/time
+cursor and cooperatively yields between bounded I/O and lexical chunks. Emacs's
+JSON decoder materializes one already size-checked record as a measured
+nonpreemptible unit of at most 15 MiB. Likewise, `secure-hash` consumes one
+already bounded record, object, or recovery fragment as a measured
+nonpreemptible unit of at most 16 MiB. Epi yields immediately before and after
+each hash/decode and reports a slow unit rather than claiming mid-primitive
+preemption. Prefix
+resealing and reachable-object transfer use the same cursor discipline during
+recovery; partial state is never published, and generation plus file
+identity/head are revalidated before completion. Thereafter an in-memory, disposable index keyed by file identity,
 format, validated byte offset, and tail hash supports tail-only validation and
 append-time incremental reduction. A mismatch discards the index and forces a
 full validation. Warm append parses only new bytes, reducer metadata is O(n)
-without retaining duplicate payload bodies, and conversation views render a
-bounded window with older regions materialized on demand. Large-ledger tests
-assert parsed-byte limits, bounded initial rendering, and linear memory growth;
-wall-clock benchmarks record a reference-host baseline and reject material
-regression rather than asserting hardware-independent timings.
+without retaining duplicate payload bodies. Parent/child construction uses
+O(1)-amortized edge insertion followed by one finalization copy, and traversal
+is iterative so deep branches do not consume Elisp recursion. Conversation and
+tree views render bounded windows with older regions or child sets materialized
+on demand. Large-ledger tests require reducer-owned hash entries plus cons
+cells plus vector elements to remain at most `12*n + 1024` for `n` records,
+with exactly zero retained payload-body copies. They also assert bounded
+rendering, heartbeat interleaving, adversarial chain/star/balanced shapes, and
+linear memory growth. Wall-clock/RSS benchmarks compare only a matching
+reference-host fingerprint against a versioned baseline.
 
 ## 5. Runtime lifecycle
 
@@ -399,6 +489,21 @@ regression rather than asserting hardware-independent timings.
 One session admits one structural or agent operation at a time. Independent
 sessions may operate concurrently because each has a separate runtime object,
 request buffer, cancellation token, and event sequence.
+
+Within one Emacs process, a live-session registry indexes canonical file
+identity and durable session ID. Opening the same identity with matching
+bindings returns the exact existing object; symlink/hard-link aliases,
+conflicting bindings, copied IDs, and path replacement cannot create a second
+runtime. Open/create reserves identity before cooperative work, and close or
+failure removes only the exact object/token it installed.
+
+Public tail recovery uses that same registry. Before the closed-ledger recovery
+primitive may lock, move, or publish anything, the facade atomically reserves
+the source path/identity/session ID and destination path/identity/new session
+ID in deterministic key order. Any live or reserved alias is busy even if its
+runtime is idle; it must be closed first. Exact-token cleanup runs on every
+exit, recovery publishes no live runtime, and the caller explicitly opens the
+new ledger afterward.
 
 The outer phase is one of:
 
@@ -418,6 +523,15 @@ Prompt, explicit compaction, branch navigation, session replacement, and fork
 are structural operations. They begin only from idle. Steering, follow-up,
 abort, configuration setters, and controlled extension writes may be accepted
 at their documented safe points.
+
+First-slice leaf selection is a turnless structural operation whose one crash
+barrier appends operation-started, leaf, and operation-finished in that order,
+then emits committed agent-settled. It never bypasses operation admission.
+
+`blocked` is not an outer phase. Recovery may reduce a terminalized session to
+phase `idle` with a separate blocked reason (for example an uncertain mutation).
+Such a session has settled but rejects new structural or agent operations until
+an explicit reconciliation record clears the reduced state.
 
 ### 5.2 Prompt lifecycle
 
@@ -478,6 +592,13 @@ generation, aborts the hidden request buffer through public gptel-abort, and
 fails the turn. A watchdog can stop a stalled leg; it can never authorize a
 tool or continue to another provider leg.
 
+A valid tool-proposal callback with a captured continuation completes that
+network leg and cancels its watchdog before Epi queues policy work. Human
+approval and tool execution are not provider stalls: the runtime owns their
+independent optional policy timer and descriptor-defined execution timer. The
+next leg watchdog starts only when a committed result releases the continuation
+and GPTel actually begins the next network request.
+
 ### 5.4 Settlement
 
 Message completion and agent settlement are distinct. A completed assistant
@@ -488,6 +609,12 @@ all such work has ended and the session is idle.
 Batch callers, busy indicators, deferred exports, session replacement, and
 tests use agent-settled as their completion boundary.
 
+The optional first-slice prompt settlement callback receives the same committed
+agent-settled event as `(callback session event)`, once, after subscribers for
+that event have been attempted. Prompt admission validates it, prompt returns
+the operation ID before it can run, and callback failure or overrun is diagnosed
+without changing or retrying the committed outcome.
+
 ## 6. GPTel compatibility adapter
 
 ### 6.1 Responsibilities
@@ -496,7 +623,8 @@ epi-gptel.el is the only module permitted to depend on GPTel's version-sensitive
 representation. It:
 
 - Resolves and validates an explicit GPTel backend and model.
-- Installs all request settings buffer-locally.
+- Installs all request settings buffer-locally, including disabling ambient
+  GPTel post-request hooks in the hidden request buffer.
 - Requires Curl and effective streaming for the agent lane.
 - Converts provider-neutral Epi history into the representation accepted by
   the tested GPTel snapshot.
@@ -508,14 +636,52 @@ representation. It:
   explicitly and buffer-locally; confirmation is forced for every tool call.
 - Wraps imported tool functions so that GPTel cannot execute them before Epi
   policy.
-- Copies raw provider call IDs from the mutable tool-use information during
-  the callback and correlates duplicate, identical parallel proposals by ID
-  rather than by name or arguments.
+- Replaces only the Epi request's pinned WAIT action with a wrapper that calls
+  a captured, hash-verified function object for GPTel's complete stock WAIT
+  handler once while narrowly intercepting its `set-process-filter` call. This
+  preserves the stock per-leg clearing of tool-result, tool-use, error, HTTP,
+  reasoning, and token fields as well as Curl dispatch and the buffer-local
+  post-request hook. GPTel's attempted stock stream filter becomes a
+  request-local closure over that exact filter, then the interceptor is
+  restored. The closure counts raw leg/turn bytes before GPTel inserts a
+  crossing chunk; safe chunks delegate unchanged to GPTel's filter, and
+  non-Epi requests remain untouched.
+- Runs a pinned around-method safety audit before the OpenAI streaming parser
+  decodes inner `function.arguments`. It incrementally inspects every complete
+  outer `data:` envelope, every tool-call vector entry/index, raw ID/name and
+  raw argument-string bytes, and same-delta content/tool mixture. A bounded
+  single-pass scanner validates only the frozen flat primitive argument
+  object, including duplicate/member/schema limits, before GPTel's inner
+  parser. Transient validation scalars are discarded; it retains bounded raw
+  bytes and a length/hash/member/schema attestation, not canonical arguments.
+  It produces no response event and calls the stock parser exactly once only
+  when the envelope and arguments are safe.
+- Guards the pinned TOOL transition before GPTel's stock handler, rejecting
+  undeclared, mixed, parallel-when-disabled, malformed, or unsupported calls
+  before a continuation or another provider leg can exist.
+- After GPTel semantically accepts a tool callback, correlates its raw call ID
+  and name with the exact attested raw argument bytes and only then runs a
+  separate bounded callback normalizer to produce duplicate-free canonical Epi
+  arguments. It erases the raw bytes/attestation before enqueue and never
+  treats GPTel's lossy keyword plist as durable arguments.
 - Wraps every GPTel tool-result continuation with an exactly-once guard.
 - Exposes cancellation and compatibility diagnostics.
 
 The adapter never permits GPTel's silent model fallback to change an Epi
 snapshot. Unsupported backend/model pairs fail preflight.
+The first-slice pin applies to loaded artifacts, not adjacent source claims:
+clean preflight resolves and loads the exact truenamed GPTel `.el` files,
+rejects shadowing `.elc`/native artifacts, and verifies representative
+functions' `symbol-file` locations. Epi refuses a compiled or shadowed GPTel
+even when a nearby source file has the expected hash.
+
+The first slice accepts only a root object schema with
+`additionalProperties: false`, deterministic properties and required sets, and
+flat string, integer, number, or boolean properties with optional descriptions
+and same-type enums. Arrays, nested objects, null unions, combinators,
+references, defaults, pattern properties, and unproven keywords fail
+compatibility. The adapter compares GPTel's effective dry-run parameters with
+an independently normalized expected schema before starting.
 
 ### 6.2 Callback normalization
 
@@ -534,16 +700,38 @@ The adapter handles every documented response form:
 
 GPTel may clear or reuse request information between legs. The adapter copies
 the fields it needs during the callback and retains no mutable GPTel plist as
-durable state. The Curl process filter performs only bounded accumulation and
-enqueueing. A timer drains the per-session FIFO in bounded item, byte, and time
-quanta. Adjacent volatile text or reasoning deltas may coalesce while retaining
+durable state. The Epi layer in the Curl filter stack performs only bounded
+raw-byte counting and outer-envelope safety inspection before invoking GPTel's
+stock filter; it never emits semantic events or mutates the ledger. Normalized
+callbacks copy and enqueue. A head/tail FIFO and chunk collectors provide
+O(1)-amortized append; content flattens once at a semantic commit boundary. A timer drains the per-session FIFO in bounded item, byte, and time
+quanta. One item and 4 KiB of the published FIFO maxima are unavailable to
+ordinary callbacks and reserved for one fixed queue-overflow failure. An
+ordinary enqueue that would cross either reduced ceiling is discarded, latches
+overflow, invalidates and aborts the request, and occupies that reserve; later
+callbacks are dropped. Thus accepted events retain order and total counters
+never exceed their maxima while settlement remains representable. Adjacent volatile text or reasoning deltas may coalesce while retaining
 their first and last live sequence numbers; committed content never coalesces
-across a semantic boundary. A byte ceiling applies backpressure by suppressing
-intermediate view signals while preserving the complete response accumulator.
+across a semantic boundary. Separate hard ceilings cover one event, queued
+backlog, raw tool-argument JSON before parsing, each provider leg, the complete
+turn, and sequential call count. Crossing one invalidates the generation and
+aborts; draining quickly cannot evade total-output limits.
 Subscribers are timed and disabled after exceeding the configured execution
 budget. Emacs remains a single event thread, so the first slow callback can
 still delay later work; the design limits and reports that delay rather than
 claiming preemption.
+
+The pre-parse audit first retains `function.arguments` as bounded raw JSON text,
+then runs the frozen flat-object scanner to detect duplicate keys, excessive
+members, unsupported shapes/types, and schema/enum violations without an
+unbounded general JSON materialization. Duplicate outer keys, malformed
+envelopes, a second tool index/call, mixed content and tool data, or any
+ID/name/argument bound violation terminalizes the adapter without invoking the
+stock parser for the rejected envelope. The scanner discards transient values
+and records only a nonsemantic attestation. GPTel's stock parser and FSM then
+run exactly once and remain the semantic response authority; only its accepted
+tool callback authorizes a separate normalizer to turn the exact attested raw
+bytes into canonical Epi arguments.
 
 Streaming text and reasoning appear as volatile live signals and remain
 transient until a complete provider-neutral message can be committed. A live
@@ -554,11 +742,12 @@ unfinished turn and marks it interrupted.
 At every tool callback and leg boundary, the adapter reconciles the raw
 provider proposals with the complete tool registry in the turn snapshot. An
 undeclared name never reaches an Epi executor or authorization path. The pinned
-GPTel snapshot may synthesize an unavailable-tool result before Epi receives a
-tool-call callback; that behavior is accepted only while contract tests prove
-that undeclared-only and mixed declared/undeclared responses both settle. If a
-proposal cannot be reconciled or GPTel makes no observable progress, the leg
-watchdog fails the turn and aborts it rather than waiting indefinitely.
+GPTel snapshot may synthesize an unavailable-tool result and immediately
+advance before Epi's queued drain runs, so the adapter-owned TOOL-state guard
+must reject undeclared-only and mixed declared/undeclared responses before the
+stock handler. If a proposal cannot be reconciled or GPTel makes no observable
+progress, the leg watchdog invalidates continuations, takes exactly one
+terminal path, and never starts another provider leg.
 
 Every transition that can permit a tool side effect or another provider leg
 has a commit barrier. The adapter does not rely on callback exceptions,
@@ -651,10 +840,17 @@ Cancellation proceeds as follows:
 3. Abort the active Curl request through GPTel when one exists.
 4. Reject or ignore late callbacks from the cancelled generation.
 5. Preserve pending writes and next-turn context according to policy.
-6. Append exactly one terminal record for each affected entity. Ordinary
-   cancellation appends turn-cancelled followed by operation-cancelled. An
-   outcome that cannot be classified as cancelled uses the matching failed or
-   interrupted record type once determined; it never reuses a cancelled type.
+6. Terminalize every open call before its enclosing entities. A planned call
+   receives tool-denied(reason=operation-cancelled) plus a truthful denied
+   result message. A started provably side-effect-free call receives
+   tool-finished(cancelled) plus a truthful error result message. A started
+   mutable call whose side effect cannot be disproved receives
+   tool-finished(uncertain) and no guessed result message.
+7. Append exactly one terminal record for each enclosing entity. Ordinary
+   cancellation then appends turn-cancelled followed by operation-cancelled.
+   An outcome that cannot be classified as cancelled uses the matching failed
+   or interrupted record type once determined; it never reuses a cancelled
+   type. One agent-settled signal follows the durable terminals.
 
 Synchronous Elisp cannot be safely preempted. Tools expected to block therefore
 use asynchronous processes or cooperative continuations.
@@ -663,6 +859,17 @@ If a mutable tool has started and its executor cannot prove that cancellation
 preceded every side effect or completed a rollback, its terminal outcome is
 uncertain rather than cancelled. The session blocks provider continuation
 until the user records reconciliation.
+
+Such an uncertain normal-execution or abort path uses failed turn/operation
+terminals with code tool-uncertain, because it is not truthfully cancelled. An
+uncertain state discovered during reopen uses interrupted terminals. Both
+orders put tool-finished(uncertain) first and omit a guessed result message.
+
+A request paused in GPTel's TOOL state may have no active transport for public
+gptel-abort to find. The adapter therefore invalidates continuations first,
+attempts the public abort, and owns exactly-once terminalization of the adapter
+handle when no transport exists. It does not advance the FSM or fabricate a
+tool result.
 
 ### 7.3 Retry
 
@@ -679,14 +886,26 @@ allows at most one controlled replay of the failed model leg.
 On opening a ledger, Epi reduces the complete record sequence and reconciles
 unfinished work:
 
-- An unfinished provider request or turn appends turn-interrupted. If its
-  enclosing operation is also nonterminal, operation-interrupted follows it;
-  recovery never appends a second terminal record for either entity.
+- Recovery first terminalizes every open call. A planned call receives
+  tool-denied(reason=interrupted) and a denied result message; a started
+  side-effect-free call receives tool-finished(error, code=interrupted) and an
+  error result message; a started possibly-mutating call receives
+  tool-finished(uncertain) and no result message. Recovery then appends
+  turn-interrupted to every nonterminal turn and operation-interrupted to every
+  nonterminal operation. When both exist, the turn terminal precedes its
+  enclosing operation terminal. A turnless
+  structural operation, including compaction, branch-summary generation,
+  branch navigation, session replacement, or fork, receives only
+  operation-interrupted. Recovery never appends a second terminal record for
+  either entity.
 - A turn-started record whose intended message is absent uses those same
   interruption records; its announced queue items remain pending because no
   message consumed them.
-- A started mutable tool without a result, or one cancelled after a possible
-  side effect, becomes uncertain and requires user reconciliation.
+- A started mutable tool without a provable result, or one cancelled after a
+  possible side effect, settles to outer phase idle after its uncertain call
+  terminal and interruption terminals, and retains a separate blocked reason
+  requiring user reconciliation. This terminal-but-resultless history is valid
+  audit state; it is not replayable provider context and is not corruption.
 - An idempotent tool may be offered for explicit retry; it is not retried
   silently.
 - Durable queue items remain pending unless a valid model-visible message
@@ -694,7 +913,8 @@ unfinished work:
 - An extension-write-enqueued record without an applied or failed partner is
   retried by deterministic target ID; if that target already exists, recovery
   appends extension-write-applied without repeating the mutation.
-- Incomplete compaction may run again only if no final checkpoint exists.
+- After recovery has terminalized its old operation, incomplete compaction may
+  run again as a new operation only if no final checkpoint exists.
 - GPTel continuations, processes, markers, buffers, and FSM objects are never
   recovered.
 
@@ -773,6 +993,13 @@ decisions, and final system prompt. Live buffers may supply context, but their
 contents are snapshotted at preflight; replay does not silently read a newer
 version under an old hash.
 
+Model-visible local inputs have explicit byte ceilings: base prompt,
+individual and aggregate instruction resources, each file-read result, and the
+complete projected provider context. Disk metadata rejects obvious oversize
+inputs before reading; live buffers are encoded through bounded temporaries and
+checked by encoded byte count. Limit failure precedes prompt acceptance or tool
+content publication.
+
 ## 9. Tool and workspace model
 
 ### 9.1 Tool definition
@@ -819,6 +1046,25 @@ ledger lock or force a flush.
 The terminal record is committed before GPTel receives the model-facing
 result. A structured Epi error remains available even when the provider sees a
 textual error result.
+
+Abort and reopen use the same entity order even though their provider
+continuation is dead: call terminal, optional truthful model-result message,
+turn terminal, operation terminal, then agent-settled. Planned calls terminate
+by denial; started side-effect-free calls terminate by cancellation or
+interrupted error; started calls with a possible unprovable side effect
+terminate uncertain without a guessed result. Every call therefore has exactly
+one durable terminal even when the enclosing operation does not complete
+normally.
+
+The enclosing type still reflects truth: uncertain execution/abort is failed,
+whereas uncertain evidence found on reopen is interrupted. Ordinary abort is
+cancelled only when every affected outcome is provably cancelled.
+
+The ordering applies equally when a provider or runtime failure ends an
+operation while a call is open. Its planned call is denied with the failure
+cause, its started side-effect-free call finishes with an ordinary error, and
+its started possibly-effectful call finishes uncertain; only then do the failed
+turn and operation terminals commit.
 
 ### 9.2 File reads
 
@@ -880,6 +1126,11 @@ failure, interaction request after a hook side effect, unexpected save-hook
 change, or unverifiable partial write produces an uncertain tool outcome and
 blocks continuation for reconciliation. A reversal is a new, explicit change
 whose history remains visible.
+
+A conflict found during step 7, before Epi changes buffer or disk bytes, is an
+ordinary precondition-failed tool result and may be returned to the model.
+Uncertainty is reserved for a path where an Epi side effect may already have
+occurred and the realized outcome cannot be proved.
 
 ### 9.4 Processes
 
@@ -1029,6 +1280,12 @@ contains:
 When a message completes, the durable ledger projection replaces transient
 output. Killing or rebuilding the view cannot lose session state.
 
+Rendering is bounded by both logical items and inserted content bytes. The
+conversation view uses bounded previews plus explicit load/view actions; the
+tree uses iterative, node-capped expansion with continuation nodes. Each user
+action has its own cap, so one large message or a wide branch cannot bypass the
+initial-window limit.
+
 ### 12.2 Native interaction
 
 Epi uses:
@@ -1068,6 +1325,12 @@ The principal commands include:
 - Inspect context, resources, trust, ledger records, and diagnostics.
 - Review, approve, deny, or reverse a tool change.
 - Wait until settled.
+
+The first slice exposes `epi`, `epi-open-session`, `epi-send`, `epi-abort`,
+`epi-show-tree`, and `epi-show-ledger`, backed by public display functions that
+return buffers. Session and tree buffers are owned by session ID, reused while
+live, and rebuilt from ledger state after they are killed; the raw ledger buffer
+visits the canonical file under read-only `epi-ledger-mode`.
 
 The public functions behind these commands do not require a selected window or
 active minibuffer. A later batch or JSON-lines host calls the same kernel.
@@ -1192,8 +1455,7 @@ Further files appear when implemented responsibility warrants the split:
 The split is not a mandate to create empty scaffolding. A new file appears
 only when it contains a coherent implemented boundary.
 
-The minimum platform is Emacs 30 with an Org version supporting the required
-parsing and presentation behavior. GPTel compatibility is expressed by a
+The minimum platform is Emacs 30.1 with Org 9.7 or later. GPTel compatibility is expressed by a
 tested source snapshot and contract capabilities rather than an optimistic
 version comparison.
 
@@ -1208,8 +1470,8 @@ The slice includes:
 
 1. Version-one Org header and record parser.
 2. Locked append, semantic hash-chain validation, and final-tail recovery.
-3. User, assistant, reasoning, tool, turn, operation, leaf, interruption, and
-   recovery-origin records.
+3. Session-info, user, assistant, reasoning, tool, turn, operation, leaf,
+   interruption, and recovery-origin records.
 4. Pure active-branch and model-context reduction.
 5. One live session object and one hidden GPTel request buffer.
 6. Streaming one GPTel-backed turn through the Epi outer lifecycle.
@@ -1292,13 +1554,17 @@ features do not gate the first slice.
 - Temporary-file tests for locking, complete append, partial tail, corruption,
   migration, permissions, and content-addressed objects.
 - Competing-Emacs and forced-death tests for lock ownership, same-host stale
-  takeover, remote-owner refusal, head revalidation, and batched flushes.
+  takeover, remote-owner refusal, head revalidation, batched flushes, and every
+  recovery-manifest phase including the interval between the two source moves.
 - Scripted fake-model tests for the lifecycle features present in the slice,
   expanding to retries, overflow, queues, compaction, and settlement as those
   features land.
 - GPTel adapter contract tests for every callback form, two- and three-leg
-  tool turns, parallel proposals, tool IDs, effective streaming, malformed
-  responses, and abort.
+  tool turns, all tool-call vector indices, same- and cross-delta mixed
+  content/tool proposals, tool IDs/names/arguments at exact byte boundaries,
+  effective streaming, malformed responses, and abort. Accepted fixtures run
+  through GPTel's real parser; rejected envelopes prove the stock inner-argument
+  parse, TOOL handler, and next transport leg never run.
 - Temporary-project tests beginning with project instructions and the minimal
   mutation tool, then adding trust, symlink traversal, resource precedence,
   modified-buffer override, atomic undo, save hooks, and process cancellation
@@ -1308,12 +1574,19 @@ features do not gate the first slice.
   and prove that the unchanged-save-hook path reuses the approved diff. When
   process tools land, a quota-sized promotion fixture compares the object name
   with an independent SHA-256 of the exact captured bytes.
-- Crash-point tests after each durable transition.
+- Crash-point tests after each durable transition. When each turnless
+  structural-operation slice lands, its tests interrupt the operation before
+  its terminal record and prove recovery appends one operation-interrupted and
+  reduces the outer phase to idle.
 - Rendering tests proving that a view rebuilds from records and does not
   mutate them.
 - Large-ledger fixtures asserting tail-only warm append, bounded initial
   rendering, incremental reduction, bounded callback queues, linear metadata
-  memory, and recorded reference-host performance. A cold-validation fixture
+  memory, adversarial chain/star/balanced trees, cooperative heartbeat
+  interleaving, slow-drip total-output limits, and exact per-stage counters.
+  A versioned 100k-record reference fixture gates matching-host elapsed median
+  at 2.0 times baseline and peak RSS at 1.5 times baseline; other fingerprints
+  report without comparison. A cold-validation fixture
   proves record-chain hashing consumes stored canonical JSON byte ranges and
   does not invoke record reserialization.
 - Byte-compilation, checkdoc, and warning-free package checks.
@@ -1363,6 +1636,9 @@ A GPTel upgrade is accepted only after the adapter contract suite proves:
    ID when parallel capability is enabled.
 10. Redacted diagnostic behavior.
 11. No reliance on serialized GPTel continuations.
+12. The raw-byte and outer-envelope guards reject parallel, mixed, and
+    oversized proposals before GPTel's inner argument parser, while accepted
+    proposals still traverse the real pinned parser and FSM exactly once.
 
 Failure closes the affected capability. Epi does not silently downgrade a
 typed session to flattened text.
@@ -1423,8 +1699,9 @@ The implementation remains conformant only while these statements stay true:
    immutable hash-addressed objects are payload members of the canonical
    session store.
 2. Every other representation is a pure or replaceable projection.
-3. GPTel owns provider and MCP communication; Epi owns harness semantics and
-   authority.
+3. GPTel owns provider and MCP communication plus semantic response parsing;
+   Epi owns harness semantics, authority, and the narrow pinned safety audit
+   needed to fail closed before unsafe inner tool-argument parsing.
 4. One session has at most one active logical operation.
 5. A provider-leg boundary is not an agent-settled boundary.
 6. Every mutable tool call has durable policy and terminal records.
