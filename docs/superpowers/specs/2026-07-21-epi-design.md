@@ -263,6 +263,16 @@ at 32 containers and the sum of object members plus array elements at 131,072
 per record. The validator enforces those structural limits before invoking
 Emacs's JSON decoder, so a size-compliant depth or breadth bomb is rejected
 without materializing it.
+
+Every version-one header field value is limited to 1,048,576 stored UTF-8
+bytes, excluding its literal field prefix and terminating LF. This is a fixed
+semantic input limit, independent of `epi-ledger-work-byte-limit`: a value at
+the limit is valid, while the next byte signals `header-value-byte-limit`.
+Cold open retains such a value through one explicitly measured, hard-capped
+materialization; it does not represent that operation as cooperatively
+preemptible. The limit covers the otherwise unbounded `EPI_PROJECT_ROOT` value
+and applies equally to sealing and loading.
+
 After a fresh restart, deletion
 of a complete valid suffix is indistinguishable from an earlier valid head
 unless an external trusted witness exists; Epi does not claim adversarial
@@ -383,12 +393,23 @@ Where several adjacent records share one crash barrier, Epi writes their
 complete hash-linked forms under one lock and performs one flush. This does
 not combine their semantic identities or permit a continuation between them.
 
-The lock token records host, process ID, process-start identity, nonce, and
+The lock token records host, process ID, process-start identity, nonce,
+canonical ledger path, expected file identity, expected validated end, and
 expected ledger head. Same-host takeover is automatic only when the recorded
 process identity is provably no longer live. A remote or indeterminate owner
 is never displaced automatically. Explicit stale-lock recovery archives the
 token, obtains a new exclusive lock, and revalidates file identity and the
 complete expected head before writing.
+
+When `process-attributes` returns nil, that result alone is not proof of death.
+Epi classifies the owner as dead in this branch only when a supported local
+`list-system-processes` snapshot omits the recorded PID. A listed PID with
+unavailable attributes, an unavailable process list, or an unnormalizable
+start identity is indeterminate. A present process with a different normalized
+start identity proves PID reuse and therefore a dead recorded owner. Current-
+process token construction and both stale-owner probes run with
+`default-directory` bound to the canonical local ledger parent; an unavailable
+or malformed current-process start identity fails before lock creation.
 
 A truncated final record quarantines the ledger. Epi never appends beyond the
 fragment, because that would turn it into interior corruption. The explicit
@@ -404,6 +425,18 @@ reachable objects are copied or linked by verified hash. A malformed interior
 record, duplicate ID, backward-inconsistent schema, hash-chain failure, or
 impossible parent likewise stops normal loading. Epi never guesses past
 interior corruption.
+
+Recovery provenance is enabled as one semantic unit in the explicit
+torn-tail recovery task. Before that task lands, the codec recognizes and
+field-validates `recovery-origin`, but cold-open evidence does not claim that
+a structurally valid origin is uniquely bound to the destination history.
+Recovery adds the origin transition, verifies its destination-prefix head and
+source-evidence digest, and permits exactly one origin after every legal
+recoverable suffix while preserving that suffix's unfinished state. The
+exception admits only the later prescribed recovery terminalization; it does
+not reopen ordinary model or tool continuation. The recovered destination is
+not an accepted runtime input until those Task 6 semantics and the Task 8
+reconciliation fixtures pass.
 
 Recovery is a restartable multi-file transaction. A canonical fsynced manifest
 at `<quarantine-directory>/.epi-recovery/<recovery-id>/manifest.jcs` binds the
@@ -466,20 +499,42 @@ The principal projections are the full ledger, logical tree, active branch,
 model context, conversation view, and diagnostic operation view. Each has one
 defined reducer path; no view independently interprets raw records.
 
-Cold open validates the ledger in order through a private records/bytes/time
-cursor and cooperatively yields between bounded I/O and lexical chunks. Emacs's
-JSON decoder materializes one already size-checked record as a measured
-nonpreemptible unit of at most 15 MiB. Likewise, `secure-hash` consumes one
-already bounded record, object, or recovery fragment as a measured
-nonpreemptible unit of at most 16 MiB. Epi yields immediately before and after
-each hash/decode and reports a slow unit rather than claiming mid-primitive
-preemption. Prefix
-resealing and reachable-object transfer use the same cursor discipline during
-recovery; partial state is never published, and generation plus file
-identity/head are revalidated before completion. Thereafter an in-memory, disposable index keyed by file identity,
-format, validated byte offset, and tail hash supports tail-only validation and
-append-time incremental reduction. A mismatch discards the index and forces a
-full validation. Warm append parses only new bytes, reducer metadata is O(n)
+Cold open validates the ledger in order through one private records/bytes/time
+cursor. Adjacent pathname reads, delimiter scans, lexical work, and buffer
+transfers occur in bounded units; exact stored JSON hashing and decoding remain
+the only frame-sized measured primitives. The scanner uses immutable unibyte
+buffer source-region views, so hashing, JCS lexical validation, and
+`json-parse-buffer` consume the same stored byte range without rerendering or
+retaining a second canonical body. Only a lexically completable final frame is
+classified as truncated; an impossible prefix is interior corruption.
+Cooperative callbacks run with a private neutral buffer as current. Whenever
+an internal carry buffer survives a yield, Epi makes it read-only for the
+callback and verifies its liveness, modification tick, and multibyte mode
+before resuming; a change aborts publication with a structured conflict.
+
+The private ordered record index is finalized in immutable vector chunks.
+Each chunk contains no more than both the record budget and the byte budget
+permit, accounting eight bytes per vector slot; an artificial work budget
+below one slot retains the already ordered private list rather than performing
+an over-budget allocation. Private length, iteration, and indexed access accept
+either representation. The public `epi-ledger-records` projection continues
+to return a defensive vector, whose caller-requested allocation is separately
+measured and does not form part of cold-open publication. Indexes point to the
+one retained record object and never duplicate payload bodies.
+
+EOF semantics, equality of validated end and the initially captured file size,
+and all yielding index finalization complete before publication. Cold open then
+verifies the current chain-head prefix, yields once deliberately, and restats
+the initial pathname identity. After that successful restat it performs no
+callback, I/O, cleanup, or yield: it creates one immutable checkpoint containing
+identity, validated end, tail hash, record order, and semantic indexes, and
+installs that checkpoint in the opaque ledger handle. A later verified append
+may replace the private checkpoint as one field store; partial state is never
+published. A mismatch discards the disposable state and requires cold
+validation. Prefix resealing and reachable-object transfer use the same cursor
+discipline during recovery.
+
+Warm append parses only new bytes, reducer metadata is O(n)
 without retaining duplicate payload bodies. Parent/child construction uses
 O(1)-amortized edge insertion followed by one finalization copy, and traversal
 is iterative so deep branches do not consume Elisp recursion. Conversation and
@@ -896,6 +951,8 @@ Context overflow is not an ordinary transient retry. It invokes compaction and
 allows at most one controlled replay of the failed model leg.
 
 ### 7.4 Restart recovery
+
+Recovery-origin admission and prefix binding follow Section 4.4.
 
 On opening a ledger, Epi reduces the complete record sequence and reconciles
 unfinished work:
@@ -1465,6 +1522,19 @@ Additional rules follow:
 - The ledger hash chain detects corruption and interior history edits, not
   adversarial deletion of a complete suffix after restart. Deployments
   requiring rollback evidence maintain an external signed head witness.
+- Portable Emacs Lisp exposes bounded pathname reads, not a stable file
+  descriptor shared across those reads. Cold open therefore sandwiches every
+  sliced read with the initial path/device/inode/link/size/time identity,
+  verifies the final chain-head prefix, and performs a final identity restat
+  immediately before constructor-only publication. This detects ordinary
+  persistent append, truncation, rewrite, and replacement before publication.
+  It does not prove resistance to an adversarial rename-away/read/rename-back
+  ABA between the two stats, nor can the final stat prevent an external actor
+  from changing the pathname immediately afterward. Strict inode continuity
+  requires an explicitly reviewed native or process descriptor helper, a
+  private snapshot write, a second validation representation, or a different
+  incremental reader. The pure-Elisp first slice claims none of those stronger
+  properties.
 - Canonical paths and true names govern trust and allowed roots.
 - Project instructions cannot modify tool policy.
 - Project Elisp never loads merely because an instruction file mentions it.

@@ -1,15 +1,15 @@
 # Epi Implementation Wiggum Handoff
 
-Status: Tasks 1–3 complete; Task 4 is next; productization design awaits approval
+Status: Tasks 1–4 complete; Task 5 is next; productization remains at its approved later integration boundary
 
-Last updated: 2026-07-21
+Last updated: 2026-07-22
 
 ## Current implementation run
 
 The active objective is to implement the approved first slice under the Wiggum
-loop. Tasks 1–3 are complete on the isolated feature branch. The package
-foundation, pinned GPTel seam, and canonical ledger codec are committed as
-`89a3437`, `a5b6924`, and `813ea02`, respectively.
+loop. Tasks 1–4 are complete on the isolated feature branch. The package
+foundation, pinned GPTel seam, canonical ledger codec, and semantic loader are
+committed as `89a3437`, `a5b6924`, `813ea02`, and `7125bfc`, respectively.
 
 Completed in this run:
 
@@ -61,19 +61,36 @@ cooperative cadence. Two independent final reviews repeated the complete codec
 suite, canonicalization oracles, golden verification, and work-slice probes on
 byte-identical source and test hashes and reported no remaining finding.
 
-Task 4, ledger loading and semantic validation, is the next implementation
-frontier. All implementation changes remain in the isolated feature worktree;
-`main` remains outside the implementation path.
+Task 4 is committed as
+`7125bfc9d9e72e6295832f3029152c0c2aaa8456`
+(`feat: validate Epi ledger structure and history`). It supplies the read-only
+`epi-ledger-open` path, one-pass bounded cold validation, immutable checkpoint
+publication, full hash/reference/lifecycle validation, precise
+clean/truncated/interior-corrupt classification, and structured conditions.
+The committed scope contains 72 isolated corrupt fixtures and five isolated
+torn fixtures. Independent cursor, lifecycle, inertness, simplicity,
+staged-plan, JSON-prefix, and post-commit reviews reported no remaining
+blocker.
+
+The implementation records two deliberate boundaries. Each retained
+version-one header value has a fixed 1 MiB encoded-byte cap. Portable filename
+reads use identity sandwiches and a final chain-head/identity check, but do not
+claim adversarial rename-away/read/restore ABA resistance. `recovery-origin`
+construction, provenance binding, and semantic admission remain a hard Task 6
+prerequisite.
+
+Task 5, private storage, locking, append, and immutable objects, is the next
+implementation frontier. Its Wave 0 capsule/CAS/index/batch contract and Wave
+1 path/byte-I/O contract are prepared in reviewed scratch artifacts; production
+work still begins from a meaningful red test. All changes remain in the
+isolated feature worktree; `main` remains outside the implementation path.
 
 The user also invoked `command-productize`. Read-only reconnaissance and
-current-tool research are complete. The recommended integration point is after
-Task 15 and before the final README/documentation task, so the productized
-targets cover the complete delivered file set and the README remains the final
-truth check. Productization implementation remains behind its required design
-approval gate. The open choice is whether its 5% performance rule replaces
-Task 15's existing matching-host elapsed/RSS thresholds or becomes a separate
-short benchmark; replacing the existing thresholds with 1.05 times the frozen
-five-process medians is the current recommendation.
+current-tool research are complete. Productization integrates after Task 15
+and before the final README/documentation task, so its targets cover the
+complete delivered file set and the README remains the final truth check. Its
+5% comparator is a separate short productization check and does not replace
+Task 15's 2.0x elapsed and 1.5x RSS acceptance thresholds.
 
 One terminal integration decision is known but does not block intermediate
 implementation: this repository has no remote or upstream. The inherited
@@ -106,18 +123,18 @@ PAL consensus tooling was not advertised in this environment. Anvil is
 available through a dedicated Emacs 30.2.50 daemon; its clean-buffer checks do
 not certify a separate interactive Emacs process.
 
-Tasks 1–3 used staged parallel contract, implementation, and review lanes while
-the coordinator owned integration, gates, and Git. Task 4 keeps that ownership
-model and owns `epi-ledger.el`, the codec tests, and its corruption/torn-tail
-fixtures. Productization remains a read-only design lane until approved and
-must not contend for Task 4 files.
+Tasks 1–4 used staged parallel contract, implementation, and review lanes while
+the coordinator owned integration, gates, and Git. Task 5 keeps that ownership
+model and owns only `epi-ledger.el` and `test/epi-ledger-io-test.el`.
+Productization remains at its later integration boundary and must not contend
+for Task 5 files.
 
 ## Prior planning outcome
 
 The approved Pi-grade Epi architecture now has a detailed, executable,
 test-first implementation plan at
 `docs/superpowers/plans/2026-07-21-epi-first-slice.md`. The planning unit was
-documentation-only; implementation is now complete through Task 3.
+documentation-only; implementation is now complete through Task 4.
 
 The plan covers the bounded first slice in Section 16 of
 `docs/superpowers/specs/2026-07-21-epi-design.md` and the applicable Section
@@ -178,6 +195,42 @@ all reported clean with no remaining actionable finding. No partner observation
 file remains under `doc/observations/`.
 
 ## Verification evidence
+
+The Task 4 implementation gate requires and has passed:
+
+- The coordinator's final `make test` passed 477/477 tests in fresh Emacs
+  processes: 79 GPTel contract, 342 ledger/JCS, 30 package, and 26 preflight;
+  the post-repair run completed at 2026-07-22 04:57:48-0700.
+- The complete ledger/JCS gate passed 342/342 tests, including 185
+  `epi-ledger-open-*` contracts. The fixture manifest contains 72 corrupt and
+  five torn artifacts, all byte-bound to deterministic builders.
+- Warning-as-error `make compile` exited 0; `make checkdoc` passed all three
+  production files; Anvil reported no source or test diagnostics; and the
+  exact frozen-root preflight passed 26/26.
+- The sealed `epi-ledger.el` SHA-256 is
+  `9f9e2de56f909b03511b502e0d778a2766df4265e24900a22ef87c1de3c90f47`;
+  the sealed codec-test SHA-256 is
+  `0ef33d917e811dc70683cba5a4292e8c620309c7b43039ea24dbde10d1cfa500`;
+  and the exact precommit staged-diff SHA-256 is
+  `669adebf4ab2ab86e026017bd6bc308ff9bc92cd230015d12a118786c4cc7ddc`.
+- Review found and repaired three publication-boundary defects before commit:
+  yield callbacks could observe or mutate the carry buffer, multi-chunk indexed
+  lookup could continue after finding its record, and impossible source-backed
+  JSON prefixes could be misclassified as recoverable truncation. TDD
+  regressions, the full gate, 333-prefix parity checks, large-fragment work
+  probes, and an independent post-commit audit all passed afterward.
+- The post-commit evidence audit also strengthened the previous-hash fixture
+  to break only the fourth rolling link and gave the multi-chunk index test an
+  independent exact-order oracle. The repaired fixture SHA-256 is
+  `ce2e7c8ca80a799c74a020e40bb35d9bf7a4e0f1c4b2d63d1eef4c440c3fd1ac`;
+  an independent re-audit approved both repairs before the amend.
+- The earlier staged-plan audit returned PASS for its pre-repair candidate at
+  report SHA-256
+  `e9dc8b6f191f4f3e02ea5f2bece6e4b70c23ffdc7ac3df1f863c818f0c52fb2e`;
+  it is retained as historical evidence, not as the final-candidate audit.
+  The final post-repair audit is
+  `docs/reviews/2026-07-22-task4-post-repair-audit.md`, SHA-256
+  `cb0fcff2814251924d28d29b69d916657f11843bef99f3d73696ddd6163973e9`.
 
 The Task 3 implementation gate requires and has passed:
 
@@ -261,9 +314,10 @@ silently downgraded to a local integration boundary.
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
    install a dependency, enter `nix develop`, or substitute installed Pi.
-4. Start Task 4 test-first: add isolated corrupt/torn fixtures and red
-   `epi-ledger-open` semantic-validation tests before extending the committed
-   Task 3 codec.
+4. Start Task 5 test-first in its exact file scope: modify `epi-ledger.el` and
+   create `test/epi-ledger-io-test.el`. Integrate the 12 Wave 0 capsule/CAS/
+   suffix-index/batch tests first, observe their targeted red results, and do
+   not begin filesystem mutation until that wave is green.
 5. Continue dependency-ready tasks numerically, one TDD/review/commit unit at
    a time, with architecture checkpoints after Tasks 2, 6, 12, and 15.
 6. Complete the separately approved productization spec and plan before
@@ -272,13 +326,46 @@ silently downgraded to a local integration boundary.
 7. Do not implement a later-slice roadmap capability without its own reviewed
    plan and capability gate.
 
+Task 5 boundary facts:
+
+- The implementation brief is `/var/tmp/epi-wg-task5/execution-brief.md`
+  (SHA-256
+  `d7ef0e5e7b7a5ae865068f3019bc0d5e9948e1d0cbef876a9c854e42448a26b3`).
+  Its seven ordered red/green waves are authoritative for the task.
+- Wave 0 is `/var/tmp/epi-wg-task5/wave0-tests.el` (SHA-256
+  `e478ed6ab7494d009a7fb2a22402dc0060f0b64c521acd735a0cce638b0142e1`),
+  exactly 12 clean targeted red tests. Wave 1 is
+  `/var/tmp/epi-wg-task5-wave1/wave1-tests.el` (SHA-256
+  `5f5c1e25055c3437102ce11dbc72139a11de41c767f7a07dbd614a8618abf748`),
+  exactly nine clean targeted red tests. Apply each through `apply_patch`; do
+  not copy scratch files over repository files.
+- Reuse Task 4's immutable checkpoint and private checkpoint cell only to
+  publish a verified append result as one replacement. Add the smallest
+  successor operations required by Task 5; do not restore the deleted
+  speculative clone/advance/publish/uncertain prototype cluster.
+- Keep every write behind the private no-conversion local-byte writer and the
+  explicit Epi lock. Update in-memory state only after suffix readback, chain
+  validation, and file identity/head verification.
+- Treat nil `process-attributes` as indeterminate unless a supported local
+  `list-system-processes` snapshot omits the PID. Bind both process probes to
+  the canonical local ledger parent through `default-directory`.
+- Preserve exact preexisting bytes. A losing writer or pre-write failure writes
+  nothing; uncertain post-write failure forces cold validation before another
+  append.
+- Implement only create, lock/stale-lock recovery, batched append, and object
+  put/get/presence. Do not begin tail recovery, quarantine, recovery manifests,
+  or `recovery-origin` semantics; those remain Task 6.
+- Retain the frozen GPTel, Pi, JCS, Emacs, Transient, and Compat roots. Run the
+  focused Task 5 gate, every ledger/prior test, warning-as-error compile, and
+  Checkdoc before the Task 5 commit.
+
 ## Stop-and-escalate counters
 
 - Repeated failing gate signature: 0/3.
 - Maximum unusable outputs from any one reviewer: 1/2; each affected reviewer
   recovered after one neutral local-quality prompt.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: none. Tasks 1–3 are committed and Task 4 is next; all
+- Current stop reason: none. Tasks 1–4 are committed and Task 5 is next; all
   exact preflight source inputs remain present and validated.
 - Terminal integration issue: no remote/upstream for the inherited push rule;
   this does not block local implementation work.

@@ -564,7 +564,7 @@ T12 ── T13 UI ── T14 acceptance ── T15 hardening ── T16 document
 frozen customization, deterministic ID/wall-clock/deadline-clock indirections,
 autoloaded public facade, and batch commands.
 
-- [ ] Create the initial `test/epi-test-helper.el` with only test loading,
+- [x] Create the initial `test/epi-test-helper.el` with only test loading,
   temporary-root, deterministic-ID, and independently bindable wall/deadline
   clock helpers. Every helper-owned symbol is prefixed `epi-test-`; this file
   never defines, advises, or substitutes a production Epi symbol and does not
@@ -572,7 +572,7 @@ autoloaded public facade, and batch commands.
   validator, runner, Makefile, or `epi.el`, write both
   `test/epi-preflight-test.el` and `test/epi-package-test.el`.
 
-- [ ] In `test/epi-preflight-test.el`, specify the validator behavior for an
+- [x] In `test/epi-preflight-test.el`, specify the validator behavior for an
   exact source-only resolution and its injected stale sibling `.elc`, earlier
   shadow directory, and native-artifact failures, using
   `epi-test-preflight-validate` as the explicit validator entry point. Also
@@ -583,7 +583,7 @@ autoloaded public facade, and batch commands.
   assertion must distinguish that diagnostic from a missing runner or
   unrelated child-process failure.
 
-- [ ] In `test/epi-package-test.el`, require `epi-test-helper` but register all
+- [x] In `test/epi-package-test.el`, require `epi-test-helper` but register all
   ERT tests without a top-level `require` of `epi`. Every test enters one shared
   `epi-test-with-epi-loaded` fixture that calls `(require 'epi)` only when the
   selected test executes. This lets the runner load and count the tests before
@@ -617,7 +617,7 @@ autoloaded public facade, and batch commands.
       (should (eq (plist-get (cadr condition) :code) 'not-idle)))))
 ```
 
-- [ ] Run the new infrastructure contract directly, before the runner and
+- [x] Run the new infrastructure contract directly, before the runner and
   Makefile exist:
 
 ```sh
@@ -632,7 +632,7 @@ because it does not observe the exact
 `SELECTOR matched zero loaded ERT tests` runner diagnostic. A missing test,
 zero selected tests, or an unrelated load error is not the intended red.
 
-- [ ] Run the package contract directly, still before the Makefile exists:
+- [x] Run the package contract directly, still before the Makefile exists:
 
 ```sh
 direnv exec . "$EPI_EMACS" --batch -Q -L . -L test \
@@ -645,7 +645,7 @@ then the selected tests fail when their fixture reports
 `Cannot open load file ... epi`. A top-level load failure or zero selected tests
 is not the intended red.
 
-- [ ] Now implement all preflight validator and probe utilities in
+- [x] Now implement all preflight validator and probe utilities in
   `test/epi-test-helper.el`, each under the `epi-test-*` namespace; create
   `test/run-tests.el` and the Makefile infrastructure.
   `epi-test-preflight-validate` is the validator entry point used by the tests
@@ -662,7 +662,7 @@ is not the intended red.
   above from `PI_ROOT` and `JCS_ORACLE_ROOT`, reports every observed mismatch,
   and performs no clone, fetch, install, checkout, or source rewrite.
 
-- [ ] Run the infrastructure tests directly once more, before asking the
+- [x] Run the infrastructure tests directly once more, before asking the
   Makefile to trust them:
 
 ```sh
@@ -675,11 +675,11 @@ Expected green: the three injected artifact probes fail closed for their exact
 reasons, the clean injected probe passes, helper loading leaves GPTel unloaded,
 and the runner's zero-match regression observes the dedicated nonzero exit.
 
-- [ ] Run `direnv exec . make preflight`. The target first runs those isolated
+- [x] Run `direnv exec . make preflight`. The target first runs those isolated
   probes, then validates the real declared inputs exactly. Any probe or input
   mismatch stops implementation before `epi.el` is created.
 
-- [ ] Re-run the still-red package contract through the stable runner:
+- [x] Re-run the still-red package contract through the stable runner:
 
 ```sh
 direnv exec . make test-one TEST=test/epi-package-test.el SELECTOR='^epi-package-'
@@ -688,7 +688,7 @@ direnv exec . make test-one TEST=test/epi-package-test.el SELECTOR='^epi-package
 Expected red: nonzero ERT exit with `Cannot open load file ... epi`; the runner
 must report that it selected at least one `epi-package-*` test.
 
-- [ ] Implement `epi.el` with `lexical-binding: t`, Package-Requires for Emacs
+- [x] Implement `epi.el` with `lexical-binding: t`, Package-Requires for Emacs
   30.1, Org 9.7, GPTel 0.9.9.5, Transient 0.7.8, and Compat 30.1.0.0;
   `defgroup`; every exact public `defcustom` name/default/type frozen above;
   the complete condition hierarchy and one-plist signal contract;
@@ -700,7 +700,7 @@ must report that it selected at least one `epi-package-*` test.
   only canonical string/cons/vector payloads. Public accessors copy strings and
   custom-deep-copy payload on every read; do not use `copy-tree`.
 
-- [ ] Define these conditions with the exact frozen parent relationships:
+- [x] Define these conditions with the exact frozen parent relationships:
   `epi-error`; direct children `epi-busy`, `epi-invalid-state`,
   `epi-limit-exceeded`, `epi-ledger-error`, `epi-gptel-error`,
   `epi-tool-error`, `epi-interaction-required`, and `epi-cancelled`;
@@ -715,7 +715,7 @@ must report that it selected at least one `epi-package-*` test.
   `:code`, using `plist-member` before calling
   `(signal condition (list plist))`.
 
-- [ ] Add dynamically bindable private functions/variables for UUID generation,
+- [x] Add dynamically bindable private functions/variables for UUID generation,
   Epi-profile RFC 3339 wall time, the process-local nondecreasing deadline clock, its
   high-water state, and cooperative yield. Implement the deadline default as
   the frozen process-local, nonpersisted high-water mark over `float-time` epoch
@@ -724,18 +724,18 @@ must report that it selected at least one `epi-package-*` test.
   independently and never advise `current-time`, `float-time`, or global
   random state.
 
-- [ ] Define `epi-session-p` as a `cl-defgeneric` whose default method returns
+- [x] Define `epi-session-p` as a `cl-defgeneric` whose default method returns
   nil. Install autoload declarations for the public runtime/UI functions and
   interactive commands and public UI mode functions; mark command autoloads
   interactive. Tasks 8 and 13 define those exact symbols in their owning
   modules. Do not add facade wrappers, fallback semantics, or parallel
   `epi-runtime-*` public functions.
 
-- [ ] Implement `test/checkdoc.el` with `checkdoc-current-buffer`, not `checkdoc-batch`. Add isolated build directories for `.elc` output and cleanup.
+- [x] Implement `test/checkdoc.el` with `checkdoc-current-buffer`, not `checkdoc-batch`. Add isolated build directories for `.elc` output and cleanup.
 
-- [ ] Run the focused test again. Expected green: all `epi-package-*` tests pass and zero unexpected results.
+- [x] Run the focused test again. Expected green: all `epi-package-*` tests pass and zero unexpected results.
 
-- [ ] Run:
+- [x] Run:
 
 ```sh
 direnv exec . make compile
@@ -744,7 +744,7 @@ direnv exec . make checkdoc
 
 Expected: no warnings, errors, or source-tree `.elc` files.
 
-- [ ] Commit:
+- [x] Commit:
 
 ```sh
 git add Makefile epi.el test/epi-test-helper.el test/run-tests.el test/checkdoc.el test/epi-preflight-test.el test/epi-package-test.el
@@ -772,7 +772,7 @@ git commit -m "build: establish the Epi package test foundation"
 
 **Task boundary:** `epi-tools.el`, `epi-ledger.el`, and runtime message structs do not exist yet. This seam task consumes copied provider-neutral descriptor/history alists owned by `epi-gptel-snapshot` and fixture helpers; it must not require or stub later production modules. Tasks 11–12 connect the proven seam to the real Epi structs without changing the contract.
 
-- [ ] Write contract tests for exact backend/model selection, effective Curl streaming, text/reasoning/nil/t/tool-call/tool-result callback forms, per-leg versus request completion, terminal post actions, abort both during transport and while paused in TOOL, redacted errors, two- and three-leg sequential tools, exact raw call IDs, and typed replay.
+- [x] Write contract tests for exact backend/model selection, effective Curl streaming, text/reasoning/nil/t/tool-call/tool-result callback forms, per-leg versus request completion, terminal post actions, abort both during transport and while paused in TOOL, redacted errors, two- and three-leg sequential tools, exact raw call IDs, and typed replay.
 
 ```elisp
 (ert-deftest epi-gptel-contract-leg-finish-is-not-terminal ()
@@ -792,7 +792,7 @@ git commit -m "build: establish the Epi package test foundation"
                    (epi-test-openai-tool-call-id data)))))
 ```
 
-- [ ] Run:
+- [x] Run:
 
 ```sh
 direnv exec . make test-one TEST=test/epi-gptel-contract-test.el SELECTOR='^epi-gptel-contract-'
@@ -800,45 +800,45 @@ direnv exec . make test-one TEST=test/epi-gptel-contract-test.el SELECTOR='^epi-
 
 Expected red: missing `epi-gptel` types and driver functions.
 
-- [ ] Define the adapter structs and constant `epi-gptel-capability` with value `openai-chat-completions/sequential-tools-v1`. The capability report includes GPTel version, commit, backend family, streaming mode, typed-history mode, sequential-tool limit, and every disabled feature.
+- [x] Define the adapter structs and constant `epi-gptel-capability` with value `openai-chat-completions/sequential-tools-v1`. The capability report includes GPTel version, commit, backend family, streaming mode, typed-history mode, sequential-tool limit, and every disabled feature.
 
-- [ ] Build the request with `gptel-request :dry-run t`. Resolve the exact named backend, require classic `gptel-openai` rather than `gptel-openai-responses`, require the exact model before GPTel can sanitize it, require Curl, and inspect the realized FSM info before starting it.
+- [x] Build the request with `gptel-request :dry-run t`. Resolve the exact named backend, require classic `gptel-openai` rather than `gptel-openai-responses`, require the exact model before GPTel can sanitize it, require Curl, and inspect the realized FSM info before starting it.
 
-- [ ] Force all request-sensitive settings buffer-locally. Translate Epi's false sentinel to GPTel's request sentinel `:json-false`; effective dry-run data must contain `parallel_tool_calls` as JSON false whenever tools exist. If GPTel overwrites or omits that setting, fail compatibility rather than accepting possible parallel calls.
+- [x] Force all request-sensitive settings buffer-locally. Translate Epi's false sentinel to GPTel's request sentinel `:json-false`; effective dry-run data must contain `parallel_tool_calls` as JSON false whenever tools exist. If GPTel overwrites or omits that setting, fail compatibility rather than accepting possible parallel calls.
 
-- [ ] Compile Epi tools to unregistered GPTel tools with a fail-closed stub function, `:async t`, and `:confirm t`. Reject schemas outside the frozen subset, copy before GPTel preprocesses it, and compare effective dry-run `tools[].function.parameters` with an independently normalized expected object. Force `gptel-confirm-tool-calls` so GPTel only returns proposals.
+- [x] Compile Epi tools to unregistered GPTel tools with a fail-closed stub function, `:async t`, and `:confirm t`. Reject schemas outside the frozen subset, copy before GPTel preprocesses it, and compare effective dry-run `tools[].function.parameters` with an independently normalized expected object. Force `gptel-confirm-tool-calls` so GPTel only returns proposals.
 
-- [ ] Attach Epi's terminal closure to the FSM `:post` list before explicitly transitioning `INIT -> WAIT` in the hidden buffer. Treat callback `t` as `leg-finished` only. Terminal settlement comes only from the post action.
+- [x] Attach Epi's terminal closure to the FSM `:post` list before explicitly transitioning `INIT -> WAIT` in the hidden buffer. Treat callback `t` as `leg-finished` only. Terminal settlement comes only from the post action.
 
-- [ ] Install two narrowly scoped safety guards without replacing GPTel's transport, response semantics, callback, or FSM. Replace the pinned FSM WAIT action only with `epi-gptel--handle-wait`, which calls a captured, hash-verified function object for stock `gptel--handle-wait` exactly once. During that stock call, temporarily intercept `set-process-filter`; when stock Curl setup installs `gptel-curl--stream-filter`, install instead a request-local closure over that exact stock filter and capture the process/FSM. Refuse zero, multiple, or unexpected filter installations. Delegating the complete stock WAIT handler must preserve its per-leg clearing of `:tool-result`, `:tool-use`, `:error`, `:http-status`, `:reasoning`, and `:tokens`, its Curl dispatch, and its buffer-local post-request-hook call; never call `gptel-curl-get-response` directly from the replacement. The closure maintains a request-wide raw-byte total from request start to terminal and a leg total reset only after a documented `leg-finished` and immediately before the guarded continuation starts the next leg. It checks both totals before delegating an unchanged safe chunk; a crossing chunk terminalizes without insertion. Restore `set-process-filter` before returning, and leave a non-Epi request's WAIT action/filter untouched.
+- [x] Install two narrowly scoped safety guards without replacing GPTel's transport, response semantics, callback, or FSM. Replace the pinned FSM WAIT action only with `epi-gptel--handle-wait`, which calls a captured, hash-verified function object for stock `gptel--handle-wait` exactly once. During that stock call, temporarily intercept `set-process-filter`; when stock Curl setup installs `gptel-curl--stream-filter`, install instead a request-local closure over that exact stock filter and capture the process/FSM. Refuse zero, multiple, or unexpected filter installations. Delegating the complete stock WAIT handler must preserve its per-leg clearing of `:tool-result`, `:tool-use`, `:error`, `:http-status`, `:reasoning`, and `:tokens`, its Curl dispatch, and its buffer-local post-request-hook call; never call `gptel-curl-get-response` directly from the replacement. The closure maintains a request-wide raw-byte total from request start to terminal and a leg total reset only after a documented `leg-finished` and immediately before the guarded continuation starts the next leg. It checks both totals before delegating an unchanged safe chunk; a crossing chunk terminalizes without insertion. Restore `set-process-filter` before returning, and leave a non-Epi request's WAIT action/filter untouched.
 
-- [ ] Add an around method for the pinned `gptel-curl--parse-stream` that acts only when its `info` belongs to an Epi request. Before calling the stock method, scan every newly complete `data:` outer envelope from a private audit marker, parse that outer JSON with duplicate detection while retaining each `function.arguments` fragment as raw text, and inspect every element/index in `delta.tool_calls`. At a completed call, feed the concatenated raw argument string to a bounded single-pass Epi safety scanner before GPTel's `gptel--json-read-string`: require one flat root object, at most 64 members, unique decoded string keys present in the frozen schema, primitive values of the declared type, safe finite numbers, and same-type enum membership; reject nested values, null, trailing data, or malformed escapes. Discard transient decoded scalars. Cache by raw call ID only the exact bounded raw string and a nonsemantic attestation containing byte length/SHA-256, member count, tool-schema fingerprint, and validation generation; do not construct or cache the canonical argument alist and emit no text, reasoning, call, history, result, or other provider-semantic event.
+- [x] Add an around method for the pinned `gptel-curl--parse-stream` that acts only when its `info` belongs to an Epi request. Before calling the stock method, scan every newly complete `data:` outer envelope from a private audit marker, parse that outer JSON with duplicate detection while retaining each `function.arguments` fragment as raw text, and inspect every element/index in `delta.tool_calls`. At a completed call, feed the concatenated raw argument string to a bounded single-pass Epi safety scanner before GPTel's `gptel--json-read-string`: require one flat root object, at most 64 members, unique decoded string keys present in the frozen schema, primitive values of the declared type, safe finite numbers, and same-type enum membership; reject nested values, null, trailing data, or malformed escapes. Discard transient decoded scalars. Cache by raw call ID only the exact bounded raw string and a nonsemantic attestation containing byte length/SHA-256, member count, tool-schema fingerprint, and validation generation; do not construct or cache the canonical argument alist and emit no text, reasoning, call, history, result, or other provider-semantic event.
 
-- [ ] On parallel indices, more than one distinct call, mixed nonempty text and tool content, duplicate outer keys, malformed outer JSON, oversized ID/name/raw arguments, argument member/schema violation, or another capability violation, the pre-parse auditor invalidates the generation and invokes the adapter's exactly-once fail-stop path without calling the stock parser for that envelope. In the safe case it calls the stock parser exactly once on the original buffered bytes. “Before GPTel argument parsing” means the Epi bounded argument scanner completes before GPTel calls `gptel--json-read-string`; parsing the containing SSE JSON and validating the frozen flat argument object are safety duties, not an alternate provider response loop.
+- [x] On parallel indices, more than one distinct call, mixed nonempty text and tool content, duplicate outer keys, malformed outer JSON, oversized ID/name/raw arguments, argument member/schema violation, or another capability violation, the pre-parse auditor invalidates the generation and invokes the adapter's exactly-once fail-stop path without calling the stock parser for that envelope. In the safe case it calls the stock parser exactly once on the original buffered bytes. “Before GPTel argument parsing” means the Epi bounded argument scanner completes before GPTel calls `gptel--json-read-string`; parsing the containing SSE JSON and validating the frozen flat argument object are safety duties, not an alternate provider response loop.
 
-- [ ] Replace the pinned FSM's TOOL handler with an adapter-owned guard that runs before the stock handler. It requires exactly one call, no text/tool mixture, a declared frozen tool name, and a valid raw argument object. On failure it sets a redacted adapter error and transitions directly to `ERRS`; it never invokes GPTel's stock tool handler or starts another leg. On success it delegates to the stock handler so GPTel still owns execution sequencing.
+- [x] Replace the pinned FSM's TOOL handler with an adapter-owned guard that runs before the stock handler. It requires exactly one call, no text/tool mixture, a declared frozen tool name, and a valid raw argument object. On failure it sets a redacted adapter error and transitions directly to `ERRS`; it never invokes GPTel's stock tool handler or starts another leg. On success it delegates to the stock handler so GPTel still owns execution sequencing.
 
-- [ ] On the resulting declared-tool callback, require one pending continuation and one raw attestation. Copy the GPTel-accepted ID and name, correlate them with the complete raw OpenAI `function.arguments` JSON retained for that call, and require byte equality with the scanner-cached raw string plus equality of length/SHA-256/schema fingerprint/generation. Only now run a separate bounded callback normalizer over those exact bytes to construct the duplicate-free canonical flat Epi alist, rechecking the attestation before enqueue. Then erase both raw bytes and attestation. Never derive durable arguments from GPTel's lossy keyword plist, and never normalize a call that GPTel did not semantically accept.
+- [x] On the resulting declared-tool callback, require one pending continuation and one raw attestation. Copy the GPTel-accepted ID and name, correlate them with the complete raw OpenAI `function.arguments` JSON retained for that call, and require byte equality with the scanner-cached raw string plus equality of length/SHA-256/schema fingerprint/generation. Only now run a separate bounded callback normalizer over those exact bytes to construct the duplicate-free canonical flat Epi alist, rechecking the attestation before enqueue. Then erase both raw bytes and attestation. Never derive durable arguments from GPTel's lossy keyword plist, and never normalize a call that GPTel did not semantically accept.
 
-- [ ] On replay, convert a fresh copy of Epi's flat canonical argument object to GPTel's keyword-plist/sentinel representation before typed-history construction. Prove nested object/array/null schemas are rejected, while empty root object, false, strings, safe numbers, duplicate-key rejection, and reopen round trips preserve the enabled subset.
+- [x] On replay, convert a fresh copy of Epi's flat canonical argument object to GPTel's keyword-plist/sentinel representation before typed-history construction. Prove nested object/array/null schemas are rejected, while empty root object, false, strings, safe numbers, duplicate-key rejection, and reopen round trips preserve the enabled subset.
 
-- [ ] Keep the transport fixture support internal to `epi-gptel.el`. `test/epi-gptel-fixture-transport.el` supplies byte fixtures, but tests call an Epi-owned driver and never call provider parsers or FSM accessors directly. Dynamically replace only `gptel-curl-get-response` for the full asynchronous request lifetime.
+- [x] Keep the transport fixture support internal to `epi-gptel.el`. `test/epi-gptel-fixture-transport.el` supplies byte fixtures, but tests call an Epi-owned driver and never call provider parsers or FSM accessors directly. Dynamically replace only `gptel-curl-get-response` for the full asynchronous request lifetime.
 
-- [ ] Add negative tests: missing model, compiled/shadowed GPTel artifacts, non-Curl transport, ineffective streaming, Responses API, other provider, missing raw call ID, two calls in one vector, a later nonzero tool index, calls split across deltas, same-delta mixed text/tool, later-delta mixed text/tool, undeclared-only tool proposal, mixed declared/undeclared proposals, unsupported schema/argument shapes, duplicate inner argument keys, duplicate outer envelope keys, call ID/name/raw argument JSON exactly at and one byte above each limit, single- and multi-leg raw totals exactly at and one byte above their leg/turn limits, media, replayed reasoning, steering, configuration refresh, malformed SSE, transport error, duplicate continuation, callback exception, a request stuck in GPTel's TOOL state without a delivered proposal, a valid proposal held past the leg timeout for human approval, concurrent Epi requests, and an unrelated non-Epi GPTel request. Seed every cleared WAIT-info key with a distinct non-nil sentinel before leg two and prove the captured stock handler clears all six before Curl setup, invokes the buffer-local hook exactly once, and still reaches the real pinned filter/parser/FSM. Rejected fixtures never reach its inner-argument parse, TOOL handler, tool function, continuation, or second transport leg; valid approval waits do not fire the leg watchdog, and non-Epi requests remain untouched.
+- [x] Add negative tests: missing model, compiled/shadowed GPTel artifacts, non-Curl transport, ineffective streaming, Responses API, other provider, missing raw call ID, two calls in one vector, a later nonzero tool index, calls split across deltas, same-delta mixed text/tool, later-delta mixed text/tool, undeclared-only tool proposal, mixed declared/undeclared proposals, unsupported schema/argument shapes, duplicate inner argument keys, duplicate outer envelope keys, call ID/name/raw argument JSON exactly at and one byte above each limit, single- and multi-leg raw totals exactly at and one byte above their leg/turn limits, media, replayed reasoning, steering, configuration refresh, malformed SSE, transport error, duplicate continuation, callback exception, a request stuck in GPTel's TOOL state without a delivered proposal, a valid proposal held past the leg timeout for human approval, concurrent Epi requests, and an unrelated non-Epi GPTel request. Seed every cleared WAIT-info key with a distinct non-nil sentinel before leg two and prove the captured stock handler clears all six before Curl setup, invokes the buffer-local hook exactly once, and still reaches the real pinned filter/parser/FSM. Rejected fixtures never reach its inner-argument parse, TOOL handler, tool function, continuation, or second transport leg; valid approval waits do not fire the leg watchdog, and non-Epi requests remain untouched.
 
-- [ ] Exercise the WAIT interception failure contract directly: make the captured stock handler install no process filter, install twice, and install one function other than the exact pinned `gptel-curl--stream-filter`. Each case must take one redacted incompatible/fail-stop terminal path, restore the original `set-process-filter`, leave no process/continuation registered, and never invoke an unexpected filter. The one-install control must wrap and delegate to the exact stock filter once.
+- [x] Exercise the WAIT interception failure contract directly: make the captured stock handler install no process filter, install twice, and install one function other than the exact pinned `gptel-curl--stream-filter`. Each case must take one redacted incompatible/fail-stop terminal path, restore the original `set-process-filter`, leave no process/continuation registered, and never invoke an unexpected filter. The one-install control must wrap and delegate to the exact stock filter once.
 
-- [ ] Start a resettable leg watchdog only while a network leg awaits provider progress. A valid tool-proposal callback plus captured continuation is documented completion of that network leg: cancel its watchdog before enqueuing the proposal, and do not arm the next leg until the guarded continuation actually starts it. Human `tool-policy` wait and tool execution are owned by separate runtime policy/executor timers and can outlast the leg timeout. On expiry without a valid callback, invalidate continuations and attempt public `gptel-abort`. If no transport is registered because GPTel reached TOOL without delivering a valid proposal, the adapter owns terminalization: atomically mark the request terminal, enqueue one `request-failed`, and close the handle without advancing the FSM. `epi-gptel-abort` uses the same exactly-once fallback but emits `request-aborted`. Do not synthesize or release an unproven continuation.
+- [x] Start a resettable leg watchdog only while a network leg awaits provider progress. A valid tool-proposal callback plus captured continuation is documented completion of that network leg: cancel its watchdog before enqueuing the proposal, and do not arm the next leg until the guarded continuation actually starts it. Human `tool-policy` wait and tool execution are owned by separate runtime policy/executor timers and can outlast the leg timeout. On expiry without a valid callback, invalidate continuations and attempt public `gptel-abort`. If no transport is registered because GPTel reached TOOL without delivering a valid proposal, the adapter owns terminalization: atomically mark the request terminal, enqueue one `request-failed`, and close the handle without advancing the FSM. `epi-gptel-abort` uses the same exactly-once fallback but emits `request-aborted`. Do not synthesize or release an unproven continuation.
 
-- [ ] Set `gptel-post-request-hook` buffer-locally to nil. Add a hostile global-hook contract proving it never runs from Epi's hidden buffer.
+- [x] Set `gptel-post-request-hook` buffer-locally to nil. Add a hostile global-hook contract proving it never runs from Epi's hidden buffer.
 
-- [ ] Run focused tests. Expected green: every contract event sequence and exact request-data assertion passes offline.
+- [x] Run focused tests. Expected green: every contract event sequence and exact request-data assertion passes offline.
 
-- [ ] Run all Task 1 and Task 2 tests, compile, and checkdoc.
+- [x] Run all Task 1 and Task 2 tests, compile, and checkdoc.
 
-- [ ] **Fail-closed gate:** If the pinned GPTel cannot preserve typed two- and three-leg sequential calls, raw IDs, exactly-once continuation, or terminal observation, stop implementation and report the failing fixture and source anchor. Do not build a provider loop outside GPTel.
+- [x] **Fail-closed gate:** If the pinned GPTel cannot preserve typed two- and three-leg sequential calls, raw IDs, exactly-once continuation, or terminal observation, stop implementation and report the failing fixture and source anchor. Do not build a provider loop outside GPTel.
 
-- [ ] Commit:
+- [x] Commit:
 
 ```sh
 git add epi-gptel.el test/epi-gptel-contract-test.el test/epi-gptel-fixture-transport.el test/fixtures/gptel
@@ -861,9 +861,9 @@ git commit -m "test: prove the pinned GPTel adapter contract"
 
 **Interfaces produced:** header, draft, record, ledger, object-ref, message structs; JCS encoder; header and record sealing; strict framing parser and renderer.
 
-- [ ] Transcribe the complete RFC 8785 Appendix B number inputs and expected strings into a data-only fixture. Generate the independent canonical byte strings and SHA-256 digests with `node "$JCS_ORACLE_ROOT/node-es6/verify-canonicalization.js"` plus `test/generate-jcs-goldens.el`, an Emacs Lisp driver that invokes the pinned `canonicalize.js` in a separate Node process without adding JavaScript to the Epi tree. Record repository URL, commit, source hashes, exact command, Node version, and input hash in fixture metadata. `make jcs-goldens` first runs `make preflight`, checks Node, and compares the oracle's shipped input/output vectors; it rewrites the fixture only under an explicit `EPI_UPDATE_GOLDENS=1`. Tests consume only fixed goldens and never require JavaScript at runtime. Add Unicode key-order, escaping, negative-zero, safe-integer-boundary, non-finite, duplicate-key, lone-surrogate, U+10FFFF, U+110000, unibyte ASCII, unibyte non-ASCII, malformed multibyte, and unsupported-value cases.
+- [x] Transcribe the complete RFC 8785 Appendix B number inputs and expected strings into a data-only fixture. Generate the independent canonical byte strings and SHA-256 digests with `node "$JCS_ORACLE_ROOT/node-es6/verify-canonicalization.js"` plus `test/generate-jcs-goldens.el`, an Emacs Lisp driver that invokes the pinned `canonicalize.js` in a separate Node process without adding JavaScript to the Epi tree. Record repository URL, commit, source hashes, exact command, Node version, and input hash in fixture metadata. `make jcs-goldens` first runs `make preflight`, checks Node, and compares the oracle's shipped input/output vectors; it rewrites the fixture only under an explicit `EPI_UPDATE_GOLDENS=1`. Tests consume only fixed goldens and never require JavaScript at runtime. Add Unicode key-order, escaping, negative-zero, safe-integer-boundary, non-finite, duplicate-key, lone-surrogate, U+10FFFF, U+110000, unibyte ASCII, unibyte non-ASCII, malformed multibyte, and unsupported-value cases.
 
-- [ ] Generate and review the independent fixture explicitly:
+- [x] Generate and review the independent fixture explicitly:
 
 ```sh
 direnv exec . env EPI_UPDATE_GOLDENS=1 make jcs-goldens
@@ -889,7 +889,7 @@ Expected: the pinned oracle's own vectors pass before the Epi fixture changes; m
            (epi-test-jcs-unicode-order-object)))))
 ```
 
-- [ ] Run:
+- [x] Run:
 
 ```sh
 direnv exec . make test-one TEST=test/epi-ledger-codec-test.el SELECTOR='^epi-jcs-'
@@ -897,13 +897,13 @@ direnv exec . make test-one TEST=test/epi-ledger-codec-test.el SELECTOR='^epi-jc
 
 Expected red: `void-function epi-ledger--jcs-encode`.
 
-- [ ] Implement a recursive, type-checking JCS encoder. Encode key sort values as BOM-free UTF-16BE bytes. Normalize `json-serialize` number tokens with the explicit coefficient/decimal-position algorithm. Never canonicalize an alist after converting it through a hash table. Count live container nesting and cumulative object members plus array elements while encoding; reject depth 33 and entry 131,073 before retaining unbounded output.
+- [x] Implement a recursive, type-checking JCS encoder. Encode key sort values as BOM-free UTF-16BE bytes. Normalize `json-serialize` number tokens with the explicit coefficient/decimal-position algorithm. Never canonicalize an alist after converting it through a hash table. Count live container nesting and cumulative object members plus array elements while encoding; reject depth 33 and entry 131,073 before retaining unbounded output.
 
-- [ ] Make record sealing count canonical output bytes while encoding and stop before retaining output beyond the 15 MiB canonical-JSON limit; render framing only when the complete frame remains within 16 MiB. The cold framing parser checks both stored frame size and JSON byte-range size before lexical validation or JSON parsing. Its incremental lexical validator tracks string/escape state, live object/array depth, and cumulative object members plus array elements without allocating decoded values; only size- and structure-compliant bytes reach `json-parse-string`. Treat the whole-record JSON decode as one measured nonpreemptible unit between cooperative yields, never as part of the 1 MiB I/O/lexical slice counter. Add exact-limit and one-over fixtures for nesting and container entries, plus exact-limit and one-byte-over fixtures for highly escaped strings and maximum framing overhead, not only ordinary ASCII.
+- [x] Make record sealing count canonical output bytes while encoding and stop before retaining output beyond the 15 MiB canonical-JSON limit; render framing only when the complete frame remains within 16 MiB. The cold framing parser checks both stored frame size and JSON byte-range size before lexical validation or JSON parsing. Its incremental lexical validator tracks string/escape state, live object/array depth, and cumulative object members plus array elements without allocating decoded values; only size- and structure-compliant bytes reach `json-parse-string`. Treat the whole-record JSON decode as one measured nonpreemptible unit between cooperative yields, never as part of the 1 MiB I/O/lexical slice counter. Add exact-limit and one-over fixtures for nesting and container entries, plus exact-limit and one-byte-over fixtures for highly escaped strings and maximum framing overhead, not only ordinary ASCII.
 
-- [ ] Run the JCS group. Expected green: every official vector and negative input passes.
+- [x] Run the JCS group. Expected green: every official vector and negative input passes.
 
-- [ ] Write exact golden tests for the header, root hash, one record, property order, block delimiters, LF normalization, omitted optionals, and record hash. The expected strings and hashes are literal fixtures, not generated by the code under test.
+- [x] Write exact golden tests for the header, root hash, one record, property order, block delimiters, LF normalization, omitted optionals, and record hash. The expected strings and hashes are literal fixtures, not generated by the code under test.
 
 ```elisp
 (ert-deftest epi-ledger-codec-round-trips-org-looking-text ()
@@ -916,17 +916,17 @@ Expected red: `void-function epi-ledger--jcs-encode`.
                    (epi-record-hash parsed)))))
 ```
 
-- [ ] Implement strict header and level-one record framing without invoking Org Babel, property evaluation, or general Org interpretation. Hash the exact stored JSON byte range before decoding. A single-pass JCS lexical validator checks whitespace, minimal escapes, canonical number syntax, duplicate/sorted keys, and UTF-16 key order without rebuilding a second serialized copy; then parse the JSON as data and verify semantic drawer agreement.
+- [x] Implement strict header and level-one record framing without invoking Org Babel, property evaluation, or general Org interpretation. Hash the exact stored JSON byte range before decoding. A single-pass JCS lexical validator checks whitespace, minimal escapes, canonical number syntax, duplicate/sorted keys, and UTF-16 key order without rebuilding a second serialized copy; then parse the JSON as data and verify semantic drawer agreement.
 
-- [ ] Define the complete first-slice payload validators from the schema table. Verify the frozen Epi RFC 3339 timestamp profile, including year `0000`, uppercase `T`/`Z`, explicit offset, and rejection of leap-second spellings; also verify UUID/ID, lowercase hash, role, content type, call ordering, and sentinel types. Redacted details remain canonical data.
+- [x] Define the complete first-slice payload validators from the schema table. Verify the frozen Epi RFC 3339 timestamp profile, including year `0000`, uppercase `T`/`Z`, explicit offset, and rejection of leap-second spellings; also verify UUID/ID, lowercase hash, role, content type, call ordering, and sentinel types. Redacted details remain canonical data.
 
-- [ ] Add delimiter-injection, control-character, CRLF input, malformed UTF-8, drawer/JSON disagreement, self-hash-in-envelope, unknown schema, unknown record type, and noncanonical-but-semantically-equivalent JSON failures.
+- [x] Add delimiter-injection, control-character, CRLF input, malformed UTF-8, drawer/JSON disagreement, self-hash-in-envelope, unknown schema, unknown record type, and noncanonical-but-semantically-equivalent JSON failures.
 
-- [ ] Run all codec tests, then all prior tests, compile, and checkdoc.
+- [x] Run all codec tests, then all prior tests, compile, and checkdoc.
 
-- [ ] **Fail-closed gate:** If exact RFC number bytes, UTF-16 ordering, or the independent canonical-byte/digest goldens cannot be reproduced, stop. Do not substitute ordinary `json-serialize` output or a locale sort.
+- [x] **Fail-closed gate:** If exact RFC number bytes, UTF-16 ordering, or the independent canonical-byte/digest goldens cannot be reproduced, stop. Do not substitute ordinary `json-serialize` output or a locale sort.
 
-- [ ] Commit:
+- [x] Commit:
 
 ```sh
 git add Makefile epi-ledger.el test/epi-ledger-codec-test.el test/generate-jcs-goldens.el test/fixtures/jcs test/fixtures/ledger
@@ -944,7 +944,15 @@ git commit -m "feat: define the canonical Epi ledger codec"
 
 **Interfaces produced:** read-only `epi-ledger-open`, full-chain validation, clean/torn/interior classification, and structured ledger conditions.
 
-- [ ] Add tests whose fixtures each isolate one violation: bad header, missing/duplicate/non-first `session-info`, a hash-valid mismatch between header `EPI_SESSION_ID` and `session-info.payload.session_id`, unsupported format/schema, duplicate ID, forward parent/target, impossible record target, previous-hash mismatch, payload hash mismatch, property mismatch, orphan tool result, invalid tool status/pairing, duplicate call ID, duplicate terminal, contradictory terminal, clean EOF, truncated final headline/drawer/block/JSON, and valid unfinished suffix.
+**Completion:** Implemented in
+`7125bfc9d9e72e6295832f3029152c0c2aaa8456`
+(`feat: validate Epi ledger structure and history`). The final candidate
+passed 477/477 offline tests, warning-as-error compilation, Checkdoc for all
+three production files, exact preflight, and independent staged and
+post-repair reviews. The sealed implementation and test hashes are recorded
+in `WIGGUM-HANDOFF.md`.
+
+- [x] Add tests whose fixtures each isolate one violation: bad header, missing/duplicate/non-first `session-info`, a hash-valid mismatch between header `EPI_SESSION_ID` and `session-info.payload.session_id`, unsupported format/schema, duplicate ID, forward parent/target, impossible record target, previous-hash mismatch, payload hash mismatch, property mismatch, orphan tool result, invalid tool status/pairing, duplicate call ID, duplicate terminal, contradictory terminal, clean EOF, truncated final headline/drawer/block/JSON, and valid unfinished suffix.
 
 ```elisp
 (ert-deftest epi-ledger-open-identifies-corrupt-record ()
@@ -965,7 +973,7 @@ git commit -m "feat: define the canonical Epi ledger codec"
     (should (equal before (epi-test-file-bytes file)))))
 ```
 
-- [ ] Run:
+- [x] Run:
 
 ```sh
 direnv exec . make test-one TEST=test/epi-ledger-codec-test.el SELECTOR='^epi-ledger-open-'
@@ -973,19 +981,30 @@ direnv exec . make test-one TEST=test/epi-ledger-codec-test.el SELECTOR='^epi-le
 
 Expected red: open either accepts corruption or lacks structured conditions.
 
-- [ ] Implement one forward scan as an iterative cursor that records byte offsets, sequence numbers, ID-to-record mappings, file identity, validated end offset, and tail hash. Process I/O and lexical work at no more than the frozen records/bytes/time budget per slice, cooperatively yield, and resume without exposing partial state. Treat each exact stored-JSON `secure-hash` as one separately timed nonpreemptible unit after its 15-MiB size check; yield immediately before and after it and report exceptional duration. Revalidate file identity before returning the completed ledger. Keep payload bodies only in record objects; indexes refer to those objects and do not copy content.
+- [x] Implement one forward scan as an iterative cursor that records byte offsets, sequence numbers, ID-to-record mappings, file identity, validated end offset, and tail hash. Process I/O and lexical work at no more than the frozen records/bytes/time budget per slice, cooperatively yield, and resume without exposing partial state. Treat each exact stored-JSON `secure-hash` as one separately timed nonpreemptible unit after its 15-MiB size check; yield immediately before and after it and report exceptional duration. Revalidate file identity before returning the completed ledger. Keep payload bodies only in record objects; indexes refer to those objects and do not copy content.
 
-- [ ] Validate that every envelope parent/target refers backward to an allowed record family, every lifecycle ID agrees between envelope and payload, and no entity has more than one terminal. Enforce the frozen cross-record tool equality byte-for-byte/JCS-for-JCS: proposal message versus `tool-planned`; every lifecycle target/turn/operation/call ID; result parent/turn/call/name/model-result; and the exact denied/success/error/timeout/cancelled/uncertain status mapping. Add individually hash-valid negative fixtures for every unequal duplicated field, wrong timeout/cancellation mapping, result after uncertainty, missing required result, and result attached to a different call or operation. Permit only the typed `turn-started.payload.message_id` forward intent and require the later user message to match it when present.
+- [x] Validate that every envelope parent/target refers backward to an allowed record family, every lifecycle ID agrees between envelope and payload, and no entity has more than one terminal. Enforce the frozen cross-record tool equality byte-for-byte/JCS-for-JCS: proposal message versus `tool-planned`; every lifecycle target/turn/operation/call ID; result parent/turn/call/name/model-result; and the exact denied/success/error/timeout/cancelled/uncertain status mapping. Add individually hash-valid negative fixtures for every unequal duplicated field, wrong timeout/cancellation mapping, result after uncertainty, missing required result, and result attached to a different call or operation. Permit only the typed `turn-started.payload.message_id` forward intent and require the later user message to match it when present.
 
-- [ ] Classify a suffix as truncated only when the valid prefix ends exactly before one incomplete final frame. Any complete malformed frame, hash failure, bytes after a fragment, or impossible reference is interior corruption.
+- [x] Classify a suffix as truncated only when the valid prefix ends exactly before one incomplete final frame. Any complete malformed frame, hash failure, bytes after a fragment, or impossible reference is interior corruption.
 
-- [ ] Signal one plist as condition data, beginning with `:code` and including path, sequence, record ID, byte offset, and a redacted nested `:cause` where available. Tests assert codes and identifiers, never prose.
+- [x] Signal one plist as condition data, beginning with `:code` and including path, sequence, record ID, byte offset, and a redacted nested `:cause` where available. Tests assert codes and identifiers, never prose.
 
-- [ ] Confirm `epi-ledger-open` performs no writes, lock takeover, recovery, quarantine, object creation, or UI activity.
+- [x] Confirm `epi-ledger-open` performs no writes, lock takeover, recovery, quarantine, object creation, or UI activity.
 
-- [ ] Run all ledger codec/validation tests and all prior tests.
+- [x] Run all ledger codec/validation tests and all prior tests.
 
-- [ ] Commit:
+Cold open reads adjacent bounded pathname ranges into an unibyte buffer,
+parses exact buffer source regions, and retains no second frame-sized JSON
+copy. Every requested read, delimiter scan, and buffer transfer is charged.
+Finalization produces a bounded private record index before a final
+chain-head check, deliberate yield, and identity restat; publication below
+that restat performs constructors and field stores only. The portable-Elisp
+pathname ABA boundary and the fixed header-value limit are normative design
+constraints, not unrecorded implementation exceptions. Impossible final JSON
+prefixes are interior corruption; only lexically completable prefixes qualify
+as a truncated tail.
+
+- [x] Commit:
 
 ```sh
 git add epi-ledger.el test/epi-ledger-codec-test.el test/fixtures/ledger
@@ -1039,9 +1058,9 @@ Expected red: append/create/object functions are absent.
 
 - [ ] Implement `epi-ledger-create` with canonical local-path checks, private directory creation, and one precomputed byte string containing the complete header plus `initial-drafts`, whose first and only session-default record must be a valid `session-info`. Acquire an exclusive create lock whose expected file identity is `absent`, write/flush/read-verify the complete mode-0600 bytes at a hidden temporary sibling, revalidate that the destination is absent, and publish by a no-clobber same-filesystem rename while the lock is held. Refuse an existing path. A crash may leave only a recognized hidden temporary or a complete normal ledger, never a header-only normal session.
 
-- [ ] Define a canonical lock token containing host, PID, process-start identity from `(alist-get 'start (process-attributes pid))`, nonce, expected file identifier, expected validated offset, and expected head hash. Create `FILE.epi-lock` through the private byte writer's exclusive-create mode, independent of `create-lockfiles`.
+- [ ] Define a canonical lock token containing host, PID, process-start identity from `(alist-get 'start (process-attributes pid))`, nonce, canonical ledger path, expected file identifier, expected validated offset, and expected head hash. Create `FILE.epi-lock` through the private byte writer's exclusive-create mode, independent of `create-lockfiles`. Bind `default-directory` to the proven-local ledger parent while obtaining the current process identity; missing, malformed, or signaling self attributes fail with a structured conflict before lock creation or any other write.
 
-- [ ] Permit automatic takeover only when the token is same-host and PID plus start identity proves that exact process is no longer live. If the start identity is unavailable, the host is remote, or liveness is indeterminate, signal `epi-ledger-conflict`.
+- [ ] Permit automatic takeover only for a same-host token when either a present process has a different normalized start identity, proving PID reuse, or `process-attributes` is nil and a supported local `list-system-processes` snapshot omits the PID. Nil attributes alone are indeterminate, as are an unavailable process list, a listed PID whose start identity cannot be read, and a remote owner. Bind `default-directory` to the proven-local ledger parent for both probes and signal `epi-ledger-conflict` for every indeterminate case.
 
 - [ ] Add module-level `epi-ledger-recover-stale-lock`. It accepts the expected token SHA-256, archives that exact token, obtains a fresh exclusive lock, and revalidates the complete file identity/head before doing anything. It never treats token age alone as proof.
 
@@ -1055,7 +1074,7 @@ Expected red: append/create/object functions are absent.
 
 - [ ] Make object reads unibyte, size/hash verified, and fail with `epi-missing-object` for absence or mismatch. Before reading, stat the path and reject a file larger than either the declared bounded size or 16 MiB; read at most declared-size-plus-one bytes, require exact length, then hash. Add exact-cap, declared-size mismatch, replaced-oversize, and one-byte-over tests. Never infer reachability or semantic order from directory contents.
 
-- [ ] Test disabled ordinary Emacs lockfiles, malformed/remote/indeterminate tokens, same-host dead owner, PID reuse with a different start identity, token replacement during unlock, a competing head update, mismatched pre-existing object, and missing referenced object.
+- [ ] Test disabled ordinary Emacs lockfiles, malformed/remote/indeterminate tokens, nil or signaling current-process attributes, nil process attributes with a listed PID, signaling or unavailable process lists, same-host death proven by a supported process list, PID reuse with a different start identity, canonical-local `default-directory` for current-process identity and both stale-owner probes even under a remote ambient value, failure before write or takeover when those probes are inconclusive, a one-shot takeover race, token replacement during unlock, a competing head update, mismatched pre-existing object, and missing referenced object.
 
 - [ ] Run all ledger tests and all prior tests.
 
@@ -1107,6 +1126,17 @@ Expected red: `epi-ledger-recover-tail` is missing.
 - [ ] Because the recovered ledger has a new header and root hash, re-seal the logical valid-prefix records under the new hash chain through the same records/bytes/time-budgeted work cursor. Preserve record IDs, types, timestamps, parents, targets, lifecycle IDs, and payloads except that the first `session-info.payload.session_id` must change to the destination session ID so header and record remain consistent; change chain-dependent hashes and physical offsets. Test semantic equality explicitly with this named identity substitution rather than claiming byte identity for the destination prefix.
 
 - [ ] Store the exact trailing fragment bytes in the destination object store with role `recovery-fragment`. The `recovery-origin` payload records original canonical path, source session ID, source file byte size, source header hash, source valid-prefix head, fragment offset/hash/size/object reference, and destination's corresponding valid-prefix head. A small `source_evidence_sha256` hashes the canonical tuple of those fields. The at-most-16-MiB fragment hash is one measured nonpreemptible unit bracketed by cursor yields; reading/copying its bytes remains sliced. Do not compute a redundant ordinary digest over the complete ledger: the validated record chain authenticates the prefix and the fragment digest authenticates every remaining byte.
+
+- [ ] Add the semantic `recovery-origin` transition before treating any
+  recovered destination as openable. Require exactly one origin; bind its
+  destination valid-prefix head to the actual predecessor; recompute its
+  source evidence digest; admit it after every otherwise valid recoverable
+  suffix without erasing the suffix state; and suspend ordinary adjacency
+  only for the prescribed recovery terminalization. Ordinary message,
+  provider, or tool continuation remains forbidden until Task 8 terminalizes
+  the preserved suffix. Add Task 6 fixtures for every proposal, planned,
+  approved, started, result-pending, select-leaf, intended-message, and
+  uncertainty suffix class, together with explicit Task 8 reopen fixtures.
 
 - [ ] Copy or hard-link every reachable source object into the new object's store, then verify its length and hash through the destination path. Iterate objects and bounded copy chunks through the recovery cursor, yielding between units; a verified same-inode hard link need not recopy bytes. Do not carry unreachable directory entries into the new session.
 
