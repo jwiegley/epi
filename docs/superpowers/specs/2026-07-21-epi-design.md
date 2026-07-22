@@ -434,13 +434,27 @@ Recovery provenance is enabled as one semantic unit in the explicit
 torn-tail recovery task. Before that task lands, the codec recognizes and
 field-validates `recovery-origin`, but cold-open evidence does not claim that
 a structurally valid origin is uniquely bound to the destination history.
-Recovery adds the origin transition, verifies its destination-prefix head and
-source-evidence digest, and permits exactly one origin after every legal
-recoverable suffix while preserving that suffix's unfinished state. The
-exception admits only the later prescribed recovery terminalization; it does
-not reopen ordinary model or tool continuation. The recovered destination is
-not an accepted runtime input until those Task 6 semantics and the Task 8
-reconciliation fixtures pass.
+Recovery adds the origin transition, verifies its source-evidence digest, and
+appends exactly one new origin after every legal recoverable suffix while
+preserving that suffix's unfinished state. Historical origins remain legal
+after their own recovery barriers have been reconciled, so a later recovery
+can retain their fragment evidence unchanged. The newest origin alone binds
+its destination-prefix head to its actual predecessor in the newly resealed
+chain; evidence hashes are unique within a ledger. The exception admits only
+the later prescribed recovery terminalization; it does not reopen ordinary
+model or tool continuation. The recovered destination is not an accepted
+runtime input until those Task 6 semantics and the Task 8 reconciliation
+fixtures pass.
+
+The source-evidence digest is SHA-256 over the no-newline UTF-8 JCS bytes of a
+closed version-one object. It contains `kind` equal to
+`epi-recovery-source-evidence`, `version` equal to 1, and every
+`recovery-origin` payload field except `source_evidence_sha256`. Recovery
+fragments use media type `application/octet-stream` and role
+`recovery-fragment`. When no destination is supplied, the destination is
+`<canonical-source-parent>/<destination-session-id>.org`; an unfinished
+manifest is discovered before allocating a new ID and freezes the retry's
+destination and session identity.
 
 Recovery is a restartable multi-file transaction. A canonical fsynced manifest
 at `<quarantine-directory>/.epi-recovery/<recovery-id>/manifest.jcs` binds the
@@ -450,10 +464,12 @@ staging paths, final quarantine path, and last completed phase. Its monotonic
 phases are prepared, objects transferred, destination objects published,
 destination ledger published, source ledger staged, source objects staged, and
 quarantine published. Destination objects publish and verify before the
-destination ledger; source ledger and object directory then move into a hidden
-quarantine staging directory whose final rename publishes quarantine. Normal
-discovery ignores hidden recovery paths. Re-entry verifies and resumes each
-idempotent phase, including a crash between source moves, and removes the
+destination ledger. Because portable Emacs exposes no race-free no-clobber
+directory rename, recovery exclusively reserves each final directory, moves
+only manifest-bound entries into it, and publishes a canonical, fsynced,
+verified `complete.jcs` marker last. Normal discovery ignores hidden recovery
+paths and incomplete quarantine directories. Re-entry verifies and resumes
+each idempotent phase, including a crash between source moves, and removes the
 manifest only after destination and final quarantine have both been verified.
 No extra whole-ledger digest is needed: validation already hashes each record
 into the chain head, while the bounded fragment digest covers every trailing
