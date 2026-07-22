@@ -27,6 +27,19 @@
 
 The planning host currently has no `emacs` command in its shell environment, and the dedicated Anvil Emacs does not have GPTel on its `load-path`. That does not invalidate this documentation plan, but implementation must stop at the preflight until the repository's existing environment supplies the pinned dependencies.
 
+The bootstrap order is explicit because a fresh checkout has no Makefile yet.
+Before Task 1, use only read-only shell checks to locate the already-provided
+`EPI_EMACS`, `GPTEL_ROOT`, `PI_ROOT`, `JCS_ORACLE_ROOT`, and
+`EPI_EXTRA_LOAD_PATH` inputs; these availability checks are not a substitute
+for preflight. In Task 1, create the test helper and write the package test
+and dedicated preflight/runner regression test first, then run both initial red
+contracts directly with `EPI_EMACS`. Next implement the validator utilities in
+the helper plus the test runner and Makefile, run the isolated preflight tests
+directly, run `direnv exec . make preflight`, and stop on any mismatch before
+implementing `epi.el`. Every later task starts only after that exact preflight
+has passed. Do not invoke a nonexistent `make preflight`, and do not weaken or
+bypass it to bootstrap the target that defines it.
+
 Use these inputs:
 
 ```sh
@@ -77,7 +90,11 @@ Pi is a behavioral oracle, not a code port. GPTel is a runtime dependency behind
 | `epi-runtime.el` | Session FSM, snapshots, FIFO, commit barriers, settlement | All provider-neutral modules and `epi-gptel.el` |
 | `epi-ui.el` | Conversation, composer, ledger, tree, approval views | Public facade and runtime |
 
-`epi.el` must not eagerly require GPTel. Lower modules may require `epi.el`; public facade functions lazily require their owning implementation module to avoid cycles.
+`epi.el` must not eagerly require GPTel. Lower modules may require `epi.el`.
+The facade installs autoload declarations for public functions and commands
+owned by `epi-runtime.el` and `epi-ui.el`; those modules later define the
+declared public names directly. `epi.el` does not define wrapper functions that
+require an owner and delegate to a second internal public seam.
 
 ## Test File Map
 
@@ -86,6 +103,7 @@ test/
   checkdoc.el
   run-tests.el
   epi-test-helper.el
+  epi-preflight-test.el
   epi-package-test.el
   epi-gptel-contract-test.el
   epi-gptel-fixture-transport.el
@@ -109,6 +127,7 @@ test/
     gptel/
     ledger/
     jcs/
+      appendix-b.el
       independent-goldens.json
     performance/
       time-darwin.txt
@@ -116,7 +135,12 @@ test/
       reference.json
 ```
 
-`test/run-tests.el` accepts `TESTS` and `SELECTOR` from the Makefile, loads only the requested test files when supplied, treats `SELECTOR` as a raw ERT regular-expression string (not an Elisp symbol read from the environment), and calls `ert-run-tests-batch-and-exit`. `test/checkdoc.el` opens each named production file in a temporary Emacs Lisp buffer and calls `checkdoc-current-buffer`. Do not use a nonexistent `checkdoc-batch` entry point.
+`test/run-tests.el` accepts `TESTS` and `SELECTOR` from the Makefile, loads only the requested test files when supplied, treats `SELECTOR` as a raw ERT regular-expression string (not an Elisp symbol read from the environment), and calls `ert-run-tests-batch-and-exit`. When a selector is supplied, the runner must preselect against the loaded ERT tests and exit nonzero if it matches zero tests; an empty selection can never satisfy an expected-red or expected-green step. `test/checkdoc.el` opens each named production file in a temporary Emacs Lisp buffer and calls `checkdoc-current-buffer`. Do not use a nonexistent `checkdoc-batch` entry point.
+
+All preflight validator and probe utilities live in
+`test/epi-test-helper.el`, use the `epi-test-*` namespace, and are exercised by
+`test/epi-preflight-test.el`. Loading the helper never loads GPTel and never
+defines, advises, aliases, or substitutes a production Epi symbol.
 
 The Makefile exposes these stable commands:
 
@@ -257,7 +281,7 @@ The public first-slice API in `epi.el` is:
     (project-root &key file working-directory backend model system-prompt tools))
 (cl-defun epi-session-open (file &key backend model tools))
 (defun epi-session-close (session))
-(defun epi-session-p (object))
+(cl-defgeneric epi-session-p (object))
 (defun epi-session-id (session))
 (defun epi-session-file (session))
 (defun epi-session-phase (session))
@@ -276,11 +300,50 @@ The public first-slice API in `epi.el` is:
 (defun epi-display-ledger (session))
 ```
 
+These forms freeze signatures, not facade-wrapper implementations.
+`epi-session-p` is the one generic defined in `epi.el`, with a default method
+that returns nil for every object; Task 8 adds the `epi--session` method.
+`epi.el` installs autoload declarations for every other runtime- or UI-owned
+name above and for the interactive names below. The owning module defines that
+same public symbol when autoloaded; no parallel `epi-runtime-*` public API is
+introduced.
+
 One live-session registry is authoritative inside an Emacs process. It indexes both canonical file identity `(truename device inode)` and durable session ID; creation reserves canonical parent/name until publication supplies file identity. `epi-session-open` returns the exact existing session object only when file/session identity and supplied backend/model/tool bindings match. A conflicting binding, copied session ID, replaced path, or hard-link alias signals before constructing another runtime; an in-progress reservation signals `epi-busy`. `epi-session-close` signals `epi-busy` while an operation is active (the caller must abort/wait first), otherwise closes handles/buffers and unregisters only entries whose value is `eq` to that session, then becomes idempotent. Failed create/open removes only its own reservation token.
 
-The public `epi-session-recover-tail` facade also participates in this registry. It atomically reserves the source canonical path, existing file identity, and durable session ID plus the destination canonical parent/name, any existing destination identity, and a newly allocated destination session ID before invoking the low-level closed-ledger recovery primitive. Acquisition uses one deterministic key order and rolls back only the caller's exact composite token. Any live session or create/open/recovery reservation reachable through a source or destination symlink, hard link, copied session ID, or path alias signals `epi-busy`, even when that live session is idle or failed; callers must close it first. Every success or failure releases the exact reservations in `unwind-protect`, publishes no live session object, and returns the canonical recovered-ledger path; a later explicit open performs normal validation. The low-level `epi-ledger-recover-tail` has no registry awareness and is used only after the facade owns these reservations or in isolated closed-ledger tests. Symlink and hard-link aliases, duplicate/concurrent opens, failed-open cleanup, busy-close refusal, close/reopen, path replacement, and live/aliased/reserved recovery endpoints are contract tests.
+The public `epi-session-recover-tail` operation also participates in this registry. It atomically reserves the source canonical path, existing file identity, and durable session ID plus the destination canonical parent/name, any existing destination identity, and a newly allocated destination session ID before invoking the low-level closed-ledger recovery primitive. Acquisition uses one deterministic key order and rolls back only the caller's exact composite token. Any live session or create/open/recovery reservation reachable through a source or destination symlink, hard link, copied session ID, or path alias signals `epi-busy`, even when that live session is idle or failed; callers must close it first. Every success or failure releases the exact reservations in `unwind-protect`, publishes no live session object, and returns the canonical recovered-ledger path; a later explicit open performs normal validation. The low-level `epi-ledger-recover-tail` has no registry awareness and is used only after the runtime operation owns these reservations or in isolated closed-ledger tests. Symlink and hard-link aliases, duplicate/concurrent opens, failed-open cleanup, busy-close refusal, close/reopen, path replacement, and live/aliased/reserved recovery endpoints are contract tests.
 
-`epi-event` has read-only slots `kind`, `durability`, `session-id`, `generation`, `operation-id`, `turn-id`, `attempt-id`, `call-id`, `record-id`, `sequence`, `live-sequence`, and copied `payload`. First-slice committed event kinds are the frozen record-type symbols plus derived `tool-approval-needed` and `agent-settled`; each carries the applicable durable record sequence, and `agent-settled` uses its operation terminal's sequence. First-slice volatile kinds are `text-delta`, `reasoning-delta`, `tool-progress`, and `diagnostic`; they carry only a monotonically increasing live sequence and are never replayed. “Replayable” means a committed event can be reconstructed from ledger reduction; first-slice subscription starts with the next event and does not synthesize a backlog.
+`epi-event` is constructed only through one private validating constructor and
+has raw read-only slots `kind`, `durability`, `session-id`, `generation`,
+`operation-id`, `turn-id`, `attempt-id`, `call-id`, `record-id`, `sequence`,
+`live-sequence`, and `payload`. The struct uses a private raw-accessor prefix
+and generates no public copier. Durability is exactly `committed` or
+`volatile`. A committed kind requires its positive durable `sequence` and
+forbids `live-sequence`; a volatile kind requires its positive
+`live-sequence` and forbids `sequence`. The constructor validates that kind and
+durability agree. First-slice committed event kinds are the frozen record-type
+symbols plus derived `tool-approval-needed` and `agent-settled`; each carries
+the applicable durable record sequence, and `agent-settled` uses its operation
+terminal's sequence. First-slice volatile kinds are `text-delta`,
+`reasoning-delta`, `tool-progress`, and `diagnostic`; they are never replayed.
+
+Construction copies every incoming string-valued slot and custom-deep-copies
+the admitted canonical payload data: strings, conses, and vectors are rebuilt
+recursively, while immutable atoms pass through. It does not rely on
+`copy-tree`, and noncanonical mutable payload types are rejected. Public
+`epi-event-*` accessors are ordinary functions over the private raw accessors:
+each read returns a fresh copy of any string and performs the same custom deep
+copy for `payload`. Mutating values returned by those supported accessors
+cannot alter runtime/ledger state or a later accessor result. The underlying
+`cl-defstruct` record is not a security boundary: direct sequence mutation such
+as `aset`, or use of private raw accessors, is unsupported and may corrupt the
+notification seen by a later observer. Runtime and ledger state never read
+authority back from a dispatched event, so even unsupported representation
+mutation cannot change the committed outcome. Dispatch itself does not make a
+new event per subscriber: settlement subscribers and the one-shot callback
+still receive the same `eq` `agent-settled` event object.
+“Replayable” means a committed event can be reconstructed from ledger
+reduction; first-slice subscription starts with the next event and does not
+synthesize a backlog.
 
 `epi-session-subscribe` calls `FUNCTION` as `(FUNCTION SESSION EVENT)` in registration order from the bounded drain and returns an opaque token owned by that session. Dispatch snapshots the current subscriber vector for one event. `epi-session-unsubscribe` returns non-nil exactly once for the matching session/token, returns nil thereafter or for another session, and affects only later events. Subscriber mutation, failure, and overrun cannot change an already committed outcome.
 
@@ -332,6 +395,38 @@ The stable module seams are:
 
 Constructors containing `--` and all GPTel continuation values are private. Public callers receive opaque sessions and subscription tokens, copied summary plists, stable Epi events, and structured Epi errors.
 
+Every Epi condition is signaled with data containing exactly one plist. That
+plist is proper and even-length, and always has a non-nil symbolic `:code`;
+any further keys are condition-specific. No condition adds a leading message
+string, a second plist, or positional data. One private signaling helper first
+requires `plistp` (or an equivalent proper/even-length check), then uses
+`plist-member` to distinguish a missing `:code` before validating its value,
+and finally calls `(signal condition (list plist))`; production call sites do
+not assemble condition data independently. The complete inheritance tree is frozen as
+follows:
+
+```text
+epi-error
+├── epi-busy
+├── epi-invalid-state
+│   └── epi-stale-generation
+├── epi-limit-exceeded
+├── epi-ledger-error
+│   ├── epi-ledger-format-error
+│   ├── epi-ledger-corrupt
+│   │   └── epi-ledger-truncated-tail
+│   ├── epi-ledger-conflict
+│   └── epi-missing-object
+├── epi-gptel-error
+│   ├── epi-gptel-incompatible
+│   └── epi-provider-error
+├── epi-tool-error
+│   ├── epi-tool-denied
+│   └── epi-tool-uncertain
+├── epi-interaction-required
+└── epi-cancelled
+```
+
 The interactive facade is `epi` (create and display), `epi-open-session`, `epi-send`, `epi-abort`, `epi-show-tree`, and `epi-show-ledger`. Display functions return a live buffer, reuse the buffer owned by the same session when present, and rebuild it from the ledger when killed.
 
 The normalized adapter event kinds are closed:
@@ -348,56 +443,85 @@ The first-slice tool-schema subset is a root object with `additionalProperties` 
 
 ## Frozen First-Slice Limits
 
-The limits are customizable, but tests bind and assert these defaults:
+Every option named here is a public `defcustom`; the Type column freezes its
+Customize `:type` contract, and tests bind and assert its default and validated
+range. “Positive integer” requires an integer greater than zero.
+“Nonnegative seconds” requires a number greater than or equal to zero and is
+stored in seconds even when the displayed default is in milliseconds.
 
-| Limit | Default | Failure behavior |
-|---|---:|---|
-| Ledger/recovery records per work slice | 256 | Yield with private cursor |
-| Ledger/recovery I/O or lexical bytes per work slice | 1 MiB | Yield with private cursor |
-| Ledger/recovery wall time per work slice | 8 ms | Yield after current bounded unit |
-| Canonical JSON bytes per record | 15 MiB | Reject before append; corrupt if stored input exceeds |
-| Complete rendered record frame | 16 MiB | Reject before append; corrupt if stored frame exceeds |
-| Whole-record JSON materialization | 15 MiB | One measured nonpreemptible decode unit between yields |
-| One record/object/fragment SHA-256 input | 16 MiB | One measured nonpreemptible hash unit between yields |
-| JSON container nesting per record | 32 | Reject during encode or pre-decode lexical validation |
-| JSON object members plus array elements per record | 131,072 | Reject during encode or pre-decode lexical validation |
-| First-slice immutable object | 16 MiB | Refuse object creation; preserve source |
-| Torn final frame/fragment | 16 MiB | Refuse recovery; preserve source |
-| Drain items per timer | 128 | Reschedule remaining FIFO |
-| Drain bytes per timer | 512 KiB | Reschedule remaining FIFO |
-| Drain wall time per timer | 8 ms | Reschedule remaining FIFO |
-| Queued callback items | 4,096 | Invalidate generation and abort |
-| Queued callback bytes | 16 MiB | Invalidate generation and abort |
-| Queue overflow terminal reserve | 1 item / 4 KiB | Unavailable to ordinary callbacks; carries one fixed failure |
-| One normalized callback event | 512 KiB | Invalidate generation and abort |
-| Raw tool-argument JSON | 256 KiB | Reject before GPTel's inner object materialization |
-| Canonical tool-schema JSON | 256 KiB | Reject snapshot before GPTel dry-run |
-| Properties/required entries per tool | 64 each | Reject snapshot |
-| Enum entries per property/tool | 64 / 256 | Reject snapshot |
-| Top-level argument members | 64 | Reject in pre-parse argument scanner |
-| Provider call ID | 4 KiB | Reject in pre-parse safety audit |
-| Provider tool name | 128 bytes | Reject in pre-parse safety audit |
-| Raw provider response per leg | 4 MiB | Reject crossing chunk before GPTel buffer insertion |
-| Raw provider response per turn | 32 MiB | Fail turn; never start another leg |
-| Provider text plus reasoning per leg | 2 MiB | Invalidate generation and abort |
-| Provider text plus reasoning per turn | 16 MiB | Fail turn; never start another leg |
-| Sequential tool calls per turn | 32 | Fail before accepting call 33 |
-| GPTel no-progress leg timeout | 120 seconds | Diagnose, invalidate, abort |
-| Human approval timeout | disabled (`nil`) | Wait for decision; optional timer may durably deny |
-| Accepted user prompt | 2 MiB | Reject before operation/turn acceptance |
-| Base system prompt | 256 KiB | Reject session creation |
-| One instruction resource | 256 KiB | Fail preflight before snapshot |
-| Aggregate instruction resources | 1 MiB | Fail preflight before prompt acceptance |
-| Projected provider context | 16 MiB | Fail preflight before GPTel dry-run |
-| `read_file` result | 1 MiB | Return ordinary limit error without content |
-| `replace_text` input file | 4 MiB | Deny before preview |
-| `replace_text` rendered diff | 1 MiB | Deny before approval |
-| Initial rendered messages | 200 | Offer explicit load-earlier action |
-| Conversation content per render action | 1 MiB | Insert bounded preview and continuation button |
-| Tree nodes per render action | 1,000 | Insert collapsed continuation nodes |
-| Tree label bytes per node | 384 bytes | Truncate display label; preserve ID on button |
-| Tree content per render action | 512 KiB | Insert continuation node |
-| Subscriber/settled callback budget | 4 ms | Diagnose; disable repeating subscriber |
+| Limit | Public option | Default | Type | Failure behavior |
+|---|---|---:|---|---|
+| Ledger/recovery records per work slice | `epi-ledger-work-record-limit` | 256 | positive integer | Yield with private cursor |
+| Ledger/recovery I/O or lexical bytes per work slice | `epi-ledger-work-byte-limit` | 1 MiB | positive integer | Yield with private cursor |
+| Ledger/recovery wall time per work slice | `epi-ledger-work-time-budget` | 8 ms | nonnegative seconds | Yield after current bounded unit |
+| Canonical JSON bytes per record | `epi-record-json-byte-limit` | 15 MiB | positive integer | Reject before append; corrupt if stored input exceeds |
+| Complete rendered record frame | `epi-record-frame-byte-limit` | 16 MiB | positive integer | Reject before append; corrupt if stored frame exceeds |
+| Whole-record JSON materialization | `epi-record-decode-byte-limit` | 15 MiB | positive integer | One measured nonpreemptible decode unit between yields |
+| One record/object/fragment SHA-256 input | `epi-hash-input-byte-limit` | 16 MiB | positive integer | One measured nonpreemptible hash unit between yields |
+| JSON container nesting per record | `epi-json-depth-limit` | 32 | positive integer | Reject during encode or pre-decode lexical validation |
+| JSON object members plus array elements per record | `epi-json-item-limit` | 131,072 | positive integer | Reject during encode or pre-decode lexical validation |
+| First-slice immutable object | `epi-object-byte-limit` | 16 MiB | positive integer | Refuse object creation; preserve source |
+| Torn final frame/fragment | `epi-recovery-fragment-byte-limit` | 16 MiB | positive integer | Refuse recovery; preserve source |
+| Drain items per timer | `epi-drain-item-limit` | 128 | positive integer | Reschedule remaining FIFO |
+| Drain bytes per timer | `epi-drain-byte-limit` | 512 KiB | positive integer | Reschedule remaining FIFO |
+| Drain wall time per timer | `epi-drain-time-budget` | 8 ms | nonnegative seconds | Reschedule remaining FIFO |
+| Queued callback items | `epi-callback-queue-item-limit` | 4,096 | positive integer | Invalidate generation and abort |
+| Queued callback bytes | `epi-callback-queue-byte-limit` | 16 MiB | positive integer | Invalidate generation and abort |
+| Queue overflow terminal reserve items | `epi-callback-queue-reserve-items` | 1 | positive integer | Unavailable to ordinary callbacks; carries one fixed failure |
+| Queue overflow terminal reserve bytes | `epi-callback-queue-reserve-bytes` | 4 KiB | positive integer | Unavailable to ordinary callbacks; carries one fixed failure |
+| One normalized callback event | `epi-callback-event-byte-limit` | 512 KiB | positive integer | Invalidate generation and abort |
+| Raw tool-argument JSON | `epi-tool-argument-byte-limit` | 256 KiB | positive integer | Reject before GPTel's inner object materialization |
+| Canonical tool-schema JSON | `epi-tool-schema-byte-limit` | 256 KiB | positive integer | Reject snapshot before GPTel dry-run |
+| Properties per tool | `epi-tool-schema-property-limit` | 64 | positive integer | Reject snapshot |
+| Required entries per tool | `epi-tool-schema-required-limit` | 64 | positive integer | Reject snapshot |
+| Enum entries per property | `epi-tool-schema-enum-per-property-limit` | 64 | positive integer | Reject snapshot |
+| Enum entries per tool | `epi-tool-schema-enum-total-limit` | 256 | positive integer | Reject snapshot |
+| Top-level argument members | `epi-tool-argument-member-limit` | 64 | positive integer | Reject in pre-parse argument scanner |
+| Provider call ID | `epi-provider-call-id-byte-limit` | 4 KiB | positive integer | Reject in pre-parse safety audit |
+| Provider tool name | `epi-provider-tool-name-byte-limit` | 128 bytes | positive integer | Reject in pre-parse safety audit |
+| Raw provider response per leg | `epi-provider-leg-raw-byte-limit` | 4 MiB | positive integer | Reject crossing chunk before GPTel buffer insertion |
+| Raw provider response per turn | `epi-provider-turn-raw-byte-limit` | 32 MiB | positive integer | Fail turn; never start another leg |
+| Provider text plus reasoning per leg | `epi-provider-leg-output-byte-limit` | 2 MiB | positive integer | Invalidate generation and abort |
+| Provider text plus reasoning per turn | `epi-provider-turn-output-byte-limit` | 16 MiB | positive integer | Fail turn; never start another leg |
+| Sequential tool calls per turn | `epi-provider-tool-call-limit` | 32 | positive integer | Fail before accepting call 33 |
+| GPTel no-progress leg timeout | `epi-gptel-no-progress-timeout` | 120 seconds | nonnegative seconds | Diagnose, invalidate, abort |
+| Human approval timeout | `epi-tool-approval-timeout` | disabled (`nil`) | nil or nonnegative seconds | Wait for decision; optional timer may durably deny |
+| Accepted user prompt | `epi-user-prompt-byte-limit` | 2 MiB | positive integer | Reject before operation/turn acceptance |
+| Base system prompt | `epi-system-prompt-byte-limit` | 256 KiB | positive integer | Reject session creation |
+| One instruction resource | `epi-instruction-resource-byte-limit` | 256 KiB | positive integer | Fail preflight before snapshot |
+| Aggregate instruction resources | `epi-instruction-total-byte-limit` | 1 MiB | positive integer | Fail preflight before prompt acceptance |
+| Projected provider context | `epi-provider-context-byte-limit` | 16 MiB | positive integer | Fail preflight before GPTel dry-run |
+| `read_file` result | `epi-read-file-result-byte-limit` | 1 MiB | positive integer | Return ordinary limit error without content |
+| `replace_text` input file | `epi-replace-text-input-byte-limit` | 4 MiB | positive integer | Deny before preview |
+| `replace_text` rendered diff | `epi-replace-text-diff-byte-limit` | 1 MiB | positive integer | Deny before approval |
+| Initial rendered messages | `epi-ui-initial-message-limit` | 200 | positive integer | Offer explicit load-earlier action |
+| Conversation content per render action | `epi-ui-conversation-action-byte-limit` | 1 MiB | positive integer | Insert bounded preview and continuation button |
+| Tree nodes per render action | `epi-ui-tree-node-limit` | 1,000 | positive integer | Insert collapsed continuation nodes |
+| Tree label bytes per node | `epi-ui-tree-label-byte-limit` | 384 bytes | positive integer | Truncate display label; preserve ID on button |
+| Tree content per render action | `epi-ui-tree-action-byte-limit` | 512 KiB | positive integer | Insert continuation node |
+| Subscriber/settled callback budget | `epi-callback-time-budget` | 4 ms | nonnegative seconds | Diagnose; disable repeating subscriber |
+
+The remaining Task 1 public customization is also frozen:
+
+| Setting | Public option | Default | Type |
+|---|---|---|---|
+| Session ledger directory | `epi-session-directory` | `(expand-file-name "epi/sessions/" user-emacs-directory)` | directory |
+| Optional global instruction file | `epi-global-instructions-file` | `nil` | nil or file |
+
+Time has two separate private, dynamically bindable sources. The wall-clock
+source supplies time values only for RFC 3339 durable timestamps. The deadline
+source supplies numeric seconds for budgets and timeouts. Its production
+default samples `float-time`'s epoch wall time and returns the maximum of that
+sample and a process-local high-water mark. It is therefore monotonicized wall
+time, not an operating-system monotonic primitive: a backward wall-clock jump
+can stall the reported value and delay a budget until wall time catches up,
+while a forward jump may expire work early and fail closed. The high-water value
+is never persisted or treated as cross-process time. Hard item/byte limits and
+Emacs relative timers remain the authoritative safety bounds; the deadline
+clock measures elapsed work between them. Tests
+bind the wall clock and the deadline clock independently and reset/bind the
+deadline high-water state; no test advises `current-time`, `float-time`, or
+global random state.
 
 Tests use small dynamically bound values; production code never waits 120 seconds in ERT. A normalized event's charged size is 4 KiB base plus copied text/ID/name bytes, the raw argument byte count retained as a cost (not as a second string), and 256 bytes per canonical argument member. Flat arguments contain at most 64 members and their decoded string bytes are bounded by the charged raw JSON bytes, so the 512 KiB event ceiling is conservative; FIFO byte accounting sums this charge. One item and 4 KiB of each FIFO maximum are reserved and cannot admit ordinary callbacks. An ordinary enqueue that would cross either reduced admission ceiling is discarded, latches overflow, invalidates/aborts, and appends exactly one fixed-charge `request-failed(code=queue-overflow)` control event into that reserve; all later callbacks are dropped. Thus total item/byte counters never cross their published maxima and prior accepted events drain before the failure. Byte limits are measured over UTF-8 model-visible or canonical bytes as applicable, not `length` alone. A wall-time budget is checked between bounded units and cannot preempt one Elisp primitive. I/O and lexical scanning obey every 1 MiB/8 ms slice boundary; before decoding, the lexical state machine counts maximum live object/array depth and the cumulative number of object members plus array elements, rejecting either structural limit one unit over. Each whole-record JSON decode and each bounded `secure-hash` over a record, object, or recovery fragment is a separately measured nonpreemptible unit; inputs are capped at 15 MiB for record JSON and 16 MiB otherwise, and the cursor yields before and after each such primitive. Cooperative work pumps retain partial scan/reduce/recovery state only in a private cursor, call an injectable yield function between slices and nonpreemptible units, and revalidate session generation plus source identity/head before publication.
 
@@ -424,43 +548,179 @@ T12 ── T13 UI ── T14 acceptance ── T15 hardening ── T16 document
 - Create: `test/epi-test-helper.el`
 - Create: `test/run-tests.el`
 - Create: `test/checkdoc.el`
+- Create: `test/epi-preflight-test.el`
 - Create: `test/epi-package-test.el`
 
-**Interfaces produced:** `epi-error` hierarchy, JSON sentinels, `epi-event`, customization, deterministic ID/clock indirections, lazy public facade, and batch commands.
+**Interfaces produced:** `epi-error` hierarchy, JSON sentinels, `epi-event`,
+frozen customization, deterministic ID/wall-clock/deadline-clock indirections,
+autoloaded public facade, and batch commands.
 
-- [ ] Write `test/epi-package-test.el` first. Require `epi` and cover feature loading, condition inheritance and stable `:code` signal data, the exact read-only event slots/durability values, deterministic IDs/timestamps, session predicate behavior, and the fact that loading `epi` does not load `gptel`.
+- [ ] Create the initial `test/epi-test-helper.el` with only test loading,
+  temporary-root, deterministic-ID, and independently bindable wall/deadline
+  clock helpers. Every helper-owned symbol is prefixed `epi-test-`; this file
+  never defines, advises, or substitutes a production Epi symbol and does not
+  load GPTel merely by being loaded. Before implementing the preflight
+  validator, runner, Makefile, or `epi.el`, write both
+  `test/epi-preflight-test.el` and `test/epi-package-test.el`.
+
+- [ ] In `test/epi-preflight-test.el`, specify the validator behavior for an
+  exact source-only resolution and its injected stale sibling `.elc`, earlier
+  shadow directory, and native-artifact failures, using
+  `epi-test-preflight-validate` as the explicit validator entry point. Also
+  specify that loading `epi-test-helper` leaves GPTel unloaded, that all
+  validator utilities are named `epi-test-*`, and that a child invocation of
+  `test/run-tests.el` with a selector matching zero loaded tests exits nonzero
+  with the exact `SELECTOR matched zero loaded ERT tests` diagnostic. The
+  assertion must distinguish that diagnostic from a missing runner or
+  unrelated child-process failure.
+
+- [ ] In `test/epi-package-test.el`, require `epi-test-helper` but register all
+  ERT tests without a top-level `require` of `epi`. Every test enters one shared
+  `epi-test-with-epi-loaded` fixture that calls `(require 'epi)` only when the
+  selected test executes. This lets the runner load and count the tests before
+  the intentional missing-package failure. Cover feature loading; the exact
+  condition inheritance tree; condition data as exactly one proper,
+  even-length plist with a present, non-nil symbolic `:code` through the private
+  signaling helper; rejection of improper, odd, missing, nil, and nonsymbol
+  data; direct and transitive condition parents; every frozen option name,
+  default, and type; all private raw read-only event slots; absence of a public
+  event copier; constructor rejection of kind/durability or positive-sequence
+  mismatches; construction-time and per-access deep-copy isolation for strings,
+  conses, and vectors; rejection of noncanonical mutable payload data;
+  independently injected IDs, wall timestamps, and deadline samples; the
+  default-false `epi-session-p` generic; runtime/UI autoload declarations; and
+  the fact that loading `epi` does not load GPTel.
 
 ```elisp
 (ert-deftest epi-package-load-is-gptel-lazy ()
-  (should (featurep 'epi))
-  (should-not (featurep 'gptel)))
+  (epi-test-with-epi-loaded
+    (should (featurep 'epi))
+    (should-not (featurep 'gptel))))
 
 (ert-deftest epi-package-errors-have-stable-code ()
-  (let ((condition
-         (should-error
-          (signal 'epi-invalid-state
-                  (list (list :code 'not-idle :session-id "s-1")))
-          :type 'epi-invalid-state)))
-    (should (eq (plist-get (car (cdr condition)) :code) 'not-idle))))
+  (epi-test-with-epi-loaded
+    (let ((condition
+           (should-error
+            (epi--signal 'epi-invalid-state
+                         (list :code 'not-idle :session-id "s-1"))
+            :type 'epi-invalid-state)))
+      (should (= 1 (length (cdr condition))))
+      (should (eq (plist-get (cadr condition) :code) 'not-idle)))))
 ```
 
-- [ ] Create `test/run-tests.el` and `Makefile` just far enough to load the requested test. Run:
+- [ ] Run the new infrastructure contract directly, before the runner and
+  Makefile exist:
+
+```sh
+direnv exec . "$EPI_EMACS" --batch -Q -L test \
+  -l ert -l test/epi-test-helper.el -l test/epi-preflight-test.el \
+  --eval "(ert-run-tests-batch-and-exit \"^epi-preflight-\")"
+```
+
+Expected red: the behavioral validator cases fail with
+`void-function epi-test-preflight-validate`, and the zero-selector case fails
+because it does not observe the exact
+`SELECTOR matched zero loaded ERT tests` runner diagnostic. A missing test,
+zero selected tests, or an unrelated load error is not the intended red.
+
+- [ ] Run the package contract directly, still before the Makefile exists:
+
+```sh
+direnv exec . "$EPI_EMACS" --batch -Q -L . -L test \
+  -l ert -l test/epi-package-test.el \
+  --eval "(ert-run-tests-batch-and-exit \"^epi-package-\")"
+```
+
+Expected red: the file loads and registers at least one `epi-package-*` test,
+then the selected tests fail when their fixture reports
+`Cannot open load file ... epi`. A top-level load failure or zero selected tests
+is not the intended red.
+
+- [ ] Now implement all preflight validator and probe utilities in
+  `test/epi-test-helper.el`, each under the `epi-test-*` namespace; create
+  `test/run-tests.el` and the Makefile infrastructure.
+  `epi-test-preflight-validate` is the validator entry point used by the tests
+  and `make preflight`.
+  Loading the helper alone still must not load GPTel. Only an explicit
+  validator call may start its clean `--batch -Q` source-resolution probe.
+  Before that probe loads GPTel, require `locate-library` for `gptel`,
+  `gptel-request`, and `gptel-openai` to resolve the exact truenamed `.el`
+  paths in `GPTEL_ROOT`; reject an earlier shadow, sibling `.elc`, or
+  corresponding native `.eln`. Disable native JIT, force source-only
+  resolution, load those absolute source files in dependency order, and verify
+  representative pinned functions' `symbol-file` paths plus source hashes.
+  The validator also checks the exact Pi and JCS commits/files/hashes listed
+  above from `PI_ROOT` and `JCS_ORACLE_ROOT`, reports every observed mismatch,
+  and performs no clone, fetch, install, checkout, or source rewrite.
+
+- [ ] Run the infrastructure tests directly once more, before asking the
+  Makefile to trust them:
+
+```sh
+direnv exec . "$EPI_EMACS" --batch -Q -L test \
+  -l ert -l test/epi-test-helper.el -l test/epi-preflight-test.el \
+  --eval "(ert-run-tests-batch-and-exit \"^epi-preflight-\")"
+```
+
+Expected green: the three injected artifact probes fail closed for their exact
+reasons, the clean injected probe passes, helper loading leaves GPTel unloaded,
+and the runner's zero-match regression observes the dedicated nonzero exit.
+
+- [ ] Run `direnv exec . make preflight`. The target first runs those isolated
+  probes, then validates the real declared inputs exactly. Any probe or input
+  mismatch stops implementation before `epi.el` is created.
+
+- [ ] Re-run the still-red package contract through the stable runner:
 
 ```sh
 direnv exec . make test-one TEST=test/epi-package-test.el SELECTOR='^epi-package-'
 ```
 
-Expected red: nonzero ERT exit with `Cannot open load file ... epi`.
+Expected red: nonzero ERT exit with `Cannot open load file ... epi`; the runner
+must report that it selected at least one `epi-package-*` test.
 
-- [ ] Implement `epi.el` with `lexical-binding: t`, Package-Requires for Emacs 30.1, Org 9.7, GPTel 0.9.9.5, Transient 0.7.8, and Compat 30.1.0.0; `defgroup` and `defcustom` values for every frozen limit above, session directory, and global instructions; the complete condition hierarchy; `epi-json-false` and `epi-json-null`; and `epi-event`. Keep injectable monotonic-clock and cooperative-yield functions private for deterministic tests.
+- [ ] Implement `epi.el` with `lexical-binding: t`, Package-Requires for Emacs
+  30.1, Org 9.7, GPTel 0.9.9.5, Transient 0.7.8, and Compat 30.1.0.0;
+  `defgroup`; every exact public `defcustom` name/default/type frozen above;
+  the complete condition hierarchy and one-plist signal contract;
+  `epi-json-false` and `epi-json-null`; and the privately constructed
+  `epi-event`. Give its struct a private raw-accessor prefix, suppress its
+  public copier, and make every raw slot read-only. The private constructor
+  validates event kind/durability compatibility and the positive
+  sequence/live-sequence inverse, copies input strings, and custom-deep-copies
+  only canonical string/cons/vector payloads. Public accessors copy strings and
+  custom-deep-copy payload on every read; do not use `copy-tree`.
 
-- [ ] Define these conditions now: `epi-error`, `epi-busy`, `epi-invalid-state`, `epi-stale-generation`, `epi-limit-exceeded`, `epi-ledger-error`, `epi-ledger-format-error`, `epi-ledger-corrupt`, `epi-ledger-truncated-tail`, `epi-ledger-conflict`, `epi-missing-object`, `epi-gptel-error`, `epi-gptel-incompatible`, `epi-provider-error`, `epi-tool-error`, `epi-tool-denied`, `epi-tool-uncertain`, `epi-interaction-required`, and `epi-cancelled`.
+- [ ] Define these conditions with the exact frozen parent relationships:
+  `epi-error`; direct children `epi-busy`, `epi-invalid-state`,
+  `epi-limit-exceeded`, `epi-ledger-error`, `epi-gptel-error`,
+  `epi-tool-error`, `epi-interaction-required`, and `epi-cancelled`;
+  `epi-stale-generation` under `epi-invalid-state`;
+  `epi-ledger-format-error`, `epi-ledger-corrupt`, `epi-ledger-conflict`, and
+  `epi-missing-object` under `epi-ledger-error`;
+  `epi-ledger-truncated-tail` under `epi-ledger-corrupt`;
+  `epi-gptel-incompatible` and `epi-provider-error` under `epi-gptel-error`;
+  and `epi-tool-denied` and `epi-tool-uncertain` under `epi-tool-error`.
+  Route every production signal through one private helper that rejects
+  non-plists, improper or odd-length plists, and a missing, nil, or nonsymbol
+  `:code`, using `plist-member` before calling
+  `(signal condition (list plist))`.
 
-- [ ] Add dynamically bindable private functions/variables for UUID and clock generation. Test fixtures must never advise `current-time` or global random state.
+- [ ] Add dynamically bindable private functions/variables for UUID generation,
+  RFC 3339 wall time, the process-local nondecreasing deadline clock, its
+  high-water state, and cooperative yield. Implement the deadline default as
+  the frozen process-local, nonpersisted high-water mark over `float-time` epoch
+  wall time; do not describe or test it as an OS monotonic clock. Keep hard
+  item/byte bounds and relative timers authoritative. Tests bind both clocks
+  independently and never advise `current-time`, `float-time`, or global
+  random state.
 
-- [ ] Define the public facade functions listed above. Each operational facade lazily requires its owner and delegates one-for-one. Do not add fallback semantics in `epi.el`.
-
-- [ ] Implement `make preflight` and its clean Emacs helper. Before loading GPTel, require `locate-library` for `gptel`, `gptel-request`, and `gptel-openai` to resolve the exact truenamed `.el` paths in `GPTEL_ROOT`; reject an earlier shadow, sibling `.elc`, or corresponding native `.eln`. Disable native JIT, force source-only resolution, load those absolute source files in dependency order, and verify representative pinned functions' `symbol-file` paths plus source hashes. Add tests that inject a stale newer `.elc`, a preceding shadow directory, and a native-artifact candidate and require fail-closed diagnostics. It also validates the exact Pi and JCS commits/files/hashes listed above from `PI_ROOT` and `JCS_ORACLE_ROOT`, reports every observed mismatch, and performs no clone, fetch, install, checkout, or source rewrite.
+- [ ] Define `epi-session-p` as a `cl-defgeneric` whose default method returns
+  nil. Install autoload declarations for the public runtime/UI functions and
+  interactive commands and public UI mode functions; mark command autoloads
+  interactive. Tasks 8 and 13 define those exact symbols in their owning
+  modules. Do not add facade wrappers, fallback semantics, or parallel
+  `epi-runtime-*` public functions.
 
 - [ ] Implement `test/checkdoc.el` with `checkdoc-current-buffer`, not `checkdoc-batch`. Add isolated build directories for `.elc` output and cleanup.
 
@@ -478,7 +738,7 @@ Expected: no warnings, errors, or source-tree `.elc` files.
 - [ ] Commit:
 
 ```sh
-git add Makefile epi.el test/epi-test-helper.el test/run-tests.el test/checkdoc.el test/epi-package-test.el
+git add Makefile epi.el test/epi-test-helper.el test/run-tests.el test/checkdoc.el test/epi-preflight-test.el test/epi-package-test.el
 git commit -m "build: establish the Epi package test foundation"
 ```
 
@@ -671,10 +931,11 @@ git commit -m "feat: define the canonical Epi ledger codec"
 - Modify: `epi-ledger.el`
 - Modify: `test/epi-ledger-codec-test.el`
 - Create: `test/fixtures/ledger/corrupt-*.org`
+- Create: `test/fixtures/ledger/torn-*.org`
 
 **Interfaces produced:** read-only `epi-ledger-open`, full-chain validation, clean/torn/interior classification, and structured ledger conditions.
 
-- [ ] Add tests whose fixtures each isolate one violation: bad header, missing/duplicate/non-first `session-info`, unsupported format/schema, duplicate ID, forward parent/target, impossible record target, previous-hash mismatch, payload hash mismatch, property mismatch, orphan tool result, invalid tool status/pairing, duplicate call ID, duplicate terminal, contradictory terminal, clean EOF, truncated final headline/drawer/block/JSON, and valid unfinished suffix.
+- [ ] Add tests whose fixtures each isolate one violation: bad header, missing/duplicate/non-first `session-info`, a hash-valid mismatch between header `EPI_SESSION_ID` and `session-info.payload.session_id`, unsupported format/schema, duplicate ID, forward parent/target, impossible record target, previous-hash mismatch, payload hash mismatch, property mismatch, orphan tool result, invalid tool status/pairing, duplicate call ID, duplicate terminal, contradictory terminal, clean EOF, truncated final headline/drawer/block/JSON, and valid unfinished suffix.
 
 ```elisp
 (ert-deftest epi-ledger-open-identifies-corrupt-record ()
@@ -729,7 +990,7 @@ git commit -m "feat: validate Epi ledger structure and history"
 - Modify: `epi-ledger.el`
 - Create: `test/epi-ledger-io-test.el`
 
-**Interfaces produced:** `epi-ledger-create`, `epi-ledger-refresh`, private batched `epi-ledger--append`, object put/get/presence, explicit stale-lock recovery.
+**Interfaces produced:** `epi-ledger-create`, private batched `epi-ledger--append`, object put/get/presence, explicit stale-lock recovery.
 
 - [ ] Write temporary-file tests for 0700 directories, 0600 files, staged no-clobber create, a crash before/after creation publication, one-flush batched append, distinct linked hashes within a batch, exact preservation of existing bytes, file-identity/head races, lock ownership, and immutable objects.
 
@@ -762,7 +1023,7 @@ git commit -m "feat: validate Epi ledger structure and history"
 - [ ] Run:
 
 ```sh
-direnv exec . make test-one TEST=test/epi-ledger-io-test.el SELECTOR='^epi-ledger-append-'
+direnv exec . make test-one TEST=test/epi-ledger-io-test.el SELECTOR='^epi-ledger-'
 ```
 
 Expected red: append/create/object functions are absent.
@@ -802,7 +1063,7 @@ git commit -m "feat: append Epi ledgers under an explicit lock"
 
 - Modify: `epi-ledger.el`
 - Modify: `test/epi-ledger-io-test.el`
-- Create: `test/fixtures/ledger/torn-*.org`
+- Modify/extend: `test/fixtures/ledger/torn-*.org`
 
 **Interfaces produced:** the closed-ledger `epi-ledger-recover-tail` primitive, fragment object evidence, quarantine layout, recovery-origin records. The registry-aware public facade is added in Task 8 after the runtime registry exists.
 
@@ -911,7 +1172,7 @@ Expected red: reducer and branch/context functions are absent.
 
 - [ ] Apply conversation semantics exactly: a conversation message's parent is the prior model-visible conversation record; operational records do not become tree nodes; a tool-result message is the child of its assistant tool-call message; `leaf` targets a conversation message, carries its turnless structural operation ID, and is not context; the next message after the completed selection operation uses that target as parent.
 
-- [ ] Project `prompt`/user text, `response`/assistant text, and paired tool call/results without provider types. Retain call ID, name, arguments, result, status, order, and nullable group ID. Omit reasoning from first-slice replay and reject unpaired or parallel history except for a terminal uncertain call, which is retained as blocked audit state and omitted from context. A three-leg fixture must preserve turn-global orders `0`, `1`, and `2` after cold reopen; no reducer derives order from list position.
+- [ ] Project `prompt`/user text, `response`/assistant text, and paired tool call/results without provider types. Retain call ID, name, arguments, result, status, order, and nullable group ID. Omit reasoning from first-slice replay and reject unpaired or parallel history except for a terminal uncertain call, which is retained as blocked audit state and omitted from context. A three-leg fixture with two completed calls and a final text leg must preserve turn-global orders `0` and `1` after cold reopen; no reducer derives order from list position.
 
 - [ ] Detect orphan results, duplicate calls, impossible tree edges, conversations rooted in operational records, and terminal contradictions as deterministic reducer errors, not UI warnings. A planned or started call without its terminal is legal only inside the final nonterminal operation suffix: expose it as typed unfinished-call state so abort/reopen can conservatively terminalize it. A completed uncertain call with no model-result message is likewise valid audit state and reduces to blocked continuation, not corruption.
 
@@ -935,7 +1196,6 @@ git commit -m "feat: reduce Epi ledgers into branches and typed context"
 - Create: `epi-runtime.el`
 - Create: `test/epi-runtime-test.el`
 - Modify: `test/epi-test-helper.el`
-- Modify: `epi.el`
 
 **Interfaces produced:** opaque live session, operation and pending-tool values, runtime API behind the public facade, fake adapter protocol, semantic event FIFO and settlement.
 
@@ -966,9 +1226,15 @@ git commit -m "feat: reduce Epi ledgers into branches and typed context"
 direnv exec . make test-one TEST=test/epi-runtime-test.el SELECTOR='^epi-runtime-'
 ```
 
-Expected red: runtime types and facade delegates are absent.
+Expected red: the runtime module and its autoloaded public definitions are
+absent; `epi.el` contains declarations, not placeholder delegates.
 
-- [ ] Define opaque `epi--session`, `epi-operation`, and `epi-pending-tool` structs. Keep session ID, canonical file, project root, durable working directory/base system prompt/backend/model/request parameters/tool descriptors/capability, generation, phase, reduced blocked reason, ledger/state, request buffer/handle, operation, subscribers, committed/live sequence counters, FIFO, drain timer, registry, pending tool, and closed flag.
+- [ ] Define opaque `epi--session`, `epi-operation`, and `epi-pending-tool` structs. Keep session ID, canonical file, project root, durable working directory/base system prompt/backend/model/request parameters/tool descriptors/capability, generation, phase, reduced blocked reason, ledger/state, request buffer/handle, operation, subscribers, committed/live sequence counters, FIFO, drain timer, registry, pending tool, and closed flag. The private `epi--session` struct keeps its private generated predicate (or suppresses it); it must never generate, alias, or overwrite the public `epi-session-p` generic.
+
+- [ ] Define the runtime-owned public names declared by the Task 1 autoloads
+  directly in `epi-runtime.el`, and add an `epi-session-p` method specialized
+  on `epi--session`. Do not replace the generic or introduce wrapper-facing
+  `epi-runtime-*` public names.
 
 - [ ] Implement one private live-session registry with separate file-identity, canonical-path-reservation, and session-ID maps. Reserve using an opaque token before any cooperative open/create work; publish the exact session object only after validation. An identical completed open with identical bindings returns that object; every alias/conflict fails or reports busy as frozen above. Cleanup and close use compare-and-remove against the exact token/object so a stale failure cannot unregister a newer session. Implement `epi-session-recover-tail` on that same registry: atomically acquire a deterministic-order composite reservation for source path/identity/session ID and destination path/existing identity/new session ID, reject every live or reserved alias with `epi-busy`, pass the reserved new ID to `epi-ledger-recover-tail`, and release only the exact composite token on every exit without publishing a session.
 
@@ -995,7 +1261,7 @@ open uncertain mutation -> settling -> idle + reduced blocked-reason
 
 - [ ] Accumulate text and reasoning as chunk collections with O(1)-amortized append and explicit UTF-8 byte counters, never repeated string concatenation. Enforce per-leg and per-turn output limits even when a slow-drip stream is fully drained between chunks, plus the sequential-call limit. Flatten each collection exactly once at its commit boundary. A committed event uses the physical record sequence; `agent-settled` points to the last terminal record sequence.
 
-- [ ] Implement success, provider/runtime failure, abort, and reopen terminal sequences from the frozen table. Every enclosing terminal path closes an open call first: planned becomes `tool-denied` with the cause-specific reason; started and provably side-effect-free becomes `tool-finished(cancelled|error)`; started with a possible side effect becomes `tool-finished(uncertain)` and reduced blocked state. Append the prescribed truthful result message only for the first two classes and never release an obsolete continuation. Build every proposal/lifecycle/result batch from one immutable pending-call snapshot so all duplicated fields satisfy the frozen cross-record equality contract. An uncertain normal/runtime/abort path uses failed turn/operation terminals; uncertain reopen uses interrupted terminals. Then emit settlement. Guard settlement and the optional settled callback exactly once. Validate a callback before admission, defer all drain dispatch until `epi-session-prompt` has returned its operation ID, deliver the exact same `agent-settled` event to snapshotted subscribers before the callback, and wait for any rescheduled subscriber remainder before calling it. Time subscribers and the settled callback with the injectable monotonic clock. After the first subscriber overrun, disable that repeating subscriber, emit a diagnostic, and reschedule remaining drain work; a one-shot settled-callback exception or overrun is diagnosed after the outcome and never retried. Exceptions or overruns after an underlying commit never change its outcome, and Epi does not claim to preempt synchronous Elisp.
+- [ ] Implement success, provider/runtime failure, abort, and reopen terminal sequences from the frozen table. Every enclosing terminal path closes an open call first: planned becomes `tool-denied` with the cause-specific reason; started and provably side-effect-free becomes `tool-finished(cancelled|error)`; started with a possible side effect becomes `tool-finished(uncertain)` and reduced blocked state. Append the prescribed truthful result message only for the first two classes and never release an obsolete continuation. Build every proposal/lifecycle/result batch from one immutable pending-call snapshot so all duplicated fields satisfy the frozen cross-record equality contract. An uncertain normal/runtime/abort path uses failed turn/operation terminals; uncertain reopen uses interrupted terminals. Then emit settlement. Guard settlement and the optional settled callback exactly once. Validate a callback before admission, defer all drain dispatch until `epi-session-prompt` has returned its operation ID, deliver the exact same `eq` `agent-settled` event to snapshotted subscribers before the callback, and wait for any rescheduled subscriber remainder before calling it. Construct each event once through the private constructor; dispatch no per-subscriber event copies. Prove that mutation of caller-owned input or the fresh string/payload returned by a public accessor cannot mutate ledger/runtime state or the accessor result later observed by subscriber two or the callback. Time subscribers and the settled callback with the injectable deadline clock. After the first subscriber overrun, disable that repeating subscriber, emit a diagnostic, and reschedule remaining drain work; a one-shot settled-callback exception or overrun is diagnosed after the outcome and never retried. Exceptions or overruns after an underlying commit never change its outcome, and Epi does not claim to preempt synchronous Elisp.
 
 - [ ] Implement `epi-session-wait` by snapshotting the latest admitted operation ID and first checking its terminal record/settled sequence, so a synchronously settled operation returns immediately even if its event preceded the call. Otherwise register the waiter before pumping process output/timers until that operation's exactly-once `agent-settled` event or timeout. A reduced blocked reason by itself is not settlement and cannot terminate the wait early. The function must not require a selected frame, window, minibuffer, or UI buffer.
 
@@ -1010,7 +1276,7 @@ open uncertain mutation -> settling -> idle + reduced blocked-reason
 - [ ] Commit:
 
 ```sh
-git add epi-runtime.el epi.el test/epi-runtime-test.el test/epi-test-helper.el
+git add epi-runtime.el test/epi-runtime-test.el test/epi-test-helper.el
 git commit -m "feat: add the provider-independent Epi runtime"
 ```
 
@@ -1057,7 +1323,7 @@ Expected red: resource type and discovery functions are absent.
 
 - [ ] Define `epi-resource` with kind, canonical path, scope, trust, hash, snapshotted content, modified flag, and coding system. The value owns a copied string and no buffer or marker.
 
-- [ ] Canonicalize project root and working directory, require working directory to lie within root, and walk directories from root to working directory. At each level choose `AGENTS.md` when present; otherwise choose `CLAUDE.md`. A project instruction symlink resolving outside the root is rejected; the explicitly configured global file is the only outside-root source. Prepend that canonical global file.
+- [ ] Canonicalize project root and working directory, require working directory to lie within root, and walk directories from root to working directory. At each level choose `AGENTS.md` when present; otherwise choose `CLAUDE.md`. A project instruction symlink resolving outside the root is rejected; the explicitly configured global file is the only outside-root source. The `global-file` keyword defaults to `epi-global-instructions-file`; prepend that canonical global file when non-nil.
 
 - [ ] Reject an oversized disk instruction from `file-attribute-size` before reading it. Prefer a visiting buffer's current contents to disk, including unsaved changes; reject an obvious character-count overflow before encoding, then encode through a bounded temporary buffer under that buffer's file coding system and enforce the exact byte limit. Record `modified-p` and reject an unencodable value. Otherwise read exact bounded file bytes and decode under a recorded coding system. Stop discovery as soon as the aggregate limit would be crossed.
 
@@ -1195,7 +1461,7 @@ git commit -m "feat: add bounded read and mutation tools"
 - [ ] Add tests through the public adapter API for a text-only request, a two-leg read call, a three-leg read/write sequence, reopened history, exact system/tool/request snapshot, pre-parse and TOOL-guard rejection before stock dispatch, lossless raw argument extraction, a hostile global post-request hook, abort during transport and while paused in TOOL, late callback, duplicate result submission, and persistence-barrier simulation.
 
 ```elisp
-(ert-deftest epi-gptel-submit-happens-only-after-caller-releases-it ()
+(ert-deftest epi-gptel-driver-submit-happens-only-after-caller-releases-it ()
   (epi-test-with-gptel-tool-request (request observed)
     (should (equal '(tool-proposed) (epi-test-event-kinds observed)))
     (should-not (epi-test-next-leg-started-p request))
@@ -1265,7 +1531,7 @@ git commit -m "feat: drive frozen Epi turns through GPTel"
 - [ ] Add scripted lifecycle tests that assert exact record/event order for create-close-open before first turn, exact built-in and caller-supplied custom-tool rebinding (plus missing/mismatched rejection), durable base-prompt/resource refresh after reopen, text success, reasoning plus text, three sequential calls with orders 0/1/2, auto-approved read, approved mutation, denied mutation, approval timeout, execution timeout, pre-mutation conflict, provider error, abort in each phase including paused TOOL, uncertain mutation, missing object, blocked-idle admission rejection, and append failure at each barrier. For every tool path, assert proposal/lifecycle/result target-parent, turn, operation, call ID, name, JCS arguments, order, model-result, and status equality against the immutable pending-call snapshot; assert uncertainty has no result.
 
 ```elisp
-(ert-deftest epi-runtime-tool-result-commits-before-continuation ()
+(ert-deftest epi-runtime-integrated-tool-result-commits-before-continuation ()
   (epi-test-with-integrated-runtime (session adapter)
     (epi-session-prompt session "read the file")
     (epi-test-adapter-propose-read adapter "call-9")
@@ -1323,7 +1589,6 @@ git commit -m "feat: integrate Epi turn and tool settlement"
 
 - Create: `epi-ui.el`
 - Create: `test/epi-ui-test.el`
-- Modify: `epi.el`
 
 **Interfaces produced:** `epi-session-mode`, `epi-ledger-mode`, `epi-tree-mode`, public display functions, interactive entry commands, projection rendering, composer and approval commands.
 
@@ -1353,9 +1618,14 @@ git commit -m "feat: integrate Epi turn and tool settlement"
 direnv exec . make test-one TEST=test/epi-ui-test.el SELECTOR='^epi-ui-'
 ```
 
-Expected red: UI modes and commands are absent.
+Expected red: the UI module and the implementations named by the existing
+autoload declarations are absent.
 
 - [ ] Define `epi-session-mode` from `org-mode`, `epi-ledger-mode` from `org-mode`, and `epi-tree-mode` from `special-mode`. The raw ledger mode is unconditionally read-only, disables ordinary save/edit commands, and clearly states that the file is append-only Epi data.
+
+- [ ] Define the UI-owned public display functions and interactive commands
+  directly under the symbols declared by Task 1's autoloads. Do not add a
+  second wrapper or `epi-ui-*` public command layer.
 
 - [ ] Implement the public entry points exactly. `epi-display-session` returns/reuses `*Epi:<session-id>*`, `epi-display-tree` returns/reuses `*Epi Tree:<session-id>*`, and `epi-display-ledger` returns/reuses the buffer visiting the session's canonical ledger path under `epi-ledger-mode`. If a disposable session/tree buffer was killed, the next call recreates it from ledger-derived state. `epi` creates and displays; `epi-open-session` opens a selected ledger and displays; `epi-show-tree` and `epi-show-ledger` display the current session. A closed session must be reopened rather than silently resurrected.
 
@@ -1376,7 +1646,7 @@ Expected red: UI modes and commands are absent.
 - [ ] Commit:
 
 ```sh
-git add epi-ui.el epi.el test/epi-ui-test.el
+git add epi-ui.el test/epi-ui-test.el
 git commit -m "feat: add native disposable Epi views"
 ```
 
@@ -1386,7 +1656,9 @@ git commit -m "feat: add native disposable Epi views"
 
 - Create: `test/epi-acceptance-test.el`
 - Create: `test/fixtures/gptel/acceptance-*.sse`
-- Modify only production files required by a failing acceptance assertion.
+- Modify only when required by a failing acceptance assertion: `epi.el`,
+  `epi-ledger.el`, `epi-resources.el`, `epi-tools.el`, `epi-gptel.el`,
+  `epi-runtime.el`, and `epi-ui.el`.
 
 **Gate produced:** every Section 16.3 clause is exercised through the public API and real GPTel fixture transport.
 
@@ -1420,7 +1692,7 @@ Expected red: at least one integration boundary is incomplete; use the exact ass
 
 - [ ] Assert ledger record order and hash validity after each step, including `operation-started`/`leaf`/`operation-finished` around every selection; immutable object reachability; one hidden GPTel buffer while live; no GPTel buffer after close; and recovery using only ledger plus objects.
 
-- [ ] Assert replay preserves provider role, raw call ID, name, canonical arguments (including empty object, false, and safe numbers), model result, status, and turn-global orders `0, 1, 2` across three legs for every tool-bearing branch. Compare captured dry-run OpenAI request data before and after reopen.
+- [ ] Assert replay preserves provider role, raw call ID, name, canonical arguments (including empty object, false, and safe numbers), model result, status, and turn-global orders `0` and `1` across each three-leg branch containing two completed calls and a final text leg. Compare captured dry-run OpenAI request data before and after reopen.
 
 - [ ] Parameterize destruction of the hidden request buffer immediately after every durable boundary. A committed state must reopen conservatively; an uncommitted provider continuation must never be reconstructed or serialized.
 
@@ -1433,7 +1705,8 @@ Expected red: at least one integration boundary is incomplete; use the exact ass
 - [ ] Commit:
 
 ```sh
-git add test/epi-acceptance-test.el test/fixtures/gptel epi-ledger.el epi-runtime.el epi-gptel.el epi-tools.el epi-ui.el
+git add test/epi-acceptance-test.el test/fixtures/gptel
+git add -u -- epi.el epi-ledger.el epi-resources.el epi-tools.el epi-gptel.el epi-runtime.el epi-ui.el
 git commit -m "test: prove Epi reopen and branch continuity"
 ```
 
@@ -1453,7 +1726,9 @@ Before staging, inspect `git diff --name-only` and omit any unchanged production
 - Modify: `test/epi-architecture-test.el`
 - Modify: `test/epi-test-helper.el`
 - Modify: `Makefile`
-- Modify only production files required by a failing gate.
+- Modify only when required by a failing gate: `epi.el`, `epi-ledger.el`,
+  `epi-resources.el`, `epi-tools.el`, `epi-gptel.el`, `epi-runtime.el`, and
+  `epi-ui.el`.
 
 **Gates produced:** competing-process safety, forced-death evidence, bounded projections/queues, offline full suite, warning-free static checks.
 
@@ -1499,13 +1774,13 @@ Expected red: the worker protocol, recovery failpoints/resume path, and scale in
 
 - [ ] Make the entire ERT runner fail if ordinary network entry points are used. The GPTel fixture driver must prove every request consumed recorded bytes; no paid/live smoke is a release gate.
 
-- [ ] Strengthen the S-expression architecture scan: GPTel internals only in `epi-gptel.el`; no `request`, `url-retrieve`, independent Curl invocation, provider parser, TypeScript, or executable project-resource load in other production modules; raw ledger append called only from `epi-runtime.el` in production. Inside `epi-gptel.el`, permit only the pinned raw-byte filter wrapper, outer-envelope safety auditor, TOOL guard, history adapter, and documented GPTel calls; fail if the safety auditor emits provider-semantic events or if any alternate request/parser/FSM loop appears.
+- [ ] Strengthen the S-expression architecture scan: GPTel internals only in `epi-gptel.el`; no `request`, `url-retrieve`, independent Curl invocation, provider parser, TypeScript, or executable project-resource load in other production modules; raw ledger append called only from `epi-runtime.el` in production. Inside `epi-gptel.el`, permit only the pinned raw-byte filter wrapper, outer-envelope safety auditor, TOOL guard, history adapter, and documented GPTel calls; fail if the safety auditor emits provider-semantic events or if any alternate request/parser/FSM loop appears. Also reject a public event copier, use of private event raw accessors outside `epi.el`, direct production `signal` calls for Epi conditions, or any private struct definition that defines/overwrites `epi-session-p`.
 
 - [ ] Implement one shared `test/epi-scale-runner.el` used unchanged by both reference targets, with `generate-fixture`, `record`, `compare`, and single-sample worker modes. Before any warm-up or timed sample, the parent launches a separate fresh `EPI_EMACS --batch -Q` process to generate one temporary immutable fixture. A frozen benchmark-only generator, not the production renderer, uses a private PRNG with seed 424242 without changing global random state and writes the `reference-v1` shape: a 100,000-record linear conversation alternating user/assistant messages whose deterministic ASCII content is exactly 128 bytes. The generator completes the real chain fields, then the parent validates the chain, profile, count, and exact SHA-256 through production read code, changes the fixture mode to `0444`, and records device/inode/size/change identity. Generation, validation, permission changes, and full hashing finish before measurement and are never children of a time adapter. Immediately before every timed spawn, the parent re-stats that identity and verifies the full expected SHA-256; after all samples it verifies both again. A measured worker performs only bounded mode/identity/size/change checks before and after its cold open/reduction, never hashes or mutates the fixture, and exits. No sample reuses an Emacs process.
 
 - [ ] Freeze two measurement adapters and unit-test their parsers against `time-darwin.txt` and `time-gnu.txt`. With `LC_ALL=C` forced for the adapter and child, adapter `darwin-time-l-v1` invokes `/usr/bin/time -l`, reads `maximum resident set size` as bytes, and is eligible only on Darwin; adapter `gnu-time-v-v1` invokes `/usr/bin/time -v`, reads `Maximum resident set size (kbytes)` as an unsigned integer, checks multiplication overflow, and multiplies by 1024 to normalize bytes, and is eligible only on GNU/Linux with GNU time. Probe the platform, executable, C-locale output, and parser fixture before generating the benchmark fixture or invoking a timed child. Compute the executable's ordinary SHA-256 and a normalized version signature: GNU uses the first nonempty C-locale `--version` line; Darwin uses `bsd-time:<kern.osproductversion>:<kern.osversion>` from fixed `sysctl -n` fields. Reject a missing/ambiguous signature, and re-stat the same executable identity before each sample. Never attempt a platform-incompatible or failed probe. Parser tests cover both fixtures, missing/duplicate fields, malformed numbers, overflow, locale variation rejection, and the KiB-to-byte conversion. Record the adapter ID, executable hash, normalized version signature, and normalized peak RSS bytes, never unlabelled native units.
 
-- [ ] In every single-sample worker, load only declared production paths, verify the passed bounded fixture identity metadata, set `gc-cons-threshold` to 67108864 and `gc-cons-percentage` to 0.1, run one `garbage-collect`, and only then start one monotonic wall-clock interval around cold open plus reduction. The external time adapter wraps only that worker process, so its lifetime peak RSS includes Emacs/library startup and the operation under test but neither fixture construction nor full-file preverification. Both `scale-reference-record` and `scale-reference` run one discarded warm-up followed by exactly five fresh-process samples.
+- [ ] In every single-sample worker, load only declared production paths, verify the passed bounded fixture identity metadata, set `gc-cons-threshold` to 67108864 and `gc-cons-percentage` to 0.1, run one `garbage-collect`, and only then measure cold open plus reduction with the process-local nondecreasing deadline clock. This is the frozen high-water mark over wall time, not an OS monotonic primitive. The external time adapter wraps only that worker process, so its lifetime peak RSS includes Emacs/library startup and the operation under test but neither fixture construction nor full-file preverification. Both `scale-reference-record` and `scale-reference` run one discarded warm-up followed by exactly five fresh-process samples.
 
 - [ ] Have the runner emit a canonical `benchmark-protocol-v1` descriptor covering the fixture generator/profile, seed, record/content shape, measurement window, warm-up/sample count, both GC settings, adapter commands/parser rules, runner mode contract, locale, and normalized units. Put both Make reference targets and no unrelated commands inside one uniquely marked benchmark-protocol region; tests reject missing/duplicate markers or benchmark commands outside it. Hash bytewise-sorted UTF-8 manifest lines for `test/epi-scale-runner.el`, `test/fixtures/performance/time-darwin.txt`, and `test/fixtures/performance/time-gnu.txt`, the exact UTF-8 bytes between the Makefile markers, and the canonical descriptor; call the result the benchmark-protocol hash. Mutation tests prove any runner invocation, environment, adapter flag, measurement setting, or sample-orchestration change alters that hash. The exact compatibility key is reference schema, benchmark-protocol hash, pinned GPTel commit, `system-type`, `system-configuration`, full Emacs version, CPU brand/logical-core count, OS release, adapter ID, adapter executable SHA-256, normalized adapter version signature, record count, fixture-profile hash, fixture SHA-256, seed, and both GC settings.
 

@@ -169,13 +169,16 @@ GPTel owns:
 - Provider and model definitions.
 - Authentication lookup and provider-specific authorization flows.
 - Provider payload generation.
-- Curl transport and incremental response parsing.
+- Curl transport and semantic incremental response parsing.
 - Provider-specific reasoning, media, tool-call, and tool-result wire forms.
 - The current provider request and its inner multi-leg tool continuation.
 - GPTel tool schema serialization.
 - MCP protocol and process communication through the GPTel/mcp.el stack.
 
-Epi does not reproduce these mechanisms.
+Epi does not reproduce these mechanisms. The pinned adapter may inspect bounded
+raw transport bytes and complete outer streaming envelopes for non-semantic
+safety auditing before GPTel decodes tool arguments; that narrow fail-closed
+inspection does not make Epi the owner of transport or semantic parsing.
 
 ### 3.2 Epi owns
 
@@ -269,13 +272,14 @@ Physical Org nesting does not encode branches. All records remain at level
 one so that a new child of an old node can still be appended at end of file.
 The EPI_PARENT property supplies the logical edge.
 
-The first record in a version-one session is `session-info`. It durably freezes
-the working directory, unexpanded base system prompt, backend/model names,
-request parameters, tool descriptors, and capability before session creation
-returns. Header plus this record publish as one create barrier, so a session
-closed before its first prompt remains independently reopenable. Runtime
-objects rebind these durable descriptors and never reconstruct creation
-defaults from a previous expanded turn prompt or current Emacs defaults.
+The first record in a version-one session is `session-info`. Its payload
+`session_id` equals the header's `EPI_SESSION_ID`. It durably freezes the working
+directory, unexpanded base system prompt, backend/model names, request
+parameters, tool descriptors, and capability before session creation returns.
+Header plus this record publish as one create barrier, so a session closed
+before its first prompt remains independently reopenable. Runtime objects
+rebind these durable descriptors and never reconstruct creation defaults from a
+previous expanded turn prompt or current Emacs defaults.
 
 ### 4.2 Record families
 
@@ -328,7 +332,8 @@ name records that are not present yet or never arrive after a crash.
 The store enforces these invariants:
 
 1. The header has a supported format version and is followed immediately by
-   exactly one `session-info` record before any other record.
+   exactly one `session-info` record before any other record; that record's
+   payload `session_id` equals the header's `EPI_SESSION_ID`.
 2. Record IDs are unique.
 3. A parent or target refers only to an earlier valid record, except where a
    typed record explicitly permits an external session reference. Only payload
@@ -426,8 +431,12 @@ on its own filesystem.
 
 Schema migration reads the old ledger and writes a new ledger beside it. It
 does not rewrite the original. The migrated ledger receives a new session ID
-and records migration provenance; the source moves to a versioned archive
-excluded from ordinary session selection.
+and uses the same new-ledger re-sealing rule as recovery: its header and first
+`session-info.payload.session_id` agree before the remaining records are
+re-sealed under the new chain root. A `migration-origin` record follows that
+re-sealed prefix and retains the source identity; it can never precede the
+mandatory `session-info`. The source moves to a versioned archive excluded from
+ordinary session selection.
 
 The canonical session store comprises the Org ledger and its immutable,
 content-addressed object directory. The ledger is the sole semantic authority:
@@ -530,8 +539,12 @@ then emits committed agent-settled. It never bypasses operation admission.
 
 `blocked` is not an outer phase. Recovery may reduce a terminalized session to
 phase `idle` with a separate blocked reason (for example an uncertain mutation).
-Such a session has settled but rejects new structural or agent operations until
-an explicit reconciliation record clears the reduced state.
+Such a session has settled but rejects new structural or agent operations. The
+first slice deliberately has no reconciliation record, reducer transition, or
+public operation: the ledger remains inspectable and closable, but the blocked
+session is not continuable. A later slice must define the typed reconciliation
+record, its target and reducer semantics, and its public operation together
+before any blocked reason can be cleared.
 
 ### 5.2 Prompt lifecycle
 
@@ -857,8 +870,9 @@ use asynchronous processes or cooperative continuations.
 
 If a mutable tool has started and its executor cannot prove that cancellation
 preceded every side effect or completed a rollback, its terminal outcome is
-uncertain rather than cancelled. The session blocks provider continuation
-until the user records reconciliation.
+uncertain rather than cancelled. The session blocks provider continuation. In
+the first slice this block cannot be cleared; explicit user reconciliation is a
+later-slice feature whose record and API must be specified together.
 
 Such an uncertain normal-execution or abort path uses failed turn/operation
 terminals with code tool-uncertain, because it is not truthfully cancelled. An
@@ -903,9 +917,11 @@ unfinished work:
   message consumed them.
 - A started mutable tool without a provable result, or one cancelled after a
   possible side effect, settles to outer phase idle after its uncertain call
-  terminal and interruption terminals, and retains a separate blocked reason
-  requiring user reconciliation. This terminal-but-resultless history is valid
-  audit state; it is not replayable provider context and is not corruption.
+  terminal and interruption terminals, and retains a separate blocked reason.
+  The first slice cannot clear that reason; user reconciliation is deliberately
+  deferred until a later slice defines its record, reducer, and public API.
+  This terminal-but-resultless history is valid audit state; it is not replayable
+  provider context and is not corruption.
 - An idempotent tool may be offered for explicit retry; it is not retried
   silently.
 - Durable queue items remain pending unless a valid model-visible message
@@ -1032,10 +1048,10 @@ silently shadows another tool.
 Every call follows this durable sequence:
 
 ~~~text
-planned -> approved or denied -> started -> progress -> finished
-                                           +-> failed
-                                           +-> timed out
-                                           +-> cancelled
+planned +-> tool-denied
+        `-> approved -> started -> progress* -> tool-finished(status)
+
+status = success | error | timeout | cancelled | uncertain
 ~~~
 
 Progress in this diagram is a volatile live signal by default. A tool may
@@ -1124,8 +1140,9 @@ a new transaction at step 1 rather than resuming the locked one. A failure
 before disk mutation rolls back when exact restoration is provable. A save
 failure, interaction request after a hook side effect, unexpected save-hook
 change, or unverifiable partial write produces an uncertain tool outcome and
-blocks continuation for reconciliation. A reversal is a new, explicit change
-whose history remains visible.
+blocks continuation. The first slice cannot clear that block; reconciliation
+is the later-slice facility described in Section 5.1. A reversal is a new,
+explicit change whose history remains visible.
 
 A conflict found during step 7, before Epi changes buffer or disk bytes, is an
 ordinary precondition-failed tool result and may be returned to the model.
@@ -1311,7 +1328,11 @@ selects that message's parent; sending appends a new branch. The original
 message remains unchanged.
 
 A fork creates a new ledger from a selected branch and records the source
-session and source leaf. Branching stays within one ledger; forking does not.
+session and source leaf. The fork writer assigns a new session ID, re-seals the
+selected branch under a new header and `session-info` whose payload session ID
+matches that header, and appends `fork-origin` only after the mandatory
+`session-info` and copied branch records. Branching stays within one ledger;
+forking does not.
 
 ### 12.4 Commands
 
@@ -1370,6 +1391,31 @@ event families cover:
 - Retry and compaction.
 - Error, cancellation, and agent-settled.
 
+Event construction is private. Raw slots and accessors are private and
+read-only, there is no public copier, and durability is exactly committed or
+volatile: a committed kind has a positive durable sequence and no live
+sequence, while a volatile kind has a positive live sequence and no durable
+sequence. The constructor validates kind/durability compatibility and
+custom-deep-copies admitted canonical strings, conses, and vectors; it rejects
+other mutable payload types rather than relying on `copy-tree`. Public
+accessors copy strings and custom-deep-copy payload on every read, so mutation
+through the supported accessors cannot alter ledger/runtime state or a later
+accessor result. The `cl-defstruct` representation is not a security boundary:
+direct sequence mutation such as `aset` and private raw access are unsupported
+and may corrupt a notification seen by a later observer. Runtime and ledger
+authority is never read back from a dispatched event, so such unsupported
+mutation cannot alter the committed outcome. Dispatch does not manufacture
+per-subscriber event copies; all subscribers to one dispatch, and the
+settlement callback when present, observe the same `eq` event object.
+
+Durable RFC 3339 timestamps and runtime deadlines use separate injectable
+clocks. The deadline default high-water-marks `float-time` epoch wall time
+within the Emacs process and never persists that mark. It is monotonicized wall
+time, not an OS monotonic primitive: a backward jump can stall the reported
+value and delay a budget until wall time catches up, while a forward jump may
+make a deadline fail closed early. Hard item/byte caps and relative timers
+remain authoritative. Tests bind both sources independently.
+
 Subscribers may reconstruct presentation from ledger plus events without
 observing an item as both queued and active.
 
@@ -1390,6 +1436,11 @@ Epi defines conditions for:
 Conditions preserve structured causes and stable error codes. Committed
 outcomes cannot be mistaken for retryable pre-commit failures. User messages
 remain concise; the diagnostic buffer exposes the particulars after redaction.
+Every production Epi signal goes through one private helper that requires a
+proper even-length plist, uses `plist-member` to require a present `:code`,
+requires its value to be a non-nil symbol, and calls
+`(signal condition (list plist))`. Condition data is therefore exactly one
+plist rather than positional data or a leading message string.
 
 ## 14. Security posture
 
@@ -1437,7 +1488,7 @@ The initial package uses a small set of files:
 
 | File | Responsibility |
 |---|---|
-| epi.el | Public API, customization group, entry commands, and feature |
+| epi.el | Public signatures/autoload declarations, customization, conditions, events, and feature |
 | epi-ledger.el | Org record format, validation, append, reduction, tree, and projections |
 | epi-runtime.el | Operations, turns, events, queues, cancellation, recovery, and settlement |
 | epi-gptel.el | Sole GPTel compatibility and MCP-discovery boundary |
@@ -1454,6 +1505,12 @@ Further files appear when implemented responsibility warrants the split:
 
 The split is not a mandate to create empty scaffolding. A new file appears
 only when it contains a coherent implemented boundary.
+
+The facade follows ordinary Emacs autoload practice: `epi.el` declares
+runtime/UI-owned public symbols, and the owning module later defines those
+same symbols. It does not define requiring/delegating wrappers or a parallel
+internal public API. `epi-session-p` is a generic with a default false method;
+the runtime adds the concrete session method.
 
 The minimum platform is Emacs 30.1 with Org 9.7 or later. GPTel compatibility is expressed by a
 tested source snapshot and contract capabilities rather than an optimistic
@@ -1499,6 +1556,8 @@ The slice excludes:
 - Skills, prompt templates, and project extension loading.
 - JSON-lines control and Pi session import.
 - Subagents, background jobs, and parallel mutation.
+- Clearing a reduced uncertain-tool blocked reason; the reconciliation record,
+  reducer transition, and public operation are a later-slice unit.
 
 These exclusions bound implementation effort; the ledger and public types
 already reserve their target semantics.
@@ -1528,7 +1587,8 @@ calendar estimate:
    cancellation.
 2. Add resource discovery, trust, skills, prompt templates, and ordinary Elisp
    extension hooks.
-3. Add durable queues, save-point delivery, retries, and exact settlement.
+3. Add durable queues, save-point delivery, retries, explicit uncertain-tool
+   reconciliation, and exact settlement.
 4. Add manual and automatic compaction, then branch summaries.
 5. After the required mcp.el source audit, complete the capabilities that its
    pinned adapter proves, beginning with tools and enabling resources, prompts,
