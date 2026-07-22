@@ -25,6 +25,15 @@ This fixed semantic bound is independent of the cooperative work slice.  It
 covers ordinary local pathname limits and bounds the one contiguous retained
 header-field materialization required by portable Emacs Lisp.")
 
+(defconst epi-ledger--batch-record-limit 256
+  "Maximum number of drafts accepted by one create or append operation.")
+
+(defconst epi-ledger--batch-byte-limit 33554432
+  "Maximum exact rendered bytes accepted by one create or append batch.")
+
+(defconst epi-ledger--lock-token-byte-limit 65536
+  "Maximum number of bytes in one canonical Epi lock token.")
+
 (cl-defstruct (epi-header
                (:constructor epi-ledger--make-header)
                (:conc-name epi-header--raw-))
@@ -68,6 +77,33 @@ from a ledger leave it nil so the decoded PAYLOAD is the sole retained body."
   (frame-byte-size nil :read-only t)
   (sealed-json nil :read-only t))
 
+(cl-defstruct (epi-ledger--semantic-capsule
+               (:constructor epi-ledger--make-semantic-capsule)
+               (:conc-name epi-ledger--semantic-capsule-raw-))
+  "Immutable-by-convention cross-record validation state.
+The capsule deliberately excludes the transient reverse record accumulator."
+  (by-id nil :read-only t)
+  (operations nil :read-only t)
+  (turns nil :read-only t)
+  (turn-operation-index nil :read-only t)
+  (calls nil :read-only t)
+  (calls-by-target nil :read-only t)
+  (reserved-call-ids nil :read-only t)
+  (intents nil :read-only t)
+  (active-operation nil :read-only t)
+  (active-call nil :read-only t)
+  (session-seen nil :read-only t)
+  (first-nonsession nil :read-only t)
+  (pending-proposal nil :read-only t)
+  (pending-result nil :read-only t)
+  (terminalization-required nil :read-only t)
+  (deferred-references nil :read-only t)
+  (uncertain nil :read-only t)
+  (uncertainty-phase nil :read-only t)
+  (uncertainty-class nil :read-only t)
+  (uncertainty-turn nil :read-only t)
+  (uncertainty-operation nil :read-only t))
+
 (cl-defstruct (epi-ledger--checkpoint
                (:constructor epi-ledger--make-checkpoint)
                (:conc-name epi-ledger--checkpoint-raw-))
@@ -79,6 +115,7 @@ from a ledger leave it nil so the decoded PAYLOAD is the sole retained body."
   (by-id nil :read-only t)
   (turn-operation-index nil :read-only t)
   (tool-facts nil :read-only t)
+  (semantic-capsule nil :read-only t)
   (uncertain nil :read-only t))
 
 (cl-defstruct (epi-ledger--record-chunk
@@ -109,6 +146,11 @@ from a ledger leave it nil so the decoded PAYLOAD is the sole retained body."
                (:conc-name epi-ledger--checkpoint-cell-raw-))
   "Private mutable cell publishing a ledger checkpoint atomically."
   value)
+
+(cl-defstruct (epi-ledger--lock
+               (:constructor epi-ledger--make-lock))
+  "Private proof of ownership for one exact Epi lock token."
+  lock-file bytes sha256 file-identity expected-file expected-end expected-head)
 
 (cl-defstruct (epi-ledger
                (:constructor epi-ledger--make-ledger)
@@ -372,6 +414,34 @@ All structural fields are immutable.  Only CHECKPOINT-CELL may publish a new
   (epi-ledger--checkpoint-cell-raw-value
    (epi-ledger--raw-checkpoint-cell ledger)))
 
+(defun epi-ledger--checkpoint-cas (ledger expected replacement)
+  "Publish REPLACEMENT in LEDGER only when its checkpoint is EXPECTED.
+The comparison is by identity.  This primitive performs no cooperative yield,
+callback, traversal, or I/O between the comparison and the cell store."
+  (let ((cell (epi-ledger--raw-checkpoint-cell ledger)))
+    (when (eq expected (epi-ledger--checkpoint-cell-raw-value cell))
+      (setf (epi-ledger--checkpoint-cell-raw-value cell) replacement)
+      t)))
+
+(defun epi-ledger--checkpoint-uncertain-successor (checkpoint)
+  "Return a successor of CHECKPOINT whose storage uncertainty bit is set.
+All retained checkpoint authorities, including the semantic capsule, are
+shared by identity; CHECKPOINT itself is not changed."
+  (epi-ledger--make-checkpoint
+   :file-identity
+   (epi-ledger--checkpoint-raw-file-identity checkpoint)
+   :validated-end-offset
+   (epi-ledger--checkpoint-raw-validated-end-offset checkpoint)
+   :tail-hash (epi-ledger--checkpoint-raw-tail-hash checkpoint)
+   :records (epi-ledger--checkpoint-raw-records checkpoint)
+   :by-id (epi-ledger--checkpoint-raw-by-id checkpoint)
+   :turn-operation-index
+   (epi-ledger--checkpoint-raw-turn-operation-index checkpoint)
+   :tool-facts (epi-ledger--checkpoint-raw-tool-facts checkpoint)
+   :semantic-capsule
+   (epi-ledger--checkpoint-raw-semantic-capsule checkpoint)
+   :uncertain t))
+
 (defun epi-ledger--record-source-length (source)
   "Return the number of records in private ordered SOURCE."
   (cond
@@ -449,9 +519,35 @@ All structural fields are immutable.  Only CHECKPOINT-CELL may publish a new
           (signal 'args-out-of-range (list source index))))))
    (t (signal 'wrong-type-argument (list 'sequencep source)))))
 
+(defun epi-ledger--record-source-last (source)
+  "Return the retained final record in private ordered SOURCE, or nil.
+This structural lookup neither copies nor visits record bodies."
+  (cond
+   ((epi-ledger--record-index-p source)
+    (let (last-chunk)
+      (dolist (chunk (epi-ledger--record-index-raw-chunks source))
+        (setq last-chunk chunk))
+      (when last-chunk
+        (let ((count (epi-ledger--record-chunk-raw-count last-chunk)))
+          (and (> count 0)
+               (aref (epi-ledger--record-chunk-raw-values last-chunk)
+                     (1- count)))))))
+   ((vectorp source)
+    (and (> (length source) 0) (aref source (1- (length source)))))
+   ((listp source)
+    (let ((tail source)
+          last)
+      (while (consp tail)
+        (setq last (car tail)
+              tail (cdr tail)))
+      (unless (null tail)
+        (error "Improper private record source"))
+      last))
+   (t (signal 'wrong-type-argument (list 'sequencep source)))))
+
 (defun epi-ledger-file-identity (ledger)
   "Return a defensive copy of LEDGER's validated file identity."
-  (epi-ledger--public-value-copy
+  (epi-ledger--copy-tree-and-strings
    (epi-ledger--checkpoint-raw-file-identity
     (epi-ledger--checkpoint-snapshot ledger))))
 
@@ -780,29 +876,36 @@ physical operation itself before calling `epi-ledger--work-charge'."
           (setq tail next)))
       vector)))
 
-(defun epi-ledger--work-list-to-record-index (list work)
-  "Copy proper ordered LIST into a bounded-chunk record index using WORK."
-  (if (< epi-ledger-work-byte-limit 8)
-      list
-    (let* ((chunk-limit
+(defun epi-ledger--work-list-to-record-chunks (records work)
+  "Return (COUNT . CHUNKS) for proper ordered RECORDS using WORK.
+Each chunk vector is bounded by both cooperative record and byte cadence.
+The records themselves are shared; only vectors, chunk objects, and their
+list spine are new."
+  (let* ((chunk-limit
           (max 1
                (min epi-ledger-work-record-limit
                     (max 1 (/ epi-ledger-work-byte-limit 8)))))
-         (tail list)
+         (tail records)
          chunks
          (total 0))
     (while (consp tail)
-      (let* ((capacity chunk-limit)
+      (let ((probe tail)
+            (capacity 0))
+        (while (and (< capacity chunk-limit) (consp probe))
+          (setq capacity (1+ capacity)
+                probe (epi-ledger--work-cdr probe work)))
+        (let* (
              (bytes (* capacity 8))
              (values
               (progn
                 (epi-ledger--open-observe-work
                  'allocate 'record-index-chunk bytes
                  :records capacity :bounded t)
-                (epi-ledger--work-charge work bytes)
-                (make-vector capacity nil)))
+                (epi-ledger--run-bounded-unit
+                 'allocate 'record-index-chunk bytes work
+                 (lambda () (make-vector capacity nil)))))
              (count 0))
-        (while (and (< count capacity) (consp tail))
+        (while (< count capacity)
           (let ((record (epi-ledger--work-car tail work))
                 (next (epi-ledger--work-cdr tail work)))
             (epi-ledger--work-charge work 1)
@@ -813,12 +916,160 @@ physical operation itself before calling `epi-ledger--work-charge'."
         (setq chunks
               (epi-ledger--work-cons
                (epi-ledger--make-record-chunk :values values :count count)
-               chunks work))))
+               chunks work)))))
     (unless (null tail)
-      (error "Cannot cooperatively index an improper record list"))
+      (error "Cannot cooperatively chunk an improper record list"))
+    (epi-ledger--work-cons
+     total (epi-ledger--work-nreverse-list chunks work) work)))
+
+(defun epi-ledger--work-list-to-record-index (list work)
+  "Copy proper ordered LIST into a bounded-chunk record index using WORK."
+  (if (< epi-ledger-work-byte-limit 8)
+      list
+    (let ((result (epi-ledger--work-list-to-record-chunks list work)))
       (epi-ledger--make-record-index
-       :chunks (epi-ledger--work-nreverse-list chunks work)
-       :count total))))
+       :chunks (cdr result)
+       :count (car result)))))
+
+(defun epi-ledger--record-index-extend (index suffix work)
+  "Return INDEX extended by proper ordered SUFFIX using WORK.
+The old chunk-list spine is copied, while every old chunk and prefix record is
+shared.  Only SUFFIX receives new bounded chunk vectors."
+  (unless (epi-ledger--record-index-p index)
+    (signal 'wrong-type-argument (list 'epi-ledger--record-index-p index)))
+  (when (< epi-ledger-work-byte-limit 8)
+    (epi-ledger--limit-fail
+     'record-index-work-byte-limit
+     :limit epi-ledger-work-byte-limit :minimum 8))
+  (let* ((chunk-result
+          (epi-ledger--work-list-to-record-chunks suffix work))
+         (suffix-count (car chunk-result))
+         (suffix-chunks (cdr chunk-result))
+         (old-tail (epi-ledger--record-index-raw-chunks index))
+         (new-tail suffix-chunks)
+         head last)
+    (while (consp old-tail)
+      (let* ((chunk (epi-ledger--work-car old-tail work))
+             (next (epi-ledger--work-cdr old-tail work))
+             (cell (epi-ledger--work-cons chunk nil work)))
+        (if last
+            (progn
+              (epi-ledger--work-charge work 1)
+              (setcdr last cell))
+          (setq head cell))
+        (setq last cell
+              old-tail next)))
+    (unless (null old-tail)
+      (error "Improper private record chunk spine"))
+    (while (consp new-tail)
+      (let* ((chunk (epi-ledger--work-car new-tail work))
+             (next (epi-ledger--work-cdr new-tail work))
+             (cell (epi-ledger--work-cons chunk nil work)))
+        (if last
+            (progn
+              (epi-ledger--work-charge work 1)
+              (setcdr last cell))
+          (setq head cell))
+        (setq last cell
+              new-tail next)))
+    (unless (null new-tail)
+      (error "Improper private suffix chunk spine"))
+    (epi-ledger--make-record-index
+     :chunks head
+     :count (+ (epi-ledger--record-index-raw-count index) suffix-count))))
+
+(defun epi-ledger--record-index-to-list-with-suffix (index suffix work)
+  "Copy INDEX order and proper SUFFIX into one proper list using WORK.
+Only list cells are new; every record is shared by identity.  This is the
+positive tiny-byte-cadence fallback where an eight-byte vector slot cannot be
+reserved without exceeding the configured work slice."
+  (let ((chunk-tail (epi-ledger--record-index-raw-chunks index))
+        head last)
+    (cl-labels
+        ((append-record
+          (record)
+          (let ((cell (epi-ledger--work-cons record nil work)))
+            (if last
+                (progn
+                  (epi-ledger--work-charge work 1)
+                  (setcdr last cell))
+              (setq head cell))
+            (setq last cell))))
+      (while (consp chunk-tail)
+        (let* ((chunk (epi-ledger--work-car chunk-tail work))
+               (next (epi-ledger--work-cdr chunk-tail work))
+               (values (epi-ledger--record-chunk-raw-values chunk)))
+          (dotimes (offset (epi-ledger--record-chunk-raw-count chunk))
+            (epi-ledger--work-charge work 1)
+            (append-record (aref values offset)))
+          (setq chunk-tail next)))
+      (unless (null chunk-tail)
+        (error "Improper private record chunk spine"))
+      (let ((tail suffix))
+        (while (consp tail)
+          (let ((record (epi-ledger--work-car tail work))
+                (next (epi-ledger--work-cdr tail work)))
+            (append-record record)
+            (setq tail next)))
+        (unless (null tail)
+          (error "Improper private record suffix")))
+      head)))
+
+(defun epi-ledger--record-source-extend (source suffix work)
+  "Return private ordered SOURCE extended by proper ordered SUFFIX under WORK.
+Only sequence containers are copied.  All records and, for a record index,
+all prefix chunk objects remain shared by identity."
+  (cond
+   ((epi-ledger--record-index-p source)
+    (if (< epi-ledger-work-byte-limit 8)
+        (epi-ledger--record-index-to-list-with-suffix source suffix work)
+      (epi-ledger--record-index-extend source suffix work)))
+   ((vectorp source)
+    (let ((tail suffix)
+          (suffix-count 0))
+      (while (consp tail)
+        (setq suffix-count (1+ suffix-count)
+              tail (epi-ledger--work-cdr tail work)))
+      (unless (null tail)
+        (error "Improper private record suffix"))
+      (let* ((prefix-count (length source))
+             (count (+ prefix-count suffix-count))
+             (result
+              (epi-ledger--run-bounded-unit
+               'allocate 'record-source-extension (* 8 count) work
+               (lambda () (make-vector count nil)))))
+        (dotimes (index prefix-count)
+          (epi-ledger--work-charge work 1)
+          (aset result index (aref source index)))
+        (setq tail suffix)
+        (dotimes (index suffix-count)
+          (let ((record (epi-ledger--work-car tail work))
+                (next (epi-ledger--work-cdr tail work)))
+            (epi-ledger--work-charge work 1)
+            (aset result (+ prefix-count index) record)
+            (setq tail next)))
+        result)))
+   ((listp source)
+    (let ((prefix-tail source)
+          (suffix-tail suffix)
+          head last)
+      (dolist (which '(prefix suffix))
+        (let ((tail (if (eq which 'prefix) prefix-tail suffix-tail)))
+          (while (consp tail)
+            (let* ((record (epi-ledger--work-car tail work))
+                   (next (epi-ledger--work-cdr tail work))
+                   (cell (epi-ledger--work-cons record nil work)))
+              (if last
+                  (progn
+                    (epi-ledger--work-charge work 1)
+                    (setcdr last cell))
+                (setq head cell))
+              (setq last cell
+                    tail next)))
+          (unless (null tail)
+            (error "Improper private record source"))))
+      head))
+   (t (signal 'wrong-type-argument (list 'sequencep source)))))
 
 (defun epi-ledger--work-sort-list-to-vector (list predicate work field)
   "Sort proper LIST into a vector with PREDICATE, charging WORK for FIELD."
@@ -3702,6 +3953,44 @@ Optional WORK-STATE receives the scan charge."
             (epi-ledger--utf8-byte-length
              value 'header-value work)))))
 
+(defun epi-ledger--utf8-byte-length-no-callback (value field)
+  "Return VALUE's exact UTF-8 byte length without callbacks for FIELD."
+  (unless (stringp value)
+    (epi-ledger--format-fail 'invalid-string :field field))
+  (let ((multibyte (multibyte-string-p value))
+        (total 0))
+    (dotimes (index (length value))
+      (let ((character (aref value index)))
+        (unless (if multibyte
+                    (and (<= character #x10ffff)
+                         (not (<= #xd800 character #xdfff)))
+                  (<= character #x7f))
+          (epi-ledger--format-fail 'invalid-string :field field))
+        (setq total
+              (+ total
+                 (cond ((<= character #x7f) 1)
+                       ((<= character #x7ff) 2)
+                       ((<= character #xffff) 3)
+                       (t 4))))))
+    total))
+
+(defun epi-ledger--header-rendered-byte-size-no-callback
+    (session-id created-at project-root)
+  "Return header bytes for SESSION-ID, CREATED-AT, and PROJECT-ROOT.
+Perform the exact sizing without invoking any callback."
+  (cl-loop
+   for (prefix . value)
+   in `(("#+title: " . "Epi session")
+        ("#+EPI_FORMAT: " . "1")
+        ("#+EPI_SESSION_ID: " . ,session-id)
+        ("#+EPI_CREATED_AT: " . ,created-at)
+        ("#+EPI_PROJECT_ROOT: " . ,project-root)
+        ("#+EPI_CODING_SYSTEM: " . "utf-8-unix")
+        ("#+EPI_HEADER_SHA256: " . ,(make-string 64 ?0)))
+   sum (+ (length prefix) 1
+          (epi-ledger--utf8-byte-length-no-callback
+           value 'header-value))))
+
 (defun epi-ledger-render-header (header)
   "Return exact UTF-8/LF framing bytes for sealed HEADER."
   (epi-ledger--with-operation-work-state
@@ -3922,6 +4211,234 @@ hard cap, and BYTE-LIMIT-CODE selects its structured error code."
             (epi-ledger--format-fail
              'unsupported-json-value :type (type-of node))))))
       (copy-node value 0)))))
+
+(defun epi-ledger--canonical-string-byte-length-no-callback (value)
+  "Return VALUE's exact JCS string byte length without yielding or copying."
+  (unless (stringp value)
+    (epi-ledger--format-fail 'invalid-string :field 'string))
+  (let ((multibyte (multibyte-string-p value))
+        (total 2))
+    (dotimes (index (length value))
+      (let ((character (aref value index)))
+        (unless (if multibyte
+                    (and (<= character #x10ffff)
+                         (not (<= #xd800 character #xdfff)))
+                  (<= character #x7f))
+          (epi-ledger--format-fail 'invalid-string :field 'string))
+        (setq total
+              (+ total
+                 (cond
+                  ((memq character '(8 9 10 12 13 34 92)) 2)
+                  ((< character 32) 6)
+                  ((<= character #x7f) 1)
+                  ((<= character #x7ff) 2)
+                  ((<= character #xffff) 3)
+                  (t 4))))))
+    total))
+
+(defun epi-ledger--canonical-value-byte-length-no-callback (value)
+  "Return canonical JCS byte length of already snapshotted VALUE.
+This helper performs no cooperative yield and invokes no Epi callback."
+  (cl-labels
+      ((measure
+        (node)
+        (cond
+         ((stringp node)
+          (epi-ledger--canonical-string-byte-length-no-callback node))
+         ((null node) 2)
+         ((vectorp node)
+          (let ((total 2))
+            (dotimes (index (length node))
+              (when (> index 0)
+                (setq total (1+ total)))
+              (setq total (+ total (measure (aref node index)))))
+            total))
+         ((consp node)
+          (let ((tail node)
+                (first t)
+                (total 2))
+            (while (consp tail)
+              (let ((entry (car tail)))
+                (unless (and (consp entry) (stringp (car entry)))
+                  (epi-ledger--format-fail
+                   'object-entry-required :field 'payload))
+                (unless first
+                  (setq total (1+ total)))
+                (setq first nil
+                      total
+                      (+ total
+                         (epi-ledger--canonical-string-byte-length-no-callback
+                          (car entry))
+                         1
+                         (measure (cdr entry)))
+                      tail (cdr tail))))
+            (unless (null tail)
+              (epi-ledger--format-fail 'improper-object :field 'payload))
+            total))
+         ((eq node t) 4)
+         ((eq node epi-json-false) 5)
+         ((eq node epi-json-null) 4)
+         ((or (integerp node) (floatp node))
+          (length (epi-ledger--jcs-number node)))
+         (t
+          (epi-ledger--format-fail
+           'unsupported-json-value :type (type-of node))))))
+    (measure value)))
+
+(defun epi-ledger--draft-projected-frame-byte-size (draft)
+  "Return DRAFT's exact rendered size using fixed generated-value widths.
+Nil identifiers and timestamps are replaced only for this callback-free size
+projection; the owned DRAFT remains unchanged."
+  (let* ((id (or (epi-draft-id draft)
+                 "00000000-0000-4000-8000-000000000000"))
+         (at (or (epi-draft-at draft)
+                 "2000-01-01T00:00:00.000000000Z"))
+         (type (epi-draft-type draft))
+         (_schema (epi-ledger--schema type))
+         (record
+          (epi-ledger--make-record
+           :id id :type type :schema 1 :at at
+           :previous-hash (make-string 64 ?0)
+           :hash (make-string 64 ?0)
+           :parent (epi-draft-parent draft)
+           :target (epi-draft-target draft)
+           :turn (epi-draft-turn draft)
+           :operation (epi-draft-operation draft)
+           :payload (epi-draft-payload draft)))
+         (json-size
+          (epi-ledger--canonical-value-byte-length-no-callback
+           (epi-ledger--envelope record)))
+         (properties (epi-ledger--record-render-properties record)))
+    (+ (length "*  \n:PROPERTIES:\n")
+       (string-bytes (symbol-name type))
+       (string-bytes id)
+       (cl-loop
+        for (name . value) in properties
+        sum (+ (length name) 4 (string-bytes value)))
+       (length ":END:\n#+begin_epi-json\n")
+       json-size
+       (length "\n#+end_epi-json\n"))))
+
+(defun epi-ledger--snapshot-draft-batch (drafts &optional header-bytes)
+  "Return an owned vector snapshot of DRAFTS under aggregate batch caps.
+HEADER-BYTES, when non-nil, is an already rendered unibyte header whose exact
+length participates in the byte cap.  Collection ownership and byte
+projection complete without yields, ID/time sources, or file I/O."
+  (let ((gc-cons-threshold most-positive-fixnum)
+        (count 0)
+        source)
+    (cond
+     ((vectorp drafts)
+      (setq count (length drafts))
+      (when (> count epi-ledger--batch-record-limit)
+        (epi-ledger--limit-fail
+         'batch-record-limit :limit epi-ledger--batch-record-limit
+         :count count))
+      (setq source (append drafts nil)))
+     ((listp drafts)
+      (let ((tail drafts)
+            reverse)
+        (while (and (consp tail)
+                    (<= count epi-ledger--batch-record-limit))
+          (push (car tail) reverse)
+          (setq count (1+ count)
+                tail (cdr tail)))
+        (when (> count epi-ledger--batch-record-limit)
+          (epi-ledger--limit-fail
+           'batch-record-limit :limit epi-ledger--batch-record-limit
+           :count count))
+        (unless (null tail)
+          (epi-ledger--format-fail 'invalid-draft-batch))
+        (setq source (nreverse reverse))))
+     (t
+      (epi-ledger--format-fail 'invalid-draft-batch)))
+    (let* ((header-size
+            (cond
+             ((null header-bytes) 0)
+             ((and (stringp header-bytes)
+                   (not (multibyte-string-p header-bytes)))
+              (length header-bytes))
+             (t
+              (epi-ledger--format-fail 'invalid-header-bytes))))
+           (bytes header-size)
+           (owned (make-vector count nil))
+           (tail source))
+      (when (> bytes epi-ledger--batch-byte-limit)
+        (epi-ledger--limit-fail
+         'batch-byte-limit :limit epi-ledger--batch-byte-limit
+         :bytes bytes))
+      (cl-labels
+          ((copy-field
+            (value field)
+            (cond
+             ((null value) nil)
+             ((not (stringp value))
+              (epi-ledger--format-fail 'invalid-string :field field))
+             (t
+              (let ((storage (string-bytes value)))
+                (when (> storage (- epi-ledger--batch-byte-limit bytes))
+                  (epi-ledger--limit-fail
+                   'batch-byte-limit :limit epi-ledger--batch-byte-limit
+                   :bytes (+ bytes storage)))
+                (substring-no-properties value))))))
+        (dotimes (index count)
+          (let ((draft (car tail)))
+            (unless (epi-draft-p draft)
+              (epi-ledger--format-fail 'draft-required))
+            (let ((copy
+                   (make-epi-draft
+                    :id (copy-field (epi-draft-id draft) "id")
+                    :type (epi-draft-type draft)
+                    :at (copy-field (epi-draft-at draft) "at")
+                    :parent (copy-field (epi-draft-parent draft) "parent")
+                    :target (copy-field (epi-draft-target draft) "target")
+                    :turn (copy-field (epi-draft-turn draft) "turn")
+                    :operation
+                    (copy-field (epi-draft-operation draft) "operation")
+                    :payload
+                    (epi-ledger--snapshot-canonical-value
+                     (epi-draft-payload draft)
+                     epi-record-json-byte-limit
+                     'record-json-byte-limit))))
+              (setq bytes
+                    (+ bytes
+                       (epi-ledger--draft-projected-frame-byte-size copy)))
+              (when (> bytes epi-ledger--batch-byte-limit)
+                (epi-ledger--limit-fail
+                 'batch-byte-limit :limit epi-ledger--batch-byte-limit
+                 :bytes bytes))
+              (aset owned index copy)))
+          (setq tail (cdr tail))))
+      owned)))
+
+(defun epi-ledger--fill-owned-draft-defaults (owned-drafts)
+  "Fill nil IDs and timestamps in owned vector OWNED-DRAFTS.
+Each draft is visited in physical order.  Its ID is filled before its
+timestamp, and every callback result is copied and validated before any later
+callback can run.  Return the same vector."
+  (unless (vectorp owned-drafts)
+    (epi-ledger--format-fail 'invalid-draft-batch))
+  (dotimes (index (length owned-drafts))
+    (let ((draft (aref owned-drafts index)))
+      (unless (epi-draft-p draft)
+        (epi-ledger--format-fail 'draft-required))
+      (unless (epi-draft-id draft)
+        (let ((generated (epi--new-id)))
+          (unless (stringp generated)
+            (epi-ledger--format-fail 'invalid-id :field "id"))
+          (let ((owned (substring-no-properties generated)))
+            (unless (epi-ledger--uuid-p owned)
+              (epi-ledger--format-fail 'invalid-id :field "id"))
+            (setf (epi-draft-id draft) owned))))
+      (unless (epi-draft-at draft)
+        (let ((generated (epi--format-timestamp)))
+          (unless (stringp generated)
+            (epi-ledger--format-fail 'invalid-timestamp :field "at"))
+          (let ((owned (substring-no-properties generated)))
+            (unless (epi-ledger--timestamp-p owned)
+              (epi-ledger--format-fail 'invalid-timestamp :field "at"))
+            (setf (epi-draft-at draft) owned))))))
+  owned-drafts)
 
 (defun epi-ledger--preflight-canonical-value
     (value &optional byte-limit byte-limit-code)
@@ -5635,6 +6152,1844 @@ an immutable carry window may call `epi-ledger--scan-frame-owned' directly."
   deferred-references uncertain uncertainty-phase uncertainty-class
   uncertainty-turn uncertainty-operation)
 
+(defun epi-ledger--semantic-capsule-from-state (state)
+  "Publish STATE's semantic roots as an immutable-by-convention capsule.
+The transient reverse record accumulator is intentionally not represented."
+  (when (epi-ledger--validation-state-records-reverse state)
+    (epi-ledger--format-fail
+     'semantic-capsule-record-accumulator-not-empty))
+  (epi-ledger--make-semantic-capsule
+   :by-id (epi-ledger--validation-state-by-id state)
+   :operations (epi-ledger--validation-state-operations state)
+   :turns (epi-ledger--validation-state-turns state)
+   :turn-operation-index
+   (epi-ledger--validation-state-turn-operation-index state)
+   :calls (epi-ledger--validation-state-calls state)
+   :calls-by-target (epi-ledger--validation-state-calls-by-target state)
+   :reserved-call-ids
+   (epi-ledger--validation-state-reserved-call-ids state)
+   :intents (epi-ledger--validation-state-intents state)
+   :active-operation (epi-ledger--validation-state-active-operation state)
+   :active-call (epi-ledger--validation-state-active-call state)
+   :session-seen (epi-ledger--validation-state-session-seen state)
+   :first-nonsession (epi-ledger--validation-state-first-nonsession state)
+   :pending-proposal (epi-ledger--validation-state-pending-proposal state)
+   :pending-result (epi-ledger--validation-state-pending-result state)
+   :terminalization-required
+   (epi-ledger--validation-state-terminalization-required state)
+   :deferred-references
+   (epi-ledger--validation-state-deferred-references state)
+   :uncertain (epi-ledger--validation-state-uncertain state)
+   :uncertainty-phase
+   (epi-ledger--validation-state-uncertainty-phase state)
+   :uncertainty-class
+   (epi-ledger--validation-state-uncertainty-class state)
+   :uncertainty-turn
+   (epi-ledger--validation-state-uncertainty-turn state)
+   :uncertainty-operation
+   (epi-ledger--validation-state-uncertainty-operation state)))
+
+(defun epi-ledger--semantic-capsule-clone (capsule)
+  "Return one mutable validation accumulator cloned from CAPSULE.
+All mutable graph nodes are copied through one identity memo, preserving
+aliases and cycles within the clone.  Immutable `epi-record' leaves remain
+shared.  The returned record accumulator starts empty."
+  (unless (epi-ledger--semantic-capsule-p capsule)
+    (signal 'wrong-type-argument
+            (list 'epi-ledger--semantic-capsule-p capsule)))
+  (let ((memo (make-hash-table :test #'eq)))
+    (cl-labels
+        ((clone
+          (node)
+          (cond
+           ((or (null node) (numberp node) (symbolp node)
+                (epi-record-p node))
+            node)
+           ((gethash node memo))
+           ((stringp node)
+            (let ((copy (substring-no-properties node)))
+              (puthash node copy memo)
+              copy))
+           ((consp node)
+            (let ((copy (cons nil nil)))
+              (puthash node copy memo)
+              (setcar copy (clone (car node)))
+              (setcdr copy (clone (cdr node)))
+              copy))
+           ((hash-table-p node)
+            (let ((copy (copy-hash-table node)))
+              (clrhash copy)
+              (puthash node copy memo)
+              (maphash (lambda (key value)
+                         (puthash (clone key) (clone value) copy))
+                       node)
+              copy))
+           ((vectorp node)
+            (let ((copy (make-vector (length node) nil)))
+              (puthash node copy memo)
+              (dotimes (index (length node))
+                (aset copy index (clone (aref node index))))
+              copy))
+           (t
+            (epi-ledger--format-fail
+             'unsupported-semantic-node :type (type-of node))))))
+      (epi-ledger--make-validation-state
+       :records-reverse nil
+       :by-id (clone (epi-ledger--semantic-capsule-raw-by-id capsule))
+       :operations
+       (clone (epi-ledger--semantic-capsule-raw-operations capsule))
+       :turns (clone (epi-ledger--semantic-capsule-raw-turns capsule))
+       :turn-operation-index
+       (clone
+        (epi-ledger--semantic-capsule-raw-turn-operation-index capsule))
+       :calls (clone (epi-ledger--semantic-capsule-raw-calls capsule))
+       :calls-by-target
+       (clone (epi-ledger--semantic-capsule-raw-calls-by-target capsule))
+       :reserved-call-ids
+       (clone (epi-ledger--semantic-capsule-raw-reserved-call-ids capsule))
+       :intents (clone (epi-ledger--semantic-capsule-raw-intents capsule))
+       :active-operation
+       (clone (epi-ledger--semantic-capsule-raw-active-operation capsule))
+       :active-call
+       (clone (epi-ledger--semantic-capsule-raw-active-call capsule))
+       :session-seen
+       (clone (epi-ledger--semantic-capsule-raw-session-seen capsule))
+       :first-nonsession
+       (clone (epi-ledger--semantic-capsule-raw-first-nonsession capsule))
+       :pending-proposal
+       (clone (epi-ledger--semantic-capsule-raw-pending-proposal capsule))
+       :pending-result
+       (clone (epi-ledger--semantic-capsule-raw-pending-result capsule))
+       :terminalization-required
+       (clone
+        (epi-ledger--semantic-capsule-raw-terminalization-required capsule))
+       :deferred-references
+       (clone
+        (epi-ledger--semantic-capsule-raw-deferred-references capsule))
+       :uncertain
+       (clone (epi-ledger--semantic-capsule-raw-uncertain capsule))
+       :uncertainty-phase
+       (clone (epi-ledger--semantic-capsule-raw-uncertainty-phase capsule))
+       :uncertainty-class
+       (clone (epi-ledger--semantic-capsule-raw-uncertainty-class capsule))
+       :uncertainty-turn
+       (clone (epi-ledger--semantic-capsule-raw-uncertainty-turn capsule))
+       :uncertainty-operation
+       (clone
+        (epi-ledger--semantic-capsule-raw-uncertainty-operation capsule))))))
+
+(defun epi-ledger--validation-suffix-records (state work)
+  "Extract STATE's newly validated records in physical order using WORK.
+Clear the reverse accumulator before returning so no published capsule can
+retain a second all-record list spine."
+  (let ((reverse (epi-ledger--validation-state-records-reverse state)))
+    (setf (epi-ledger--validation-state-records-reverse state) nil)
+    (epi-ledger--work-nreverse-list reverse work)))
+
+(defun epi-ledger--resolve-local-write-path (path)
+  "Return an owned canonical local file name for caller-supplied PATH.
+Resolve only an existing ancestor, then append validated absent components.
+Reject handlers before remote-name detection or any handler bypass."
+  (unless (stringp path)
+    (epi-ledger--format-fail 'invalid-write-path))
+  (let ((owned (substring-no-properties path)))
+    (when (or (string-empty-p owned)
+              (string-match-p "[\0\r\n]" owned)
+              (directory-name-p owned)
+              (find-file-name-handler owned 'write-region))
+      (epi-ledger--format-fail 'invalid-write-path))
+    (when (condition-case nil (file-remote-p owned) (error t))
+      (epi-ledger--format-fail 'invalid-write-path))
+    (unless (file-name-absolute-p owned)
+      (epi-ledger--format-fail 'invalid-write-path))
+    (let ((expanded
+           (condition-case nil
+               (expand-file-name owned)
+             (error (epi-ledger--format-fail 'invalid-write-path)))))
+      (unless (equal owned expanded)
+        (epi-ledger--format-fail 'invalid-write-path))
+      (let ((probe expanded)
+            missing
+            exists)
+        (while (not exists)
+          (when (or (find-file-name-handler probe 'file-exists-p)
+                    (condition-case nil (file-remote-p probe) (error t)))
+            (epi-ledger--format-fail 'invalid-write-path))
+          (setq exists
+                (condition-case nil
+                    (file-exists-p probe)
+                  (file-error
+                   (epi-ledger--format-fail 'invalid-write-path))))
+          (unless exists
+            (when (condition-case nil
+                      (file-symlink-p probe)
+                    (file-error
+                     (epi-ledger--format-fail 'invalid-write-path)))
+              (epi-ledger--format-fail 'invalid-write-path))
+            (let* ((component (file-name-nondirectory probe))
+                   (parent
+                    (directory-file-name (file-name-directory probe))))
+              (when (or (string-empty-p component)
+                        (member component '("." ".."))
+                        (equal parent probe))
+                (epi-ledger--format-fail 'invalid-write-path))
+              (push component missing)
+              (setq probe parent))))
+        (when (and (null missing)
+                   (condition-case nil
+                       (file-symlink-p probe)
+                     (file-error
+                      (epi-ledger--format-fail 'invalid-write-path))))
+          (epi-ledger--format-fail 'non-regular-storage-leaf))
+        (when (or (find-file-name-handler probe 'file-truename)
+                  (condition-case nil (file-remote-p probe) (error t)))
+          (epi-ledger--format-fail 'invalid-write-path))
+        (unless
+            (condition-case nil
+                (if missing
+                    (file-directory-p probe)
+                  (file-regular-p probe))
+              (file-error
+               (epi-ledger--format-fail 'invalid-write-path)))
+          (epi-ledger--format-fail
+           (if missing 'non-directory-parent 'non-regular-storage-leaf)))
+        (let ((resolved
+               (condition-case nil
+                   (file-truename probe)
+                 (file-error
+                  (epi-ledger--format-fail 'invalid-write-path)))))
+          (dolist (component missing)
+            (setq resolved
+                  (expand-file-name component
+                                    (file-name-as-directory resolved))))
+          (when (or (find-file-name-handler resolved 'write-region)
+                    (condition-case nil
+                        (file-remote-p resolved)
+                      (error t)))
+            (epi-ledger--format-fail 'invalid-write-path))
+          (substring-no-properties resolved))))))
+
+(defun epi-ledger--ensure-private-parent (path)
+  "Create PATH's absent parent directories one at a time with mode 0700.
+Existing directories retain their modes.  Return PATH's canonical parent."
+  (let* ((canonical (epi-ledger--resolve-local-write-path path))
+         (probe (directory-file-name (file-name-directory canonical)))
+         missing)
+    (condition-case condition
+        (let ((file-name-handler-alist nil))
+          (while (not (file-exists-p probe))
+            (when (file-symlink-p probe)
+              (epi-ledger--format-fail 'invalid-write-path))
+            (push probe missing)
+            (let ((parent
+                   (directory-file-name (file-name-directory probe))))
+              (when (equal parent probe)
+                (epi-ledger--format-fail 'non-directory-parent))
+              (setq probe parent)))
+          (unless (and (file-directory-p probe)
+                       (not (file-symlink-p probe)))
+            (epi-ledger--format-fail 'non-directory-parent))
+          (dolist (directory missing)
+            (condition-case create-condition
+                (progn
+                  (with-file-modes #o700
+                    (make-directory directory nil))
+                  (set-file-modes directory #o700))
+              (file-already-exists
+               (unless (and (file-directory-p directory)
+                            (not (file-symlink-p directory)))
+                 (epi-ledger--fail
+                  'epi-ledger-conflict 'storage-write-failed)))
+              (file-error
+               (ignore create-condition)
+               (epi-ledger--fail
+                'epi-ledger-conflict 'storage-write-failed)))))
+      (file-error
+       (ignore condition)
+       (epi-ledger--fail 'epi-ledger-conflict 'storage-write-failed)))
+    (file-name-as-directory
+     (substring-no-properties
+      (directory-file-name (file-name-directory canonical))))))
+
+(defun epi-ledger--hidden-sibling (path &optional suffix)
+  "Return a hidden sibling of canonical PATH using optional SUFFIX.
+When SUFFIX is nil, generate a fresh Epi temporary suffix."
+  (let* ((canonical (epi-ledger--resolve-local-write-path path))
+         (owned-suffix
+          (substring-no-properties
+           (or suffix (concat "epi-tmp-" (epi--new-id))))))
+    (when (or (string-empty-p owned-suffix)
+              (string-match-p "[\0\r\n/]" owned-suffix)
+              (member owned-suffix '("." "..")))
+      (epi-ledger--format-fail 'invalid-hidden-sibling-suffix))
+    (expand-file-name
+     (concat "." (file-name-nondirectory canonical) "." owned-suffix)
+     (file-name-directory canonical))))
+
+(defun epi-ledger--write-bytes (path bytes mode durablep)
+  "Write owned unibyte BYTES to proven-local PATH in closed MODE.
+MODE is `exclusive-create', `append', or `replace'.  DURABLEP enables the
+`write-region' fsync path.  Return nil after an exact no-conversion write."
+  (unless (memq mode '(exclusive-create append replace))
+    (epi-ledger--format-fail 'invalid-write-mode :mode mode))
+  (unless (and (stringp bytes) (not (multibyte-string-p bytes)))
+    (epi-ledger--format-fail 'unibyte-write-required))
+  (when (and (> (length bytes) 0)
+             (or (text-properties-at 0 bytes)
+                 (let ((change (next-property-change 0 bytes)))
+                   (and change (< change (length bytes))))))
+    (epi-ledger--format-fail 'property-free-write-required))
+  ;; Resolution performs the handler and locality proof before the deliberate
+  ;; bypass below.  Preserve the already-proven input spelling at the system
+  ;; call boundary; callers carry the resolver's canonical result between
+  ;; operations, while direct low-level callers can still close an injected
+  ;; `write-region' race against the exact name they supplied.
+  (let* ((_proven (epi-ledger--resolve-local-write-path path))
+         (local (substring-no-properties path)))
+    (condition-case condition
+        (let ((newp
+               (or (eq mode 'exclusive-create)
+                   (let ((file-name-handler-alist nil))
+                     (not (file-exists-p local)))))
+              (coding-system-for-write 'no-conversion)
+              (buffer-file-coding-system 'no-conversion)
+              (buffer-file-format nil)
+              (file-coding-system-alist nil)
+              (format-alist nil)
+              (write-region-annotate-functions nil)
+              (write-region-post-annotation-function nil)
+              (write-region-inhibit-fsync (not durablep))
+              (create-lockfiles nil)
+              (file-name-handler-alist nil))
+          (with-file-modes #o600
+            (pcase mode
+              ('exclusive-create
+               (write-region bytes nil local nil 'silent nil 'excl))
+              ('append
+               (write-region bytes nil local t 'silent nil nil))
+              ('replace
+               (write-region bytes nil local nil 'silent nil nil))))
+          (when newp
+            (set-file-modes local #o600))
+          nil)
+      (file-already-exists
+       (ignore condition)
+       (epi-ledger--fail 'epi-ledger-conflict 'destination-exists))
+      (file-error
+       (ignore condition)
+       (epi-ledger--fail 'epi-ledger-conflict 'storage-write-failed)))))
+
+(defun epi-ledger--read-bytes (path begin end)
+  "Return a fresh unibyte copy of PATH's bytes from BEGIN through END.
+BEGIN is inclusive and END exclusive, as for `insert-file-contents-literally'."
+  (unless (and (integerp begin) (integerp end)
+               (<= 0 begin) (<= begin end))
+    (epi-ledger--format-fail 'invalid-byte-range))
+  ;; Resolution rejects a handler-owned or non-regular leaf before bypass.
+  (let ((canonical (epi-ledger--resolve-local-write-path path)))
+    (condition-case condition
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (let ((coding-system-for-read 'no-conversion)
+                (buffer-file-coding-system 'no-conversion)
+                (file-coding-system-alist nil)
+                (format-alist nil)
+                (after-insert-file-functions nil)
+                (inhibit-modification-hooks t)
+                (file-name-handler-alist nil))
+            (insert-file-contents-literally canonical nil begin end))
+          (buffer-substring-no-properties (point-min) (point-max)))
+      (file-error
+       (ignore condition)
+       (epi-ledger--fail 'epi-ledger-conflict 'storage-read-failed)))))
+
+(defun epi-ledger--stat-local-file (path)
+  "Return PATH's full local identity plist, or nil when PATH is absent."
+  (let ((canonical (epi-ledger--resolve-local-write-path path)))
+    (condition-case condition
+        (let* ((file-name-handler-alist nil)
+               (attributes (file-attributes canonical 'string)))
+          (when attributes
+            (unless (null (file-attribute-type attributes))
+              (epi-ledger--format-fail 'non-regular-storage-leaf))
+            (list :path (substring-no-properties canonical)
+                  :device (file-attribute-device-number attributes)
+                  :inode (file-attribute-inode-number attributes)
+                  :links (file-attribute-link-number attributes)
+                  :size (file-attribute-size attributes)
+                  :modified (file-attribute-modification-time attributes)
+                  :changed (file-attribute-status-change-time attributes))))
+      (file-error
+       (ignore condition)
+       (epi-ledger--fail 'epi-ledger-conflict 'storage-stat-failed)))))
+
+(defvar epi-ledger--byte-writer #'epi-ledger--write-bytes
+  "Dynamically bindable exact local-byte writer.")
+
+(defvar epi-ledger--lock-create-function #'epi-ledger--default-lock-create
+  "Dynamically bindable exclusive lock-token creator.")
+
+(defvar epi-ledger--append-function #'epi-ledger--default-append
+  "Dynamically bindable single data-append operation.")
+
+(defvar epi-ledger--flush-function #'epi-ledger--default-flush
+  "Dynamically bindable final file flush operation.")
+
+(defvar epi-ledger--stat-function #'epi-ledger--stat-local-file
+  "Dynamically bindable local file identity reader.")
+
+(defvar epi-ledger--read-function #'epi-ledger--read-bytes
+  "Dynamically bindable exact ranged local-byte reader.")
+
+(defvar epi-ledger--unlock-function #'epi-ledger--default-unlock
+  "Dynamically bindable exact lock release operation.")
+
+(defvar epi-ledger--publish-function #'epi-ledger--default-publish
+  "Dynamically bindable sibling no-clobber publication operation.")
+
+(defvar epi-ledger--publish-expected-source-identity nil
+  "Optional exact prepublication source identity for the default publisher.")
+
+(defvar epi-ledger--create-prepublication-function #'ignore
+  "Zero-argument barrier immediately before atomic ledger publication.")
+
+(defvar epi-ledger--create-postpublication-function #'ignore
+  "Zero-argument barrier after ledger publication and source cleanup.")
+
+(defun epi-ledger--default-lock-create (path token-bytes)
+  "Exclusively create PATH from TOKEN-BYTES and return its identity."
+  (funcall epi-ledger--byte-writer
+           path token-bytes 'exclusive-create t)
+  (or (funcall epi-ledger--stat-function path)
+      (epi-ledger--fail 'epi-ledger-conflict 'storage-stat-failed)))
+
+(defun epi-ledger--default-append (path suffix-bytes)
+  "Append owned SUFFIX-BYTES to PATH once without a final fsync."
+  (funcall epi-ledger--byte-writer path suffix-bytes 'append nil))
+
+(defun epi-ledger--default-flush (path)
+  "Run PATH's final fsync path through one empty durable append."
+  (funcall epi-ledger--byte-writer
+           path "" 'append t))
+
+(defun epi-ledger--default-unlock (lock)
+  "Release opaque LOCK through the exact-token implementation when loaded."
+  (if (fboundp 'epi-ledger--release-lock)
+      (funcall (symbol-function 'epi-ledger--release-lock) lock)
+    (epi-ledger--fail 'epi-ledger-conflict 'unlock-unavailable)))
+
+(defun epi-ledger--same-file-object-p (left right)
+  "Return non-nil when identity plists LEFT and RIGHT name one file object."
+  (and left right
+       (equal (plist-get left :device) (plist-get right :device))
+       (equal (plist-get left :inode) (plist-get right :inode))))
+
+(defun epi-ledger--owned-stat (path)
+  "Return an ownership-isolated stat-seam result for PATH."
+  (epi-ledger--copy-tree-and-strings
+   (funcall epi-ledger--stat-function (substring-no-properties path))))
+
+(defun epi-ledger--default-publish (temporary destination)
+  "Hard-link TEMPORARY to sibling DESTINATION without overwriting a winner.
+Return only after both names are verified to designate the same file object;
+the caller owns postpublication removal of the source name."
+  (let* ((source (epi-ledger--resolve-local-write-path temporary))
+         (target (epi-ledger--resolve-local-write-path destination))
+         (source-identity
+          (condition-case nil
+              (if epi-ledger--publish-expected-source-identity
+                  (epi-ledger--stat-local-file source)
+                (epi-ledger--owned-stat source))
+            (error nil))))
+    (unless (equal (file-name-directory source)
+                   (file-name-directory target))
+      (epi-ledger--format-fail 'publication-sibling-required))
+    (unless source-identity
+      (epi-ledger--fail 'epi-ledger-conflict 'storage-publication-failed))
+    (when (and epi-ledger--publish-expected-source-identity
+               (not (equal epi-ledger--publish-expected-source-identity
+                           source-identity)))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'storage-publication-failed))
+    (condition-case condition
+        (let ((file-name-handler-alist nil))
+          (add-name-to-file
+           (substring-no-properties source)
+           (substring-no-properties target) nil))
+      (file-already-exists
+       (ignore condition)
+       (epi-ledger--fail 'epi-ledger-conflict 'destination-exists))
+      (file-error
+       (ignore condition)
+       (let ((published-target
+              (condition-case nil
+                  (epi-ledger--owned-stat target)
+                (error nil))))
+         (if (epi-ledger--same-file-object-p
+              source-identity published-target)
+             (epi-ledger--fail
+              'epi-ledger-conflict 'storage-publication-failed :published t)
+           (if published-target
+               (epi-ledger--fail
+                'epi-ledger-conflict 'destination-exists)
+             (epi-ledger--fail
+              'epi-ledger-conflict 'storage-publication-failed))))))
+    (let ((published-source
+           (condition-case nil
+               (epi-ledger--owned-stat source)
+             (error nil)))
+          (published-target
+           (condition-case nil
+               (epi-ledger--owned-stat target)
+             (error nil))))
+      (unless (and (epi-ledger--same-file-object-p
+                    source-identity published-source)
+                   (epi-ledger--same-file-object-p
+                    published-source published-target))
+        (epi-ledger--fail
+         'epi-ledger-conflict 'storage-publication-failed :published t)))
+    nil))
+
+(defun epi-ledger--string-has-properties-p (value)
+  "Return non-nil when string VALUE carries any text property."
+  (and (> (length value) 0)
+       (or (text-properties-at 0 value)
+           (let ((position 0)
+                 found)
+             (while (and (< position (length value)) (not found))
+               (setq position (or (next-property-change
+                                   position value (length value))
+                                  (length value)))
+               (when (< position (length value))
+                 (setq found (text-properties-at position value))))
+             found))))
+
+(defun epi-ledger--safe-integer-p (value)
+  "Return non-nil when VALUE is an integer representable exactly by JCS."
+  (and (integerp value)
+       (<= (- epi-ledger--maximum-safe-integer)
+           value epi-ledger--maximum-safe-integer)))
+
+(defun epi-ledger--normalize-time-vector (value)
+  "Normalize Emacs time VALUE to an owned four-safe-integer vector."
+  (let ((parts
+         (condition-case nil
+             (time-convert
+              (if (vectorp value) (append value nil) value) 'list)
+           (error nil))))
+    (unless (and (listp parts)
+                 (= 4 (length parts))
+                 (seq-every-p #'epi-ledger--safe-integer-p parts))
+      (epi-ledger--format-fail 'invalid-lock-time))
+    (vconcat parts)))
+
+(defun epi-ledger--lock-time-vector-p (value)
+  "Return non-nil when VALUE has the lock token's exact time shape."
+  (and (vectorp value)
+       (= 4 (length value))
+       (seq-every-p #'epi-ledger--safe-integer-p value)
+       (condition-case nil
+           (equal value (epi-ledger--normalize-time-vector value))
+         (error nil))))
+
+(defun epi-ledger--canonical-lock-ledger-path-p (value)
+  "Return non-nil when VALUE is a canonical absolute ledger file spelling."
+  (and (stringp value)
+       (not (string-empty-p value))
+       (not (string-match-p "[\0\r\n]" value))
+       (not (directory-name-p value))
+       (file-name-absolute-p value)
+       (let ((file-name-handler-alist nil))
+         (equal value (expand-file-name value)))))
+
+(defun epi-ledger--unsigned-decimal-string (value field)
+  "Return nonnegative integer VALUE as a canonical decimal for FIELD."
+  (unless (and (integerp value) (>= value 0))
+    (epi-ledger--format-fail 'invalid-unsigned-decimal :field field))
+  (number-to-string value))
+
+(defun epi-ledger--parse-unsigned-decimal (value field)
+  "Return canonical unsigned decimal string VALUE as an integer for FIELD."
+  (unless (and (stringp value)
+               (let ((case-fold-search nil))
+                 (string-match-p "\\`\\(?:0\\|[1-9][0-9]*\\)\\'" value)))
+    (epi-ledger--format-fail 'invalid-unsigned-decimal :field field))
+  (string-to-number value))
+
+(defun epi-ledger--lock-file-identity-object (identity)
+  "Return the closed lock-token file object for plist IDENTITY."
+  (unless (and (listp identity)
+               (stringp (plist-get identity :path)))
+    (epi-ledger--format-fail 'invalid-lock-file-identity))
+  (list
+   (cons "path" (substring-no-properties (plist-get identity :path)))
+   (cons "device"
+         (epi-ledger--unsigned-decimal-string
+          (plist-get identity :device) 'device))
+   (cons "inode"
+         (epi-ledger--unsigned-decimal-string
+          (plist-get identity :inode) 'inode))
+   (cons "links"
+         (epi-ledger--unsigned-decimal-string
+          (plist-get identity :links) 'links))
+   (cons "size"
+         (epi-ledger--unsigned-decimal-string
+          (plist-get identity :size) 'size))
+   (cons "modified"
+         (epi-ledger--normalize-time-vector
+          (plist-get identity :modified)))
+   (cons "changed"
+         (epi-ledger--normalize-time-vector
+          (plist-get identity :changed)))))
+
+(defun epi-ledger--encode-lock-token
+    (host pid process-start nonce ledger-path
+          expected-file expected-end expected-head)
+  "Encode the exact closed lock token.
+HOST, PID, PROCESS-START, NONCE, and LEDGER-PATH identify its owner and target;
+EXPECTED-FILE, EXPECTED-END, and EXPECTED-HEAD bind the ledger state."
+  (unless (and (stringp host) (not (string-empty-p host))
+               (epi-ledger--canonical-lock-ledger-path-p ledger-path)
+               (epi-ledger--uuid-p nonce))
+    (epi-ledger--format-fail 'invalid-lock-token-input))
+  (let* ((owned-path (substring-no-properties ledger-path))
+         (end-string
+          (epi-ledger--unsigned-decimal-string expected-end 'expected-end))
+         (file-object
+          (if (equal expected-file "absent")
+              "absent"
+            (epi-ledger--lock-file-identity-object expected-file)))
+         (head
+          (if expected-head
+              (progn
+                (epi-ledger--require-hash expected-head 'expected-head)
+                (substring-no-properties expected-head))
+            epi-json-null)))
+    (unless
+        (if (equal file-object "absent")
+            (and (= expected-end 0) (null expected-head))
+          (and (equal owned-path
+                      (epi-ledger--object-value file-object "path"))
+               (= expected-end
+                  (string-to-number
+                   (epi-ledger--object-value file-object "size")))
+               expected-head))
+      (epi-ledger--format-fail 'incoherent-lock-token-input))
+    (epi-ledger--jcs-encode
+     (list
+      (cons "version" 1)
+      (cons "host" (substring-no-properties host))
+      (cons "pid" (epi-ledger--unsigned-decimal-string pid 'pid))
+      (cons "process_start"
+            (epi-ledger--normalize-time-vector process-start))
+      (cons "nonce" (substring-no-properties nonce))
+      (cons "ledger_path" owned-path)
+      (cons "expected_file" file-object)
+      (cons "expected_end" end-string)
+      (cons "expected_head" head))
+     epi-ledger--lock-token-byte-limit)))
+
+(defun epi-ledger--lock-decode-fail ()
+  "Signal the stable conflict for a malformed lock token."
+  (epi-ledger--fail 'epi-ledger-conflict 'malformed-lock-token))
+
+(defun epi-ledger--decode-lock-file-object (object ledger-path expected-end)
+  "Validate and reorder present file OBJECT for LEDGER-PATH and EXPECTED-END."
+  (epi-ledger--closed-object
+   object '("path" "device" "inode" "links" "size" "modified" "changed")
+   nil 'expected-file)
+  (let* ((path (epi-ledger--object-value object "path"))
+         (device (epi-ledger--object-value object "device"))
+         (inode (epi-ledger--object-value object "inode"))
+         (links (epi-ledger--object-value object "links"))
+         (size (epi-ledger--object-value object "size"))
+         (modified (epi-ledger--object-value object "modified"))
+         (changed (epi-ledger--object-value object "changed")))
+    (unless (and (stringp path) (equal path ledger-path))
+      (epi-ledger--format-fail 'invalid-lock-file-path))
+    (dolist (entry `((,device . device) (,inode . inode)
+                     (,links . links) (,size . size)))
+      (epi-ledger--parse-unsigned-decimal (car entry) (cdr entry)))
+    (unless (= (epi-ledger--parse-unsigned-decimal size 'size)
+               expected-end)
+      (epi-ledger--format-fail 'incoherent-lock-file-size))
+    (unless (and (epi-ledger--lock-time-vector-p modified)
+                 (epi-ledger--lock-time-vector-p changed))
+      (epi-ledger--format-fail 'invalid-lock-time))
+    (let ((normalized-modified (epi-ledger--normalize-time-vector modified))
+          (normalized-changed (epi-ledger--normalize-time-vector changed)))
+      (list (cons "path" (substring-no-properties path))
+            (cons "device" (substring-no-properties device))
+            (cons "inode" (substring-no-properties inode))
+            (cons "links" (substring-no-properties links))
+            (cons "size" (substring-no-properties size))
+            (cons "modified" normalized-modified)
+            (cons "changed" normalized-changed)))))
+
+(defun epi-ledger--decode-lock-token (bytes)
+  "Decode and validate canonical unibyte lock-token BYTES.
+The returned object owns all mutable values and has a schema-ordered nested
+file identity so independent re-encoding reproduces BYTES exactly."
+  (condition-case nil
+      (progn
+        (unless (and (stringp bytes)
+                     (not (multibyte-string-p bytes))
+                     (<= (length bytes) epi-ledger--lock-token-byte-limit)
+                     (not (epi-ledger--string-has-properties-p bytes)))
+          (error "Invalid lock byte container"))
+        (let* ((decoded-text (decode-coding-string bytes 'utf-8-unix t))
+               (roundtrip (encode-coding-string decoded-text 'utf-8-unix))
+               (json-object-type 'alist)
+               (json-array-type 'vector)
+               (json-key-type 'string)
+               (json-null epi-json-null)
+               (json-false epi-json-false)
+               (object
+                (and (equal bytes roundtrip)
+                     (json-read-from-string decoded-text))))
+          (unless (and object
+                       (equal bytes
+                              (epi-ledger--jcs-encode
+                               object epi-ledger--lock-token-byte-limit)))
+            (error "Noncanonical lock token"))
+          (epi-ledger--closed-object
+           object '("version" "host" "pid" "process_start" "nonce"
+                    "ledger_path" "expected_file" "expected_end"
+                    "expected_head")
+           nil 'lock-token)
+          (let* ((version (epi-ledger--object-value object "version"))
+                 (host (epi-ledger--object-value object "host"))
+                 (pid (epi-ledger--object-value object "pid"))
+                 (process-start
+                  (epi-ledger--object-value object "process_start"))
+                 (nonce (epi-ledger--object-value object "nonce"))
+                 (ledger-path
+                  (epi-ledger--object-value object "ledger_path"))
+                 (expected-file
+                  (epi-ledger--object-value object "expected_file"))
+                 (end-string
+                  (epi-ledger--object-value object "expected_end"))
+                 (expected-head
+                  (epi-ledger--object-value object "expected_head"))
+                 (expected-end
+                  (epi-ledger--parse-unsigned-decimal
+                   end-string 'expected-end)))
+            (unless (and (eq version 1)
+                         (stringp host) (not (string-empty-p host))
+                         (epi-ledger--canonical-lock-ledger-path-p ledger-path)
+                         (epi-ledger--uuid-p nonce))
+              (error "Invalid lock scalar"))
+            (epi-ledger--parse-unsigned-decimal pid 'pid)
+            (unless (epi-ledger--lock-time-vector-p process-start)
+              (error "Invalid process start"))
+            (epi-ledger--normalize-time-vector process-start)
+            (cond
+             ((stringp expected-file)
+              (unless (and (equal expected-file "absent")
+                           (= expected-end 0)
+                           (eq expected-head epi-json-null))
+                (error "Incoherent absent token")))
+             ((listp expected-file)
+              (unless (epi-ledger--hash-p expected-head)
+                (error "Invalid present head"))
+              (let ((ordered
+                     (epi-ledger--decode-lock-file-object
+                      expected-file ledger-path expected-end)))
+                (setcdr (assoc-string "expected_file" object nil) ordered)))
+             (t (error "Invalid expected file")))
+            (epi-ledger--copy-tree-and-strings object))))
+    (error (epi-ledger--lock-decode-fail))))
+
+(defun epi-ledger--lock-path (ledger-path)
+  "Return the canonical dedicated lock sibling for LEDGER-PATH."
+  (epi-ledger--resolve-local-write-path
+   (concat (epi-ledger--resolve-local-write-path ledger-path) ".epi-lock")))
+
+(defun epi-ledger--lock-archive-path (ledger-path token-sha256)
+  "Return the canonical stale-token archive for LEDGER-PATH and TOKEN-SHA256."
+  (epi-ledger--require-hash token-sha256 'expected-token-sha256)
+  (let* ((canonical (epi-ledger--resolve-local-write-path ledger-path))
+         (candidate
+          (concat (file-name-directory canonical)
+                  "." (file-name-nondirectory canonical)
+                  ".epi-stale-lock-" token-sha256 ".jcs")))
+    (epi-ledger--resolve-local-write-path candidate)))
+
+(defun epi-ledger--bounded-lock-read (path identity mismatch-code)
+  "Read the exact bounded token at PATH under IDENTITY.
+Signal MISMATCH-CODE when the read container, length, or identity changes."
+  (setq path (substring-no-properties path)
+        identity (epi-ledger--copy-tree-and-strings identity))
+  (unless identity
+    (epi-ledger--fail 'epi-ledger-conflict mismatch-code))
+  (let ((size (plist-get identity :size)))
+    (unless (and (integerp size) (>= size 0))
+      (epi-ledger--fail 'epi-ledger-conflict mismatch-code))
+    (when (> size epi-ledger--lock-token-byte-limit)
+      (epi-ledger--limit-fail
+       'lock-token-byte-limit
+       :limit epi-ledger--lock-token-byte-limit :bytes size))
+    (let ((bytes
+           (funcall epi-ledger--read-function
+                    (substring-no-properties path) 0 size)))
+      (unless (and (stringp bytes)
+                   (not (multibyte-string-p bytes))
+                   (= (length bytes) size)
+                   (not (epi-ledger--string-has-properties-p bytes))
+                   (equal identity (epi-ledger--owned-stat path)))
+        (epi-ledger--fail 'epi-ledger-conflict mismatch-code))
+      (substring-no-properties bytes))))
+
+(defun epi-ledger--local-parent-directory (ledger-path)
+  "Return canonical LEDGER-PATH's proven-local parent directory."
+  (file-name-as-directory
+   (directory-file-name (file-name-directory ledger-path))))
+
+(defun epi-ledger--process-start-from-attributes (attributes)
+  "Return the normalized start in proper process ATTRIBUTES, or nil."
+  (when (and (listp attributes) (proper-list-p attributes))
+    (let ((start
+           (condition-case nil
+               (cdr (assq 'start attributes))
+             (error nil))))
+      (when (and (listp start)
+                 (proper-list-p start)
+                 (= 4 (length start))
+                 (seq-every-p #'epi-ledger--safe-integer-p start))
+        (condition-case nil
+            (epi-ledger--normalize-time-vector start)
+          (error nil))))))
+
+(defun epi-ledger--current-process-start (ledger-path)
+  "Return the current process start vector while rooted beside LEDGER-PATH."
+  (let* ((default-directory
+          (epi-ledger--local-parent-directory ledger-path))
+         (attributes
+          (condition-case nil
+              (process-attributes (emacs-pid))
+            (error :indeterminate)))
+         (start (epi-ledger--process-start-from-attributes attributes)))
+    (unless start
+      (epi-ledger--fail 'epi-ledger-conflict 'lock-owner-indeterminate))
+    start))
+
+(defun epi-ledger--lock-owner-state (token)
+  "Classify decoded lock TOKEN as `live', `dead', or `indeterminate'."
+  (let* ((host (epi-ledger--copy-tree-and-strings
+                (epi-ledger--object-value token "host")))
+         (ledger-path
+          (epi-ledger--copy-tree-and-strings
+           (epi-ledger--object-value token "ledger_path")))
+         (pid-value
+          (epi-ledger--copy-tree-and-strings
+           (epi-ledger--object-value token "pid")))
+         (stored-start
+          (epi-ledger--copy-tree-and-strings
+           (epi-ledger--object-value token "process_start"))))
+    (if (not (and (stringp host) (equal host (system-name))))
+        'indeterminate
+      (let* ((pid
+              (condition-case nil
+                  (epi-ledger--parse-unsigned-decimal pid-value 'pid)
+                (error nil)))
+             (default-directory
+              (and (stringp ledger-path)
+                   (epi-ledger--local-parent-directory ledger-path)))
+         (attributes
+              (and pid default-directory
+                   (condition-case nil
+                       (process-attributes pid)
+                     (error :indeterminate)))))
+        (cond
+         ((or (null pid) (null default-directory)
+              (eq attributes :indeterminate))
+          'indeterminate)
+         (attributes
+          (let ((observed
+                 (epi-ledger--process-start-from-attributes attributes)))
+            (if (not observed)
+                'indeterminate
+              (if (equal observed stored-start) 'live 'dead))))
+         ((not (fboundp 'list-system-processes)) 'indeterminate)
+         (t
+          (let ((processes
+                 (condition-case nil
+                     (list-system-processes)
+                   (error :indeterminate))))
+            (if (not (listp processes))
+                'indeterminate
+              (if (not (and (proper-list-p processes)
+                            (consp processes)
+                            (seq-every-p
+                             (lambda (process)
+                               (and (integerp process) (> process 0)))
+                             processes)
+                            (memq (emacs-pid) processes)))
+                  'indeterminate
+                (if (memq pid processes) 'indeterminate 'dead))))))))))
+
+(defun epi-ledger--delete-exact-lock-name (path failure-code)
+  "Delete lock PATH, mapping any failure to structured FAILURE-CODE."
+  (condition-case nil
+      (let ((file-name-handler-alist nil))
+        (delete-file (substring-no-properties path)))
+    (file-error
+     (epi-ledger--fail 'epi-ledger-conflict failure-code))))
+
+(defun epi-ledger--delete-published-source-name (path)
+  "Delete published source PATH or report uncertain postpublication cleanup."
+  (condition-case nil
+      (let ((file-name-handler-alist nil))
+        (delete-file (substring-no-properties path)))
+    (file-error
+     (epi-ledger--fail
+      'epi-ledger-conflict 'storage-publication-failed :published t))))
+
+(defun epi-ledger--exact-published-lock-object
+    (path expected-object expected-bytes expected-sha256)
+  "Return PATH's identity when it is EXPECTED-OBJECT with exact token bytes.
+EXPECTED-BYTES and EXPECTED-SHA256 bind the complete token content.  Return
+nil rather than leaking a read or stat failure after publication."
+  (condition-case nil
+      (let ((identity (epi-ledger--owned-stat path)))
+        (when (epi-ledger--same-file-object-p expected-object identity)
+          (let ((bytes
+                 (epi-ledger--bounded-lock-read
+                  path identity 'lock-token-changed)))
+            (and (equal bytes expected-bytes)
+                 (equal (secure-hash 'sha256 bytes) expected-sha256)
+                 identity))))
+    (error nil)))
+
+(defun epi-ledger--create-and-bind-lock
+    (lock-path candidate expected-file expected-end expected-head)
+  "Create CANDIDATE at LOCK-PATH and return its verified lock proof.
+EXPECTED-FILE, EXPECTED-END, and EXPECTED-HEAD are copied into that proof."
+  (let* ((owned-path (substring-no-properties lock-path))
+         (owned-candidate (substring-no-properties candidate))
+         (created
+          (epi-ledger--copy-tree-and-strings
+           (funcall epi-ledger--lock-create-function
+                    (substring-no-properties owned-path)
+                    (substring-no-properties owned-candidate))))
+         (observed (epi-ledger--owned-stat owned-path)))
+    (unless (and created observed (equal created observed))
+      (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+    (let ((readback
+           (epi-ledger--bounded-lock-read
+            owned-path observed 'lock-token-changed))
+          (sha256 (secure-hash 'sha256 owned-candidate)))
+      (unless (and (equal owned-candidate readback)
+                   (equal sha256 (secure-hash 'sha256 readback)))
+        (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+      (epi-ledger--make-lock
+       :lock-file (substring-no-properties owned-path)
+       :bytes (substring-no-properties owned-candidate)
+       :sha256 (substring-no-properties sha256)
+       :file-identity (epi-ledger--copy-tree-and-strings observed)
+       :expected-file
+       (epi-ledger--copy-tree-and-strings expected-file)
+       :expected-end expected-end
+       :expected-head
+       (and expected-head (substring-no-properties expected-head))))))
+
+(defun epi-ledger--acquire-lock
+    (path expected-file expected-end expected-head)
+  "Acquire PATH's exact dedicated token.
+Bind it to EXPECTED-FILE, EXPECTED-END, and EXPECTED-HEAD."
+  (let* ((owned-input-path (substring-no-properties path))
+         (owned-file (epi-ledger--copy-tree-and-strings expected-file))
+         (owned-end expected-end)
+         (owned-head
+          (and expected-head (substring-no-properties expected-head)))
+         (ledger-path
+          (epi-ledger--resolve-local-write-path owned-input-path))
+         (lock-path (epi-ledger--lock-path ledger-path))
+         (process-start (epi-ledger--current-process-start ledger-path))
+         (host (substring-no-properties (system-name)))
+         (nonce (substring-no-properties (epi--new-id)))
+         (candidate
+          (epi-ledger--encode-lock-token
+           host (emacs-pid) process-start nonce ledger-path
+           owned-file owned-end owned-head))
+         (existing (epi-ledger--owned-stat lock-path)))
+    (when existing
+      (let* ((bytes
+              (epi-ledger--bounded-lock-read
+               lock-path existing 'lock-token-changed))
+             (token
+              (epi-ledger--decode-lock-token
+               (substring-no-properties bytes))))
+        (unless (equal ledger-path
+                       (epi-ledger--object-value token "ledger_path"))
+          (epi-ledger--lock-decode-fail))
+        (let ((state (epi-ledger--lock-owner-state token)))
+        (pcase state
+          ('live (epi-ledger--fail 'epi-ledger-conflict 'lock-held))
+          ('indeterminate
+           (epi-ledger--fail
+            'epi-ledger-conflict 'lock-owner-indeterminate))
+          ('dead
+           (let ((rechecked (epi-ledger--owned-stat lock-path)))
+             (unless (equal existing rechecked)
+               (epi-ledger--fail
+                'epi-ledger-conflict 'lock-token-changed))
+             (let ((reread
+                    (epi-ledger--bounded-lock-read
+                     lock-path rechecked 'lock-token-changed)))
+               (unless (equal bytes reread)
+                 (epi-ledger--fail
+                  'epi-ledger-conflict 'lock-token-changed)))
+             (epi-ledger--delete-exact-lock-name
+              lock-path 'lock-token-changed)))))))
+    (epi-ledger--create-and-bind-lock
+     lock-path candidate owned-file owned-end owned-head)))
+
+(defun epi-ledger--release-lock (lock)
+  "Release LOCK only if its pathname still names the exact owned token."
+  (unless (epi-ledger--lock-p lock)
+    (epi-ledger--format-fail 'invalid-lock))
+  (let* ((path (epi-ledger--lock-lock-file lock))
+         (identity (epi-ledger--owned-stat path)))
+    (unless (equal identity (epi-ledger--lock-file-identity lock))
+      (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+    (let ((bytes
+           (epi-ledger--bounded-lock-read
+            path identity 'lock-token-changed)))
+      (unless (and (equal bytes (epi-ledger--lock-bytes lock))
+                   (equal (secure-hash 'sha256 bytes)
+                          (epi-ledger--lock-sha256 lock)))
+        (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+      (epi-ledger--delete-exact-lock-name path 'lock-token-changed)
+      nil)))
+
+(defun epi-ledger--lock-file-object-to-identity (object)
+  "Convert validated lock file OBJECT to an owned identity plist."
+  (list
+   :path (substring-no-properties
+          (epi-ledger--object-value object "path"))
+   :device (epi-ledger--parse-unsigned-decimal
+            (epi-ledger--object-value object "device") 'device)
+   :inode (epi-ledger--parse-unsigned-decimal
+           (epi-ledger--object-value object "inode") 'inode)
+   :links (epi-ledger--parse-unsigned-decimal
+           (epi-ledger--object-value object "links") 'links)
+   :size (epi-ledger--parse-unsigned-decimal
+          (epi-ledger--object-value object "size") 'size)
+   :modified (append
+              (epi-ledger--object-value object "modified") nil)
+   :changed (append
+             (epi-ledger--object-value object "changed") nil)))
+
+(defun epi-ledger--insert-read-range (path _visit begin end)
+  "Insert exact bytes BEGIN through END from PATH using the Task 5 read seam."
+  (let ((bytes
+         (funcall epi-ledger--read-function
+                  (substring-no-properties path) begin end)))
+    (unless (and (stringp bytes)
+                 (not (multibyte-string-p bytes))
+                 (= (length bytes) (- end begin))
+                 (not (epi-ledger--string-has-properties-p bytes)))
+      (epi-ledger--fail 'epi-ledger-conflict 'file-chain-head-changed))
+    (insert bytes)
+    (list path (length bytes))))
+
+;; These private loader seams are initialized later in the file.  Declare
+;; them here so byte compilation treats the verification bindings as dynamic.
+(defvar epi-ledger--open-identity-reader)
+(defvar epi-ledger--open-source-inserter)
+(defvar epi-ledger--open-head-inserter)
+
+(defun epi-ledger--file-authority-equal-p (left right)
+  "Return non-nil when LEFT and RIGHT have equal non-size authority fields."
+  (and (listp left) (listp right)
+       (cl-every
+        (lambda (key) (equal (plist-get left key) (plist-get right key)))
+        '(:path :device :inode :links :modified :changed))))
+
+(defun epi-ledger--verify-present-identity
+    (identity expected-identity expected-end)
+  "Verify IDENTITY against EXPECTED-IDENTITY and EXPECTED-END."
+  (unless (epi-ledger--file-authority-equal-p identity expected-identity)
+    (epi-ledger--fail 'epi-ledger-conflict 'file-identity-changed))
+  (unless (and (integerp expected-end)
+               (= (or (plist-get expected-identity :size) -1) expected-end)
+               (= (or (plist-get identity :size) -1) expected-end))
+    (epi-ledger--fail 'epi-ledger-conflict 'file-end-changed)))
+
+(defun epi-ledger--verify-state-stat (path)
+  "Return PATH's owned identity or report a closed identity conflict."
+  (condition-case condition
+      (epi-ledger--owned-stat path)
+    (error
+     (ignore condition)
+     (epi-ledger--fail 'epi-ledger-conflict 'file-identity-changed))))
+
+(defun epi-ledger--verify-file-state-core-impl
+    (path expected-identity expected-end expected-head last-record)
+  "Verify already-owned PATH against the expected file and chain state.
+EXPECTED-IDENTITY, EXPECTED-END, and EXPECTED-HEAD are trusted checkpoint
+authorities.  LAST-RECORD, when non-nil, is their retained chain-head record."
+  (let ((identity (epi-ledger--verify-state-stat path)))
+    (if (equal expected-identity "absent")
+        (unless (and (null identity) (= expected-end 0)
+                     (null expected-head))
+          (epi-ledger--fail 'epi-ledger-conflict 'file-identity-changed))
+      (epi-ledger--verify-present-identity
+       identity expected-identity expected-end)
+      (if last-record
+          (let ((epi-ledger--open-identity-reader
+                 epi-ledger--stat-function)
+                (epi-ledger--open-head-inserter
+                 #'epi-ledger--insert-read-range))
+            (unless (equal expected-head
+                           (epi-record--raw-hash last-record))
+              (epi-ledger--fail
+               'epi-ledger-conflict 'file-chain-head-changed))
+            (condition-case condition
+                (epi-ledger--open-verify-current-head
+                 path last-record identity
+                 (epi-ledger--make-work-state)
+                 (epi-record--raw-sequence last-record))
+              (epi-ledger-conflict
+               (let* ((detail (epi-ledger--condition-plist condition))
+                      (code (and detail (plist-get detail :code))))
+                 (if (memq code
+                           '(file-identity-changed file-chain-head-changed))
+                     (signal (car condition) (cdr condition))
+                   (epi-ledger--fail
+                    'epi-ledger-conflict 'file-chain-head-changed))))
+              (error
+               (epi-ledger--fail
+                'epi-ledger-conflict 'file-chain-head-changed))))
+        (let ((opened
+               (condition-case nil
+                   (let ((epi-ledger--open-identity-reader
+                          epi-ledger--stat-function)
+                         (epi-ledger--open-source-inserter
+                          #'epi-ledger--insert-read-range)
+                         (epi-ledger--open-head-inserter
+                          #'epi-ledger--insert-read-range))
+                     (epi-ledger-open path))
+                 (error
+                  (epi-ledger--fail
+                   'epi-ledger-conflict 'file-chain-head-changed)))))
+          (let ((checkpoint (epi-ledger--checkpoint-snapshot opened)))
+            (unless (= (epi-ledger--checkpoint-raw-validated-end-offset
+                        checkpoint)
+                       expected-end)
+              (epi-ledger--fail 'epi-ledger-conflict 'file-end-changed))
+            (unless (equal (epi-ledger--checkpoint-raw-tail-hash checkpoint)
+                           expected-head)
+              (epi-ledger--fail
+               'epi-ledger-conflict 'file-chain-head-changed)))))
+      (epi-ledger--verify-present-identity
+       (epi-ledger--verify-state-stat path)
+       expected-identity expected-end))
+    nil))
+
+(defun epi-ledger--verify-file-state-core
+    (path expected-identity expected-end expected-head last-record)
+  "Verify PATH against EXPECTED-IDENTITY, EXPECTED-END, and EXPECTED-HEAD.
+LAST-RECORD supplies the retained chain head.  This named wrapper remains an
+injectable verification boundary."
+  (epi-ledger--verify-file-state-core-impl
+   path expected-identity expected-end expected-head last-record))
+
+(defun epi-ledger--verify-file-state-raw
+    (path expected-identity expected-end expected-head last-record)
+  "Verify PATH against EXPECTED-IDENTITY, EXPECTED-END, and EXPECTED-HEAD.
+LAST-RECORD supplies the retained chain head.  Do not invoke cooperative or
+storage seam callbacks."
+  (let ((epi-ledger--stat-function #'epi-ledger--stat-local-file)
+        (epi-ledger--read-function #'epi-ledger--read-bytes)
+        (epi--yield-function #'ignore)
+        (epi--deadline-clock-function #'float-time)
+        (epi-ledger--nonpreemptible-observer nil))
+    (epi-ledger--verify-file-state-core-impl
+     path expected-identity expected-end expected-head last-record)))
+
+(defun epi-ledger--verify-file-state
+    (path expected-identity expected-end expected-head last-record)
+  "Verify PATH against EXPECTED-IDENTITY, EXPECTED-END, and EXPECTED-HEAD.
+LAST-RECORD enables the loader's bounded final-record head verifier when the
+caller already holds that validated private record."
+  (epi-ledger--verify-file-state-core
+   (substring-no-properties path)
+   (epi-ledger--copy-tree-and-strings expected-identity)
+   expected-end
+   (and expected-head (substring-no-properties expected-head))
+   last-record))
+
+(defun epi-ledger--archive-stale-lock
+    (lock-path archive original-identity token-bytes)
+  "Archive exact TOKEN-BYTES from LOCK-PATH at ARCHIVE without overwrite.
+ORIGINAL-IDENTITY binds the source file object across publication."
+  (setq lock-path (substring-no-properties lock-path)
+        archive (substring-no-properties archive)
+        original-identity
+        (epi-ledger--copy-tree-and-strings original-identity)
+        token-bytes (substring-no-properties token-bytes))
+  (let ((archive-identity (epi-ledger--owned-stat archive))
+        (token-sha256 (secure-hash 'sha256 token-bytes)))
+    (if archive-identity
+        (let ((archived
+               (epi-ledger--bounded-lock-read
+                archive archive-identity 'destination-exists)))
+          (unless (equal archived token-bytes)
+            (epi-ledger--fail 'epi-ledger-conflict 'destination-exists))
+          (let ((rechecked (epi-ledger--owned-stat lock-path)))
+            (unless (equal original-identity rechecked)
+              (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+            (let ((reread
+                   (epi-ledger--bounded-lock-read
+                    lock-path rechecked 'lock-token-changed)))
+              (unless (equal token-bytes reread)
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'lock-token-changed))))
+          (epi-ledger--delete-published-source-name lock-path))
+      ;; Revalidate the exact source immediately before invoking the atomic
+      ;; hard-link primitive.  Its callback remains a mutation boundary, so
+      ;; both names are independently checked again afterward.
+      (let ((prelink-identity (epi-ledger--owned-stat lock-path)))
+        (unless (equal original-identity prelink-identity)
+          (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+        (let ((prelink-bytes
+               (epi-ledger--bounded-lock-read
+                lock-path prelink-identity 'lock-token-changed)))
+          (unless (and (equal token-bytes prelink-bytes)
+                       (equal token-sha256
+                              (secure-hash 'sha256 prelink-bytes)))
+            (epi-ledger--fail
+             'epi-ledger-conflict 'lock-token-changed))))
+      (condition-case condition
+          (let ((file-name-handler-alist nil))
+            (add-name-to-file
+             (substring-no-properties lock-path)
+             (substring-no-properties archive) nil))
+        (file-already-exists
+         (ignore condition)
+         (epi-ledger--fail 'epi-ledger-conflict 'destination-exists))
+        (file-error
+         (ignore condition)
+         (let ((source-after
+                (condition-case nil
+                    (epi-ledger--owned-stat lock-path)
+                  (error nil)))
+               (archive-after
+                (condition-case nil
+                    (epi-ledger--owned-stat archive)
+                  (error :unverifiable))))
+           (cond
+            ((and (consp archive-after)
+                  (or (null source-after)
+                      (epi-ledger--same-file-object-p
+                       source-after archive-after)))
+             (epi-ledger--fail
+              'epi-ledger-conflict 'storage-publication-failed :published t))
+            ((consp archive-after)
+             (epi-ledger--fail
+              'epi-ledger-conflict 'destination-exists))
+            ((eq archive-after :unverifiable)
+             (epi-ledger--fail
+              'epi-ledger-conflict 'storage-publication-failed :published t))
+            (t
+             (epi-ledger--fail
+              'epi-ledger-conflict 'storage-publication-failed))))))
+      (let* ((source-after
+              (epi-ledger--exact-published-lock-object
+               lock-path original-identity token-bytes token-sha256))
+             (archive-after
+              (epi-ledger--exact-published-lock-object
+               archive original-identity token-bytes token-sha256)))
+        (unless (and source-after archive-after
+                     (epi-ledger--same-file-object-p
+                      source-after archive-after))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'storage-publication-failed :published t))
+        (unless (epi-ledger--exact-published-lock-object
+                 lock-path source-after token-bytes token-sha256)
+          (epi-ledger--fail
+           'epi-ledger-conflict 'storage-publication-failed :published t)))
+      (epi-ledger--delete-published-source-name lock-path))
+    archive))
+
+(cl-defun epi-ledger-recover-stale-lock
+    (path &key expected-token-sha256)
+  "Recover PATH from the exact stale token authorized by EXPECTED-TOKEN-SHA256.
+Archive the authorized bytes, acquire a fresh state-equivalent lock, verify
+the complete expected ledger state, release the fresh lock, and return the
+canonical archive pathname."
+  (epi-ledger--require-hash
+   expected-token-sha256 'expected-token-sha256)
+  (let* ((owned-path
+          (copy-sequence (substring-no-properties path)))
+         (owned-token-sha256
+          (copy-sequence
+           (substring-no-properties expected-token-sha256)))
+         (ledger-path (epi-ledger--resolve-local-write-path owned-path))
+         (lock-path (epi-ledger--lock-path ledger-path))
+         (identity (epi-ledger--owned-stat lock-path))
+         (token-bytes
+          (epi-ledger--bounded-lock-read
+           lock-path identity 'lock-token-changed)))
+    (unless (equal owned-token-sha256
+                   (secure-hash 'sha256 token-bytes))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'stale-lock-sha-mismatch))
+    (let* ((token
+            (epi-ledger--decode-lock-token
+             (substring-no-properties token-bytes)))
+           (bound-path
+            (epi-ledger--object-value token "ledger_path")))
+      (unless (equal ledger-path bound-path)
+        (epi-ledger--lock-decode-fail))
+      (let* ((archive
+              (epi-ledger--lock-archive-path
+               ledger-path owned-token-sha256))
+             (decoded-file
+              (epi-ledger--object-value token "expected_file"))
+             (expected-file
+              (if (equal decoded-file "absent")
+                  "absent"
+                (epi-ledger--lock-file-object-to-identity decoded-file)))
+             (expected-end
+              (epi-ledger--parse-unsigned-decimal
+               (epi-ledger--object-value token "expected_end")
+               'expected-end))
+             (decoded-head
+              (epi-ledger--object-value token "expected_head"))
+             (expected-head
+              (unless (eq decoded-head epi-json-null)
+                (substring-no-properties decoded-head))))
+        (epi-ledger--archive-stale-lock
+         lock-path archive identity token-bytes)
+        (let ((fresh
+               (epi-ledger--acquire-lock
+                ledger-path expected-file expected-end expected-head)))
+          (unwind-protect
+              (progn
+                (epi-ledger--verify-file-state
+                 ledger-path expected-file expected-end expected-head nil)
+                archive)
+            (funcall epi-ledger--unlock-function fresh)))))))
+
+(defun epi-ledger--snapshot-object-input (bytes media-type role)
+  "Return an exact private plist snapshot of object input values.
+Snapshot caller BYTES, MEDIA-TYPE, and ROLE without yielding or invoking an
+Epi callback.  BYTES must be unibyte and within `epi-object-byte-limit'."
+  (unless (and (stringp bytes) (not (multibyte-string-p bytes)))
+    (epi-ledger--format-fail 'unibyte-object-required))
+  (when (> (length bytes) epi-object-byte-limit)
+    (epi-ledger--limit-fail
+     'object-byte-limit :limit epi-object-byte-limit :bytes (length bytes)))
+  (unless (and (stringp media-type) (not (string-empty-p media-type))
+               (stringp role) (not (string-empty-p role)))
+    (epi-ledger--format-fail 'invalid-object-metadata))
+  ;; This validator is callback-free; unlike the cooperative public string
+  ;; validator it cannot yield before all three values have been copied.
+  (epi-ledger--canonical-string-byte-length-no-callback media-type)
+  (epi-ledger--canonical-string-byte-length-no-callback role)
+  (let ((gc-cons-threshold most-positive-fixnum))
+    (list :bytes (substring-no-properties bytes)
+          :media-type (substring-no-properties media-type)
+          :role (substring-no-properties role))))
+
+(defun epi-ledger--snapshot-object-reference (object-ref)
+  "Return an exact callback-free private snapshot of OBJECT-REF."
+  (unless (epi-object-ref-p object-ref)
+    (signal 'wrong-type-argument (list 'epi-object-ref-p object-ref)))
+  (let ((hash (epi-object-ref--raw-hash object-ref))
+        (size (epi-object-ref--raw-size object-ref))
+        (media-type (epi-object-ref--raw-media-type object-ref))
+        (role (epi-object-ref--raw-role object-ref)))
+    (epi-ledger--require-hash hash "object.hash")
+    (epi-ledger--require-nonnegative-integer size "object.size")
+    (when (> size epi-object-byte-limit)
+      (epi-ledger--limit-fail
+       'object-byte-limit :field "object.size"
+       :limit epi-object-byte-limit :bytes size))
+    (unless (and (stringp media-type) (not (string-empty-p media-type))
+                 (stringp role) (not (string-empty-p role)))
+      (epi-ledger--format-fail 'invalid-object-metadata))
+    (epi-ledger--canonical-string-byte-length-no-callback media-type)
+    (epi-ledger--canonical-string-byte-length-no-callback role)
+    (let ((gc-cons-threshold most-positive-fixnum))
+      (list :hash (substring-no-properties hash)
+            :size size
+            :media-type (substring-no-properties media-type)
+            :role (substring-no-properties role)))))
+
+(defun epi-ledger--object-path (ledger hash)
+  "Return LEDGER's canonical immutable-object path for HASH."
+  (unless (epi-ledger-p ledger)
+    (signal 'wrong-type-argument (list 'epi-ledger-p ledger)))
+  (epi-ledger--require-hash hash "object.hash")
+  (let* ((objects (concat (epi-ledger--raw-path ledger) ".objects"))
+         (sha-directory
+          (expand-file-name "sha256" (file-name-as-directory objects)))
+         (prefix-directory
+          (expand-file-name
+           (substring hash 0 2) (file-name-as-directory sha-directory))))
+    (expand-file-name hash (file-name-as-directory prefix-directory))))
+
+(defun epi-ledger--object-read-fail (family code)
+  "Signal FAMILY's stable object-read failure for CODE."
+  (pcase family
+    ('missing
+     (epi-ledger--fail 'epi-missing-object code))
+    ('corrupt
+     (epi-ledger--fail 'epi-ledger-corrupt 'object-content-mismatch))
+    ('write
+     (epi-ledger--fail 'epi-ledger-conflict 'storage-write-failed))
+    ('proof
+     (epi-ledger--fail 'epi-ledger-conflict code))
+    (_ (error "Unknown Epi object-read failure family: %S" family))))
+
+(defun epi-ledger--object-stat-fail (family)
+  "Signal FAMILY's stable object-stat failure."
+  (if (eq family 'put)
+      (epi-ledger--fail 'epi-ledger-conflict 'storage-write-failed)
+    (epi-ledger--object-read-fail family 'object-read-failed)))
+
+(defun epi-ledger--object-stat (path family)
+  "Return PATH's identity, mapping every stat failure through FAMILY."
+  (condition-case condition
+      (epi-ledger--owned-stat path)
+    (epi-ledger-format-error
+     (if (eq family 'put)
+       (epi-ledger--fail
+          'epi-ledger-corrupt 'object-content-mismatch)
+       (epi-ledger--object-read-fail family 'object-read-failed)))
+    (file-error
+     (epi-ledger--object-stat-fail family))
+    (epi-error
+     (if (eq 'storage-stat-failed
+             (plist-get (epi-ledger--condition-plist condition) :code))
+         (epi-ledger--object-stat-fail family)
+       (signal (car condition) (cdr condition))))
+    (error
+     (epi-ledger--object-stat-fail family))))
+
+(defun epi-ledger--object-storage-call (code function &rest arguments)
+  "Call FUNCTION with ARGUMENTS, mapping raw file failures to CODE."
+  (condition-case condition
+      (apply function arguments)
+    (file-error
+     (ignore condition)
+     (epi-ledger--fail 'epi-ledger-conflict code))
+    (epi-ledger-format-error
+     (epi-ledger--fail 'epi-ledger-conflict code))
+    (epi-ledger-conflict
+     (if (eq 'storage-stat-failed
+             (plist-get (epi-ledger--condition-plist condition) :code))
+         (epi-ledger--fail 'epi-ledger-conflict code)
+       (signal (car condition) (cdr condition))))))
+
+(defun epi-ledger--object-read-bounded (path maximum family)
+  "Read at most MAXIMUM bytes from PATH for error FAMILY.
+Every storage request is bounded by `epi-ledger-work-byte-limit'."
+  (let ((work (epi-ledger--make-work-state))
+        (chunk-limit (max 1 epi-ledger-work-byte-limit))
+        (cursor 0)
+        (total 0)
+        chunks
+        done)
+    (while (and (< cursor maximum) (not done))
+      (let* ((end (min maximum (+ cursor chunk-limit)))
+             (requested (- end cursor)))
+        (epi-ledger--work-charge work requested)
+        (let ((chunk
+               (condition-case nil
+                   (funcall epi-ledger--read-function path cursor end)
+                 (error
+                  (epi-ledger--object-read-fail
+                   family 'object-read-failed)))))
+          (unless (and (stringp chunk)
+                       (not (multibyte-string-p chunk))
+                       (<= (length chunk) requested))
+            (epi-ledger--object-read-fail family 'object-read-failed))
+          ;; Own the seam result before any later yield or callback.
+          (let* ((owned (substring-no-properties chunk))
+                 (amount (length owned)))
+            (if (= amount 0)
+                (setq done t)
+              (push owned chunks)
+              (setq cursor (+ cursor amount)
+                    total (+ total amount))
+              (when (< amount requested)
+                (setq done t)))))))
+    (setq chunks (epi-ledger--work-nreverse-list chunks work))
+    (epi-ledger--work-concat-chunks
+     chunks total work 'object-read)))
+
+(defun epi-ledger--object-read-verified-state-impl
+    (path expected-size expected-hash family)
+  "Return verified PATH bytes and identity for EXPECTED-SIZE and EXPECTED-HASH.
+FAMILY selects the stable public error classification."
+  (epi-ledger--require-nonnegative-integer expected-size "object.size")
+  (when (> expected-size epi-object-byte-limit)
+    (epi-ledger--limit-fail
+     'object-byte-limit :field "object.size"
+     :limit epi-object-byte-limit :bytes expected-size))
+  (epi-ledger--require-hash expected-hash "object.hash")
+  (let ((identity (epi-ledger--object-stat path family)))
+    (unless identity
+      (epi-ledger--object-read-fail family 'object-missing))
+    (unless (and (integerp (plist-get identity :size))
+                 (= expected-size (plist-get identity :size)))
+      (epi-ledger--object-read-fail family 'object-size-mismatch))
+    (let ((bytes
+           (epi-ledger--object-read-bounded
+            path (1+ expected-size) family)))
+      (unless (= expected-size (length bytes))
+        (epi-ledger--object-read-fail family 'object-size-mismatch))
+      (unless (equal expected-hash
+                     (epi-ledger--hash bytes 'object-content))
+        (epi-ledger--object-read-fail family 'object-hash-mismatch))
+      (let ((rechecked (epi-ledger--object-stat path family)))
+        (unless (equal identity rechecked)
+          (epi-ledger--object-read-fail family 'object-read-failed))
+        (list :bytes bytes :identity rechecked)))))
+
+(defun epi-ledger--object-read-verified-state
+    (path expected-size expected-hash family)
+  "Return verified PATH state for EXPECTED-SIZE, EXPECTED-HASH, and FAMILY."
+  (epi-ledger--object-read-verified-state-impl
+   path expected-size expected-hash family))
+
+(defun epi-ledger--object-read-verified-raw
+    (path expected-size expected-hash)
+  "Verify PATH against EXPECTED-SIZE and EXPECTED-HASH without seams."
+  (let ((epi-ledger--stat-function #'epi-ledger--stat-local-file)
+        (epi-ledger--read-function #'epi-ledger--read-bytes)
+        (epi--yield-function #'ignore)
+        (epi--deadline-clock-function #'float-time)
+        (epi-ledger--nonpreemptible-observer nil))
+    (epi-ledger--object-read-verified-state-impl
+     path expected-size expected-hash 'proof)))
+
+(defun epi-ledger--object-read-verified
+    (path expected-size expected-hash family)
+  "Read PATH and verify EXPECTED-SIZE and EXPECTED-HASH for FAMILY."
+  (plist-get
+   (epi-ledger--object-read-verified-state
+    path expected-size expected-hash family)
+   :bytes))
+
+(defun epi-ledger--write-object-temporary (path bytes)
+  "Write owned BYTES to temporary PATH and return its created identity."
+  (unless (and (stringp bytes) (not (multibyte-string-p bytes)))
+    (epi-ledger--format-fail 'unibyte-object-required))
+  (let ((work (epi-ledger--make-work-state))
+        (cursor 0)
+        (first t)
+        (chunk-limit (max 1 epi-ledger-work-byte-limit))
+        identity
+        complete)
+    (unwind-protect
+        (progn
+          (if (= (length bytes) 0)
+              (progn
+                (epi-ledger--object-storage-call
+                 'storage-write-failed epi-ledger--byte-writer
+                 path "" 'exclusive-create nil)
+                (setq identity
+                      (epi-ledger--object-storage-call
+                       'storage-write-failed
+                       #'epi-ledger--stat-local-file path)))
+            (while (< cursor (length bytes))
+              (let* ((end (min (length bytes) (+ cursor chunk-limit)))
+                     (amount (- end cursor)))
+                (epi-ledger--work-charge work amount)
+                (epi-ledger--object-storage-call
+                 'storage-write-failed epi-ledger--byte-writer
+                 path (substring-no-properties bytes cursor end)
+                 (if first 'exclusive-create 'append) nil)
+                (when first
+                  (setq identity
+                        (epi-ledger--object-storage-call
+                         'storage-write-failed
+                         #'epi-ledger--stat-local-file path)))
+                (setq cursor end
+                      first nil))))
+          (unless identity
+            (epi-ledger--fail
+             'epi-ledger-conflict 'storage-write-failed))
+          (epi-ledger--object-storage-call
+           'storage-write-failed epi-ledger--byte-writer
+           path "" 'append t)
+          (setq complete t)
+          identity)
+      (unless complete
+        (epi-ledger--delete-owned-object-name path identity nil)))))
+
+(defun epi-ledger--raw-object-name-state (path)
+  "Return callback-free storage state for the exact local name PATH.
+The result is nil for absence, `:replacement' for a non-regular leaf,
+`:unknown' on an indeterminate probe, or a regular-file identity plist."
+  (condition-case nil
+      (let* ((file-name-handler-alist nil)
+             (owned (substring-no-properties path))
+             (attributes (file-attributes owned 'string)))
+        (cond
+         ((null attributes) nil)
+         ((file-attribute-type attributes) :replacement)
+         (t
+          (list :path owned
+                :device (file-attribute-device-number attributes)
+                :inode (file-attribute-inode-number attributes)
+                :links (file-attribute-link-number attributes)
+                :size (file-attribute-size attributes)
+                :modified (file-attribute-modification-time attributes)
+                :changed (file-attribute-status-change-time attributes)))))
+    (error :unknown)))
+
+(defun epi-ledger--delete-owned-object-name (path expected requiredp)
+  "Delete PATH only if it still denotes EXPECTED's exact file object.
+When REQUIREDP is non-nil, report a failed exact deletion as an ambiguous
+postpublication cleanup.  A replacement name is never deleted."
+  (when expected
+    (let ((identity
+           (condition-case condition
+               (epi-ledger--stat-local-file path)
+             (epi-ledger-format-error
+              (if (eq 'non-regular-storage-leaf
+                      (plist-get
+                       (epi-ledger--condition-plist condition) :code))
+                  (epi-ledger--raw-object-name-state path)
+                :unknown))
+             (error :unknown))))
+      (cond
+       ((null identity) nil)
+       ((eq identity :replacement) nil)
+       ((eq identity :unknown)
+        (when requiredp
+          (epi-ledger--fail
+           'epi-ledger-conflict 'storage-publication-failed
+           :published t)))
+       ((not (epi-ledger--same-file-object-p expected identity)) nil)
+       (t
+        (condition-case nil
+            (let ((file-name-handler-alist nil))
+              (delete-file (substring-no-properties path)))
+          (file-error
+           (when requiredp
+             (epi-ledger--fail
+              'epi-ledger-conflict 'storage-publication-failed
+              :published t)))))))))
+
+(defun epi-ledger--object-publication-failure
+    (destination source-identity)
+  "Classify a failed publication to DESTINATION from SOURCE-IDENTITY."
+  (let ((target
+         (condition-case condition
+             (epi-ledger--stat-local-file destination)
+           (epi-ledger-format-error
+            (if (eq 'non-regular-storage-leaf
+                    (plist-get
+                     (epi-ledger--condition-plist condition) :code))
+                (epi-ledger--raw-object-name-state destination)
+              :unknown))
+           (error :unknown))))
+    (cond
+     ((eq target :unknown)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'storage-publication-failed :published t))
+     ((eq target :replacement)
+      (epi-ledger--fail 'epi-ledger-conflict 'destination-exists))
+     ((epi-ledger--same-file-object-p source-identity target)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'storage-publication-failed :published t))
+     (target
+      (epi-ledger--fail 'epi-ledger-conflict 'destination-exists))
+     (t
+      (epi-ledger--fail
+       'epi-ledger-conflict 'storage-publication-failed)))))
+
+(defun epi-ledger--object-publication-format-failure (destination)
+  "Classify a path-format failure while publishing to DESTINATION."
+  (let ((occupied
+         (condition-case nil
+             (let ((file-name-handler-alist nil)
+                   (path (substring-no-properties destination)))
+               (or (file-exists-p path) (file-symlink-p path)))
+           (error nil))))
+    (if occupied
+        (epi-ledger--fail 'epi-ledger-conflict 'destination-exists)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'storage-publication-failed))))
+
+(defun epi-ledger--publish-object (temporary destination source-identity)
+  "Publish TEMPORARY at DESTINATION while bound to SOURCE-IDENTITY."
+  (let ((epi-ledger--publish-expected-source-identity source-identity))
+    (condition-case condition
+        (funcall epi-ledger--publish-function temporary destination)
+    (file-error
+     (ignore condition)
+     (epi-ledger--object-publication-failure
+      destination source-identity))
+    (epi-ledger-format-error
+     (epi-ledger--object-publication-format-failure destination))
+      (epi-ledger-conflict
+       (if (eq 'storage-stat-failed
+               (plist-get (epi-ledger--condition-plist condition) :code))
+           (epi-ledger--object-publication-failure
+            destination source-identity)
+         (signal (car condition) (cdr condition)))))))
+
+(defun epi-ledger--object-condition-code (condition)
+  "Return the stable code carried by structured Epi CONDITION."
+  (let ((detail (and (consp (cdr condition)) (cadr condition))))
+    (and (listp detail) (plist-get detail :code))))
+
+(defun epi-ledger--verify-object-for-put
+    (path expected-size expected-hash &optional published-identity)
+  "Verify PATH for put against EXPECTED-SIZE and EXPECTED-HASH.
+PUBLISHED-IDENTITY, when non-nil, permits rollback only after the raw proof
+establishes size or hash corruption of that exact owned publication."
+  (let (dynamic-failure raw-failure)
+    (condition-case condition
+        (epi-ledger--object-read-verified
+         path expected-size expected-hash 'corrupt)
+      (error (setq dynamic-failure condition)))
+    (condition-case condition
+        (epi-ledger--object-read-verified-raw
+         path expected-size expected-hash)
+      (error (setq raw-failure condition)))
+    (when raw-failure
+      (let ((code (epi-ledger--object-condition-code raw-failure)))
+        (when (and published-identity
+                   (memq code '(object-size-mismatch object-hash-mismatch)))
+          (epi-ledger--delete-owned-object-name
+           path published-identity nil))
+        (if (and published-identity (eq code 'object-missing))
+            (epi-ledger--fail
+             'epi-ledger-conflict 'storage-publication-failed)
+          (if dynamic-failure
+            (signal (car dynamic-failure) (cdr dynamic-failure))
+            (if (memq code '(object-size-mismatch object-hash-mismatch))
+                (epi-ledger--fail
+                 'epi-ledger-corrupt 'object-content-mismatch)
+              (if published-identity
+                  (epi-ledger--fail
+                   'epi-ledger-conflict 'storage-publication-failed
+                   :published t)
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'storage-read-failed)))))))
+    (when dynamic-failure
+      (signal (car dynamic-failure) (cdr dynamic-failure)))
+    t))
+
+(cl-defun epi-ledger-object-put (ledger bytes &key media-type role)
+  "Store BYTES for LEDGER with MEDIA-TYPE and ROLE and return its reference."
+  (unless (epi-ledger-p ledger)
+    (signal 'wrong-type-argument (list 'epi-ledger-p ledger)))
+  ;; Own all caller data before operation-state initialization samples a
+  ;; clock or any measured hash performs its first cooperative yield.
+  (let ((input (epi-ledger--snapshot-object-input bytes media-type role)))
+    (epi-ledger--with-operation-work-state
+      (let* ((owned-bytes (plist-get input :bytes))
+             (owned-media-type (plist-get input :media-type))
+             (owned-role (plist-get input :role))
+             (size (length owned-bytes))
+             (hash (epi-ledger--hash owned-bytes 'object-content))
+             (path (epi-ledger--object-path ledger hash))
+             (reference
+              (make-epi-object-ref
+               :hash hash :size size
+               :media-type owned-media-type :role owned-role)))
+        (if (epi-ledger--object-stat path 'put)
+            (progn
+              (epi-ledger--verify-object-for-put path size hash)
+              reference)
+          (epi-ledger--ensure-private-parent path)
+          ;; A winner may have appeared while the private directory chain was
+          ;; being created.  Verify it without creating another temporary.
+          (if (epi-ledger--object-stat path 'put)
+              (progn
+                (epi-ledger--verify-object-for-put path size hash)
+                reference)
+            (let ((temporary (epi-ledger--hidden-sibling path))
+                  temporary-identity)
+              (unwind-protect
+                  (progn
+                    (setq temporary-identity
+                          (epi-ledger--write-object-temporary
+                           temporary owned-bytes))
+        (let ((state
+               (epi-ledger--object-read-verified-state
+                temporary size hash 'write)))
+          (unless
+              (epi-ledger--same-file-object-p
+               temporary-identity
+               (plist-get state :identity))
+            (epi-ledger--fail
+             'epi-ledger-conflict 'storage-write-failed))
+          (setq temporary-identity (plist-get state :identity)))
+                    (let ((outcome
+                           (condition-case condition
+                               (progn
+                                 (epi-ledger--publish-object
+                                  temporary path temporary-identity)
+                                 'published)
+                             (epi-ledger-conflict
+                              (let* ((detail
+                                      (epi-ledger--condition-plist
+                                       condition))
+                                     (code
+                                      (and detail
+                                           (plist-get detail :code))))
+                                (if (eq code 'destination-exists)
+                                    'collision
+                                  (signal (car condition)
+                                          (cdr condition))))))))
+                      (epi-ledger--verify-object-for-put
+                       path size hash
+                       (and (eq outcome 'published)
+                            temporary-identity)))
+                    (epi-ledger--delete-owned-object-name
+                     temporary temporary-identity t)
+                    (setq temporary nil)
+                    reference)
+                (when temporary-identity
+                  (epi-ledger--delete-owned-object-name
+                   temporary temporary-identity nil))))))))))
+
+(defun epi-ledger-object-get (ledger object-ref)
+  "Return verified object bytes from LEDGER for OBJECT-REF."
+  (unless (epi-ledger-p ledger)
+    (signal 'wrong-type-argument (list 'epi-ledger-p ledger)))
+  (let ((reference (epi-ledger--snapshot-object-reference object-ref)))
+    (epi-ledger--with-operation-work-state
+      (epi-ledger--object-read-verified
+       (epi-ledger--object-path ledger (plist-get reference :hash))
+       (plist-get reference :size)
+       (plist-get reference :hash)
+       'missing))))
+
+(defun epi-ledger--object-present-p (ledger object-ref)
+  "Return non-nil if LEDGER has the exact OBJECT-REF bytes."
+  (unless (epi-ledger-p ledger)
+    (signal 'wrong-type-argument (list 'epi-ledger-p ledger)))
+  (let ((reference (epi-ledger--snapshot-object-reference object-ref)))
+    (epi-ledger--with-operation-work-state
+      (let ((path
+             (epi-ledger--object-path ledger
+                                      (plist-get reference :hash))))
+        (when (epi-ledger--object-stat path 'corrupt)
+          (epi-ledger--object-read-verified
+           path (plist-get reference :size)
+           (plist-get reference :hash) 'corrupt)
+          (condition-case nil
+              (epi-ledger--object-read-verified-raw
+               path (plist-get reference :size)
+               (plist-get reference :hash))
+            (error
+             (epi-ledger--object-read-fail
+              'corrupt 'object-read-failed)))
+          t)))))
+
 (defconst epi-ledger--frame-terminator "\n#+end_epi-json\n"
   "Literal byte sequence terminating one canonical ledger record frame.")
 
@@ -6271,11 +8626,8 @@ open-turn intent mismatch can retain its more precise diagnostic."
                      :target (epi-record--raw-id proposal)
                      :turn turn-id :operation operation-id
                      :name (epi-ledger--payload-value record "name")
-                     :arguments
-                     (epi-ledger--payload-value record "arguments")
                      :order order :state 'planned :plan record
-                     :terminal nil :status nil :model-result nil
-                     :result nil)))
+                     :terminal nil :status nil :result nil)))
           (puthash call-id call calls)
           (puthash (epi-record--raw-id proposal) call
                    (epi-ledger--validation-state-calls-by-target state))
@@ -6340,10 +8692,7 @@ open-turn intent mismatch can retain its more precise diagnostic."
          (let ((status (epi-ledger--payload-value record "status")))
            (setf (plist-get call :state) 'finished
                  (plist-get call :terminal) record
-                 (plist-get call :status) status
-                 (plist-get call :model-result)
-                 (and (not (equal status "uncertain"))
-                      (epi-ledger--payload-value record "model_result")))
+                 (plist-get call :status) status)
            (if (equal status "uncertain")
                (let* ((turn
                        (gethash (plist-get call :turn)
@@ -6400,8 +8749,6 @@ open-turn intent mismatch can retain its more precise diagnostic."
            (setf (plist-get call :state) 'denied
                  (plist-get call :terminal) record
                  (plist-get call :status) "denied"
-                 (plist-get call :model-result)
-                 (epi-ledger--payload-value record "model_result")
                  (epi-ledger--validation-state-pending-result state) call)))))))
 
 (defun epi-ledger--validate-tool-result (state record)
@@ -6432,7 +8779,8 @@ open-turn intent mismatch can retain its more precise diagnostic."
                      (plist-get call :name))
         (epi-ledger--semantic-fail 'result-name-mismatch))
       (unless (equal (epi-ledger--object-value item "result")
-                     (plist-get call :model-result))
+                     (epi-ledger--payload-value
+                      (plist-get call :terminal) "model_result"))
         (epi-ledger--semantic-fail 'result-model-result-mismatch))
       (let* ((terminal-status (plist-get call :status))
              (actual (epi-ledger--object-value item "status"))
@@ -7033,11 +9381,12 @@ repair, recovery, Org evaluation, rendering, or write occurs on this path."
       state canonical-path sequence validated-end)
      (let* ((last-record
              (car (epi-ledger--validation-state-records-reverse state)))
+            (ordered-records
+             (epi-ledger--validation-suffix-records state work))
             (records
              (epi-ledger--work-list-to-record-index
-              (epi-ledger--work-nreverse-list
-               (epi-ledger--validation-state-records-reverse state) work)
-              work)))
+              ordered-records work))
+            (capsule (epi-ledger--semantic-capsule-from-state state)))
        (epi-ledger--open-verify-current-head
         canonical-path last-record initial-identity work sequence)
        ;; This is the final cooperative boundary.  Only raw constructors and
@@ -7059,17 +9408,617 @@ repair, recovery, Org evaluation, rendering, or write occurs on this path."
 		:validated-end-offset validated-end
 		:tail-hash tail
 		:records records
-		:by-id (epi-ledger--validation-state-by-id state)
+		:by-id (epi-ledger--semantic-capsule-raw-by-id capsule)
 		:turn-operation-index
-		(epi-ledger--validation-state-turn-operation-index state)
-		:tool-facts (epi-ledger--validation-state-calls state)
-		:uncertain (epi-ledger--validation-state-uncertain state))))
+		(epi-ledger--semantic-capsule-raw-turn-operation-index capsule)
+		:tool-facts (epi-ledger--semantic-capsule-raw-calls capsule)
+		:semantic-capsule capsule
+		:uncertain (epi-ledger--semantic-capsule-raw-uncertain capsule))))
          (epi-ledger--make-ledger
           :path canonical-path :header header
           :session-id (epi-header--raw-session-id header)
           :project-root (epi-header--raw-project-root header)
-          :checkpoint-cell (epi-ledger--make-checkpoint-cell
+         :checkpoint-cell (epi-ledger--make-checkpoint-cell
                             :value checkpoint)))))))
+
+(defun epi-ledger--create-validate-draft-shape (drafts session-id)
+  "Require owned DRAFTS to lead with session-info for SESSION-ID."
+  (when (= 0 (length drafts))
+    (epi-ledger--format-fail 'empty-draft-batch))
+  (unless (eq (epi-draft-type (aref drafts 0)) 'session-info)
+    (epi-ledger--format-fail 'missing-session-info))
+  (dotimes (index (1- (length drafts)))
+    (when (eq (epi-draft-type (aref drafts (1+ index))) 'session-info)
+      (epi-ledger--format-fail 'duplicate-session-info)))
+  (let* ((payload (epi-draft-payload (aref drafts 0)))
+         (entry (and (listp payload)
+                     (assoc-string "session_id" payload nil))))
+    (when (and entry (not (equal session-id (cdr entry))))
+      (epi-ledger--format-fail 'session-id-mismatch))))
+
+(defun epi-ledger--create-document-bytes (header drafts session-id)
+  "Render and prevalidate HEADER plus owned DRAFTS for SESSION-ID."
+  (let* ((work (epi-ledger--make-work-state))
+         (header-bytes (epi-ledger-render-header header))
+         (total (length header-bytes))
+         (tail (epi-header--raw-hash header))
+         (sequence 1)
+         (state (epi-ledger--make-empty-validation-state))
+         (chunks (list header-bytes)))
+    (dotimes (index (length drafts))
+      (let* ((record
+              (epi-ledger-seal-record (aref drafts index) tail sequence))
+             (frame (epi-ledger-render-record record)))
+        (when (and (= index 0)
+                   (not (equal
+                         session-id
+                         (epi-ledger--object-value
+                          (epi-record--raw-payload record) "session_id"))))
+          (epi-ledger--format-fail 'session-id-mismatch))
+        (epi-ledger--validate-record-semantic state header record)
+        (setq total (+ total (length frame)))
+        (when (> total epi-ledger--batch-byte-limit)
+          (epi-ledger--limit-fail
+           'batch-byte-limit :limit epi-ledger--batch-byte-limit
+           :bytes total))
+        (push frame chunks)
+        (setq tail (epi-record--raw-hash record)
+              sequence (1+ sequence))))
+    (let ((failure (epi-ledger--validation-final-error state)))
+      (when failure
+        (epi-ledger--semantic-fail (car failure))))
+    (epi-ledger--work-concat-chunks
+     (nreverse chunks) total work 'create-document)))
+
+(defun epi-ledger--prepare-record-batch
+    (header capsule drafts previous-hash first-sequence byte-overhead)
+  "Seal and prevalidate owned DRAFTS after BYTE-OVERHEAD.
+HEADER and CAPSULE provide the trusted semantic prefix; PREVIOUS-HASH and
+FIRST-SEQUENCE bind the first suffix record.  Return owned records, frames,
+their one concatenated suffix, and its final hash."
+  (unless (and (epi-header-p header)
+               (epi-ledger--semantic-capsule-p capsule)
+               (vectorp drafts)
+               (> (length drafts) 0)
+               (<= (length drafts) epi-ledger--batch-record-limit)
+               (stringp previous-hash)
+               (integerp first-sequence)
+               (> first-sequence 0)
+               (integerp byte-overhead)
+               (>= byte-overhead 0))
+    (epi-ledger--format-fail 'invalid-record-batch))
+  (let ((work (epi-ledger--make-work-state))
+        (state (epi-ledger--semantic-capsule-clone capsule))
+        (tail previous-hash)
+        (sequence first-sequence)
+        (suffix-bytes 0)
+        frames-reverse)
+    (dotimes (index (length drafts))
+      (let* ((record
+              (epi-ledger-seal-record (aref drafts index) tail sequence))
+             (frame (epi-ledger-render-record record)))
+        (epi-ledger--validate-record-semantic state header record)
+        (setq suffix-bytes (+ suffix-bytes (length frame)))
+        (when (> (+ byte-overhead suffix-bytes)
+                 epi-ledger--batch-byte-limit)
+          (epi-ledger--limit-fail
+           'batch-byte-limit :limit epi-ledger--batch-byte-limit
+           :bytes (+ byte-overhead suffix-bytes)))
+        (push frame frames-reverse)
+        (setq tail (epi-record--raw-hash record)
+              sequence (1+ sequence))))
+    (let ((failure (epi-ledger--validation-final-error state)))
+      (when failure
+        (epi-ledger--semantic-fail (car failure))))
+    (let* ((records (epi-ledger--validation-suffix-records state work))
+           (frames (epi-ledger--work-nreverse-list frames-reverse work))
+           (suffix
+            (epi-ledger--work-concat-chunks
+             frames suffix-bytes work 'append-suffix)))
+      (list :records records :frames frames :suffix suffix
+            :final-hash tail))))
+
+(defun epi-ledger--validate-realized-suffix
+    (bytes origin first-sequence previous-hash header capsule path)
+  "Validate realized suffix BYTES after the trusted prefix at ORIGIN.
+FIRST-SEQUENCE and PREVIOUS-HASH bind the suffix to that prefix.  HEADER and
+CAPSULE supply its trusted semantic state, and PATH identifies the ledger for
+redacted diagnostics.  Return realized records, their semantic capsule, and
+the final hash without reopening the complete ledger."
+  (unless (and (stringp bytes)
+               (not (multibyte-string-p bytes))
+               (not (epi-ledger--string-has-properties-p bytes))
+               (> (length bytes) 0)
+               (integerp origin) (>= origin 0)
+               (integerp first-sequence) (> first-sequence 0)
+               (stringp previous-hash)
+               (epi-header-p header)
+               (epi-ledger--semantic-capsule-p capsule)
+               (stringp path))
+    (epi-ledger--format-fail 'invalid-realized-suffix))
+  (let ((work (epi-ledger--make-work-state))
+        (state (epi-ledger--semantic-capsule-clone capsule))
+        (byte-count (length bytes))
+        (offset 0)
+        (sequence first-sequence)
+        (tail previous-hash)
+        records realized-capsule)
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (insert bytes)
+      (setq buffer-read-only t)
+      (let* ((buffer (current-buffer))
+             (source
+              (epi-ledger--make-source-region
+               :buffer buffer :start (point-min) :end (point-max)
+               :tick (buffer-modified-tick)))
+             (epi-ledger--work-protected-buffer buffer)
+             (epi-ledger--work-protected-change-handler
+              (lambda ()
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'realized-readback-changed))))
+        (while (< offset byte-count)
+          (let* ((scan
+                  (epi-ledger--scan-frame-owned
+                   source offset sequence origin))
+                 (scan-state (plist-get scan :state)))
+            (unless (eq scan-state 'complete)
+              (epi-ledger--format-fail
+               (or (plist-get scan :code) 'invalid-realized-suffix)
+               :offset (or (plist-get scan :offset) (+ origin offset))))
+            (let* ((record (plist-get scan :record))
+                   (absolute-next (plist-get scan :next-offset))
+                   (next (and (integerp absolute-next)
+                              (- absolute-next origin))))
+              (unless (and (epi-record-p record)
+                           (integerp next)
+                           (> next offset)
+                           (<= next byte-count))
+                (epi-ledger--format-fail
+                 'invalid-realized-suffix :offset (+ origin offset)))
+              (unless (equal (epi-record--raw-previous-hash record) tail)
+                (epi-ledger--format-fail
+                 'previous-hash-mismatch
+                 :offset (epi-record--raw-start-offset record)))
+              (epi-ledger--validate-record-semantic state header record)
+              (setq tail (epi-record--raw-hash record)
+                    sequence (1+ sequence)
+                    offset next))))
+        (let ((eof
+               (epi-ledger--scan-frame-owned
+                source offset sequence origin)))
+          (unless (and (eq (plist-get eof :state) 'eof)
+                       (= (or (plist-get eof :next-offset) -1)
+                          (+ origin byte-count)))
+            (epi-ledger--format-fail
+             'invalid-realized-suffix :offset (+ origin offset))))
+        (let ((failure (epi-ledger--validation-final-error state)))
+          (when failure
+            (epi-ledger--semantic-fail (car failure))))
+        (setq records
+              (epi-ledger--validation-suffix-records state work)
+              realized-capsule
+              (epi-ledger--semantic-capsule-from-state state))))
+    (list :records records :capsule realized-capsule :final-hash tail)))
+
+(defun epi-ledger--publish-uncertain-successor (ledger checkpoint)
+  "Publish CHECKPOINT's uncertain successor in LEDGER and return it.
+Never replace a checkpoint that has already won the publication race."
+  (let ((uncertain
+         (epi-ledger--checkpoint-uncertain-successor checkpoint)))
+    (unless (epi-ledger--checkpoint-cas ledger checkpoint uncertain)
+      (epi-ledger--fail 'epi-ledger-conflict 'stale-checkpoint))
+    uncertain))
+
+(defun epi-ledger--mark-append-uncertain
+    (ledger checkpoint phase cause)
+  "Mark CHECKPOINT uncertain in LEDGER and signal ambiguous append PHASE.
+CAUSE is deliberately not exposed because storage failures may contain
+untrusted paths or operating-system text."
+  (ignore cause)
+  (epi-ledger--publish-uncertain-successor ledger checkpoint)
+  (epi-ledger--fail
+   'epi-ledger-conflict 'append-uncertain :phase phase))
+
+(defun epi-ledger--assert-lock-owned-core (lock)
+  "Require LOCK's path to retain its exact token object and bytes."
+  (unless (epi-ledger--lock-p lock)
+    (epi-ledger--format-fail 'invalid-lock))
+  (unless
+      (epi-ledger--exact-published-lock-object
+       (epi-ledger--lock-lock-file lock)
+       (epi-ledger--lock-file-identity lock)
+       (epi-ledger--lock-bytes lock)
+       (epi-ledger--lock-sha256 lock))
+    (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+  t)
+
+(defun epi-ledger--assert-lock-owned (lock)
+  "Require LOCK's path to retain its exact token object and bytes."
+  (epi-ledger--assert-lock-owned-core lock))
+
+(defun epi-ledger--verify-prewrite-authority-raw
+    (path expected-identity expected-end expected-head last-record lock)
+  "Verify PATH, LOCK, EXPECTED-IDENTITY, EXPECTED-END, and EXPECTED-HEAD.
+LAST-RECORD supplies the retained chain head.  Do not invoke cooperative or
+storage seam callbacks."
+  (let ((epi-ledger--stat-function #'epi-ledger--stat-local-file)
+        (epi-ledger--read-function #'epi-ledger--read-bytes)
+        (epi--yield-function #'ignore)
+        (epi--deadline-clock-function #'float-time)
+        (epi-ledger--nonpreemptible-observer nil))
+    (epi-ledger--verify-file-state-core-impl
+     path expected-identity expected-end expected-head last-record)
+    (epi-ledger--assert-lock-owned-core lock)))
+
+(defun epi-ledger--create-storage-call (code function &rest arguments)
+  "Call FUNCTION with ARGUMENTS, mapping raw file failures to CODE.
+Already structured Epi conditions propagate without alteration."
+  (condition-case condition
+      (apply function arguments)
+    (file-error
+     (ignore condition)
+     (epi-ledger--fail 'epi-ledger-conflict code))))
+
+(defun epi-ledger--create-publish (temporary destination source)
+  "Publish TEMPORARY at DESTINATION using owned source identity SOURCE.
+A raw file failure after the destination becomes the same file object is
+reported with `:published t'; an independently published winner is reported
+as `destination-exists'."
+  (unless source
+    (epi-ledger--fail 'epi-ledger-conflict 'storage-publication-failed))
+  (condition-case condition
+      (funcall epi-ledger--publish-function temporary destination)
+    (file-error
+     (ignore condition)
+     (let ((target
+            (condition-case nil
+                (epi-ledger--owned-stat destination)
+              (error nil))))
+       (cond
+        ((epi-ledger--same-file-object-p source target)
+         (epi-ledger--fail
+          'epi-ledger-conflict 'storage-publication-failed :published t))
+        (target
+         (epi-ledger--fail 'epi-ledger-conflict 'destination-exists))
+        (t
+         (epi-ledger--fail
+          'epi-ledger-conflict 'storage-publication-failed)))))))
+
+(defun epi-ledger--require-current-checkpoint (ledger expected)
+  "Require LEDGER to still publish EXPECTED by identity."
+  (unless (eq expected (epi-ledger--checkpoint-snapshot ledger))
+    (epi-ledger--fail 'epi-ledger-conflict 'stale-checkpoint)))
+
+(defun epi-ledger--append (ledger drafts)
+  "Append DRAFTS to LEDGER through one verified crash barrier.
+Publish only records parsed back from the realized suffix.  Any failure after
+writer invocation marks the expected checkpoint uncertain and is never
+retried."
+  (unless (epi-ledger-p ledger)
+    (signal 'wrong-type-argument (list 'epi-ledger-p ledger)))
+  (let ((expected (epi-ledger--checkpoint-snapshot ledger)))
+    (when (epi-ledger--checkpoint-raw-uncertain expected)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'append-uncertain :phase 'possibly-written))
+    (when (or (null drafts)
+              (and (vectorp drafts) (= (length drafts) 0)))
+      (epi-ledger--format-fail 'empty-draft-batch))
+    ;; Ownership and aggregate caps precede default sources, yields, and I/O.
+    (let ((owned (epi-ledger--snapshot-draft-batch drafts)))
+      (when (= (length owned) 0)
+        (epi-ledger--format-fail 'empty-draft-batch))
+      (epi-ledger--with-operation-work-state
+        (setq owned (epi-ledger--fill-owned-draft-defaults owned))
+        (let* ((source (epi-ledger--checkpoint-raw-records expected))
+               (old-count (epi-ledger--record-source-length source))
+               (prepared
+                (epi-ledger--prepare-record-batch
+                 (epi-ledger--raw-header ledger)
+                 (epi-ledger--checkpoint-raw-semantic-capsule expected)
+                 owned
+                 (epi-ledger--checkpoint-raw-tail-hash expected)
+                 (1+ old-count)
+                 0)))
+          ;; Preparation is cooperative and may run arbitrary callbacks.
+          (epi-ledger--require-current-checkpoint ledger expected)
+          (let* ((path (epi-ledger--raw-path ledger))
+                 (expected-file
+                  (epi-ledger--checkpoint-raw-file-identity expected))
+                 (expected-end
+                  (epi-ledger--checkpoint-raw-validated-end-offset expected))
+                 (expected-head
+                  (epi-ledger--checkpoint-raw-tail-hash expected))
+                 (last-record (epi-ledger--record-source-last source))
+                 (suffix (plist-get prepared :suffix))
+                 (lock
+                  (epi-ledger--acquire-lock
+                   path expected-file expected-end expected-head))
+                 (phase 'prewrite)
+                 replacement
+                 failure
+                 result)
+            (unwind-protect
+                (condition-case condition
+                    (progn
+                  ;; The first full sandwich binds the freshly acquired lock.
+                  (epi-ledger--require-current-checkpoint ledger expected)
+                  (epi-ledger--verify-file-state
+                   path expected-file expected-end expected-head last-record)
+                  ;; The injectable verifier is itself a callback boundary.
+                  (epi-ledger--require-current-checkpoint ledger expected)
+                  (epi-ledger--verify-file-state-core
+                   path expected-file expected-end expected-head last-record)
+                  ;; Re-prove the exact token after every preceding callback.
+                  ;; Then bypass every injectable callback while jointly
+                  ;; re-proving file and lock authority.  The pure checkpoint
+                  ;; comparison closes the remaining gap before the writer.
+                  (epi-ledger--assert-lock-owned lock)
+                  (epi-ledger--verify-prewrite-authority-raw
+                   path expected-file expected-end expected-head last-record
+                   lock)
+                  (epi-ledger--require-current-checkpoint ledger expected)
+                  (setq phase 'possibly-written)
+                  (funcall epi-ledger--append-function path suffix)
+                  (funcall epi-ledger--flush-function path)
+                  (let* ((new-identity (epi-ledger--owned-stat path))
+                         (new-end
+                          (and (listp new-identity)
+                               (plist-get new-identity :size))))
+                    (unless (and new-identity
+                                 (epi-ledger--same-file-object-p
+                                  expected-file new-identity)
+                                 (equal path (plist-get new-identity :path))
+                                 (integerp new-end)
+                                 (= new-end (+ expected-end
+                                               (length suffix))))
+                      (epi-ledger--fail
+                       'epi-ledger-conflict 'realized-end-mismatch))
+                    (let ((readback
+                           (funcall epi-ledger--read-function
+                                    path expected-end new-end)))
+                      (unless (and (stringp readback)
+                                   (not (multibyte-string-p readback))
+                                   (not
+                                    (epi-ledger--string-has-properties-p
+                                     readback))
+                                   (= (length readback) (length suffix))
+                                   (equal readback suffix))
+                        (epi-ledger--fail
+                         'epi-ledger-conflict 'realized-readback-mismatch))
+                      (let* ((realized
+                              (epi-ledger--validate-realized-suffix
+                               readback expected-end (1+ old-count)
+                               expected-head (epi-ledger--raw-header ledger)
+                               (epi-ledger--checkpoint-raw-semantic-capsule
+                                expected)
+                               path))
+                             (records (plist-get realized :records))
+                             (capsule (plist-get realized :capsule))
+                             (new-head (plist-get realized :final-hash))
+                             (new-source
+                              (epi-ledger--record-source-extend
+                               source records
+                               (epi-ledger--make-work-state)))
+                             (new-last-record
+                              (epi-ledger--record-source-last new-source)))
+                        (setq replacement
+                              (funcall
+                               (symbol-function
+                                'epi-ledger--make-checkpoint)
+                               :file-identity new-identity
+                               :validated-end-offset new-end
+                               :tail-hash new-head
+                               :records new-source
+                               :by-id
+                               (epi-ledger--semantic-capsule-raw-by-id
+                                capsule)
+                               :turn-operation-index
+                               (epi-ledger--semantic-capsule-raw-turn-operation-index
+                                capsule)
+                               :tool-facts
+                               (epi-ledger--semantic-capsule-raw-calls
+                                capsule)
+                               :semantic-capsule capsule
+                               :uncertain
+                               (epi-ledger--semantic-capsule-raw-uncertain
+                                capsule))
+                              result
+                              (epi-ledger--work-list-to-vector
+                               records (epi-ledger--make-work-state)
+                               'append-records))
+                        ;; The verifier may observe storage, but cooperative
+                        ;; callbacks stay suppressed until the pure CAS ends.
+                        (let ((epi--yield-function #'ignore))
+                          (epi-ledger--verify-file-state
+                           path new-identity new-end new-head new-last-record)
+                          (epi-ledger--verify-file-state-raw
+                           path new-identity new-end new-head new-last-record)
+                          (epi-ledger--require-current-checkpoint
+                           ledger expected)
+                          (unless (epi-ledger--checkpoint-cas
+                                   ledger expected replacement)
+                            ;; Cleanup performs the one ambiguity CAS after
+                            ;; releasing the exact lock.
+                            (epi-ledger--fail
+                             'epi-ledger-conflict 'publication-cas-lost))
+                          (setq phase 'published)))))
+                      result)
+                  ((error quit)
+                   (setq failure condition)
+                   (signal (car condition) (cdr condition))))
+              (when lock
+                (let ((owned-lock lock))
+                  (setq lock nil)
+                  (pcase phase
+                    ('prewrite
+                     (condition-case condition
+                         (funcall epi-ledger--unlock-function owned-lock)
+                       (epi-error
+                        (signal (car condition) (cdr condition)))
+                       ((error quit)
+                        (epi-ledger--fail
+                         'epi-ledger-conflict 'unlock-uncertain
+                         :phase 'prewrite))))
+                    ('possibly-written
+                     ;; Publish uncertainty before another writer can acquire
+                     ;; the lock, but always attempt exact release before the
+                     ;; ambiguity signal becomes observable to the caller.
+                     (let (uncertainty-condition)
+                       (unwind-protect
+                           (condition-case condition
+                               (epi-ledger--mark-append-uncertain
+                                ledger expected phase failure)
+                             ((error quit)
+                              (setq uncertainty-condition condition)))
+                         (unwind-protect
+                             (funcall epi-ledger--unlock-function owned-lock)
+                           (when uncertainty-condition
+                             (signal (car uncertainty-condition)
+                                     (cdr uncertainty-condition)))))))
+                    ('published
+                     (let ((released nil))
+                       (unwind-protect
+                           (progn
+                             (funcall epi-ledger--unlock-function owned-lock)
+                             (setq released t))
+                         (unless released
+                           (epi-ledger--publish-uncertain-successor
+                            ledger replacement)
+                           (epi-ledger--fail
+                            'epi-ledger-conflict 'unlock-uncertain
+                            :phase 'published)))))))))))))))
+
+(cl-defun epi-ledger-create
+    (path &key session-id created-at project-root initial-drafts)
+  "Atomically create a complete append-only ledger at PATH.
+SESSION-ID, CREATED-AT, and PROJECT-ROOT define its explicit header.
+INITIAL-DRAFTS must contain exactly one leading session-info record."
+  ;; Everything reachable from the caller is owned before operation-state
+  ;; initialization can sample a clock or any later callback can run.
+  (let* ((owned-path
+          (if (stringp path)
+              (substring-no-properties path)
+            (epi-ledger--format-fail 'invalid-write-path)))
+         (header-inputs
+          (epi-ledger--snapshot-header-inputs
+           session-id created-at project-root))
+         (owned-session-id
+          (epi-ledger--object-value header-inputs "session_id"))
+         (owned-created-at
+          (epi-ledger--object-value header-inputs "created_at"))
+         (owned-project-root
+          (epi-ledger--object-value header-inputs "project_root"))
+         (owned-drafts
+          (epi-ledger--snapshot-draft-batch initial-drafts)))
+    (epi-ledger--create-validate-draft-shape
+     owned-drafts owned-session-id)
+    ;; Reject the exact aggregate cap before work-state initialization or any
+    ;; cooperative callback.  The placeholder contributes only its length.
+    (let* ((header-size
+            (epi-ledger--header-rendered-byte-size-no-callback
+             owned-session-id owned-created-at owned-project-root))
+           (header-placeholder (make-string header-size 0)))
+      (setq owned-drafts
+            (epi-ledger--snapshot-draft-batch
+             owned-drafts header-placeholder)))
+    (epi-ledger--with-operation-work-state
+      (setq owned-drafts
+            (epi-ledger--fill-owned-draft-defaults owned-drafts))
+      (epi-ledger--create-validate-draft-shape
+       owned-drafts owned-session-id)
+      (let* ((header
+              (epi-ledger-seal-header
+               :session-id owned-session-id
+               :created-at owned-created-at
+               :project-root owned-project-root)))
+        (let* ((document
+                (epi-ledger--create-document-bytes
+                 header owned-drafts owned-session-id))
+               ;; This is deliberately the first path resolution or probe.
+               (canonical
+                (epi-ledger--resolve-local-write-path owned-path))
+               (lock nil)
+               (published nil)
+               result)
+          (epi-ledger--ensure-private-parent canonical)
+          (when (epi-ledger--create-storage-call
+                 'storage-write-failed #'epi-ledger--owned-stat canonical)
+            (epi-ledger--fail 'epi-ledger-conflict 'destination-exists))
+          (condition-case condition
+              (progn
+                (setq lock
+                      (epi-ledger--create-storage-call
+                       'storage-write-failed #'epi-ledger--acquire-lock
+                       canonical "absent" 0 nil))
+                (when (epi-ledger--create-storage-call
+                       'storage-write-failed
+                       #'epi-ledger--owned-stat canonical)
+                  (epi-ledger--fail
+                   'epi-ledger-conflict 'destination-exists))
+                (let ((temporary (epi-ledger--hidden-sibling canonical)))
+                  (epi-ledger--create-storage-call
+                   'storage-write-failed epi-ledger--byte-writer
+                   temporary document 'exclusive-create nil)
+                  (epi-ledger--create-storage-call
+                   'storage-flush-failed epi-ledger--flush-function temporary)
+                  (unless
+                      (equal document
+                             (epi-ledger--create-storage-call
+                              'storage-write-failed epi-ledger--read-function
+                              temporary 0 (length document)))
+                    (epi-ledger--fail
+                     'epi-ledger-conflict 'storage-write-failed))
+                  ;; A full cold open proves that the temporary is not merely
+                  ;; byte-equal to our intent but a complete valid ledger.
+                  (epi-ledger-open temporary)
+                  (funcall epi-ledger--create-prepublication-function)
+                  (let ((source
+                         (epi-ledger--create-storage-call
+                          'storage-publication-failed
+                          #'epi-ledger--owned-stat temporary)))
+                    (unless source
+                      (epi-ledger--fail
+                       'epi-ledger-conflict 'storage-publication-failed))
+                    (when (epi-ledger--create-storage-call
+                           'storage-write-failed
+                           #'epi-ledger--owned-stat canonical)
+                      (epi-ledger--fail
+                       'epi-ledger-conflict 'destination-exists))
+                    (epi-ledger--assert-lock-owned lock)
+                    ;; No callback or yield may intervene between this exact
+                    ;; ownership proof and entry into the publication seam.
+                    (epi-ledger--create-publish
+                     temporary canonical source))
+                  (setq published t)
+                  (epi-ledger--delete-published-source-name temporary)
+                  (funcall epi-ledger--create-postpublication-function)
+                  (setq result (epi-ledger-open canonical)))
+                (let ((owned-lock lock))
+                  (setq lock nil)
+                  (condition-case nil
+                      (funcall epi-ledger--unlock-function owned-lock)
+                    (error
+                     (epi-ledger--fail
+                      'epi-ledger-conflict 'unlock-uncertain))))
+                result)
+            (error
+             (let* ((detail (and (consp (cdr condition))
+                                 (cadr condition)))
+                    (publication-visible
+                     (or published
+                         (and (listp detail)
+                              (plist-get detail :published)))))
+               (when lock
+                 (let ((owned-lock lock))
+                   (setq lock nil)
+                   (condition-case nil
+                       (funcall epi-ledger--unlock-function owned-lock)
+                     (error
+                      (when publication-visible
+                        (epi-ledger--fail
+                         'epi-ledger-conflict 'unlock-uncertain))))))
+               (signal (car condition) (cdr condition))))))))))
 
 (defun epi-ledger-message-from-record (record)
   "Return an ownership-isolated `epi-message' projection of message RECORD."
