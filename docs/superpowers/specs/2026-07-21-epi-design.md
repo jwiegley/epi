@@ -474,6 +474,22 @@ manifest only after destination and final quarantine have both been verified.
 No extra whole-ledger digest is needed: validation already hashes each record
 into the chain head, while the bounded fragment digest covers every trailing
 byte. Re-entry revalidates those components cooperatively.
+
+The version-one `reachable_objects` set contains at most 256 historical object
+references; the current torn fragment's separate `fragment_object` is outside
+that count. This is a fixed compatibility ceiling, not a work-slice tuning
+option. Preparation verifies each admitted object cooperatively once under the
+source lock and freezes its exact file identity. After every callback boundary,
+the closing authority proof raw-restats those identities without yielding;
+yielding inside that proof would reopen the mutation race. A newly derived
+one-over set fails with
+`epi-limit-exceeded(code=recovery-atomic-object-limit)` before persistent
+recovery state is created; a decoded or resumed one-over manifest is malformed
+durable input and fails `recovery-manifest-invalid`. These exact file identities
+form process-local authority for one live attempt; they are not durable manifest
+fields. A resumed attempt establishes a fresh identity epoch only after
+re-verifying each manifest-bound object's complete size and content hash.
+
 For a default-store ledger the quarantine is under the session directory; for
 a custom ledger it defaults to a sibling `.epi-quarantine`. An explicit
 quarantine override must be proven on the same filesystem device as the source
@@ -1554,7 +1570,11 @@ Additional rules follow:
   requires an explicitly reviewed native or process descriptor helper, a
   private snapshot write, a second validation representation, or a different
   incremental reader. The pure-Elisp first slice claims none of those stronger
-  properties.
+  properties. The same boundary applies to identity-checked rollback deletion:
+  portable Emacs has no inode-conditional remove primitive. Absolute
+  replacement safety would require leaving the directory behind or using an
+  explicitly reviewed platform helper with stronger parent-directory
+  authority.
 - Canonical paths and true names govern trust and allowed roots.
 - Project instructions cannot modify tool policy.
 - Project Elisp never loads merely because an instruction file mentions it.

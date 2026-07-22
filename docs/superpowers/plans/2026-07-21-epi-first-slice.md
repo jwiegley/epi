@@ -452,15 +452,17 @@ The first-slice tool-schema subset is a root object with `additionalProperties` 
 
 ## Frozen First-Slice Limits
 
-Every option named here is a public `defcustom`; the Type column freezes its
-Customize `:type` contract, and tests bind and assert its default and validated
-range. “Positive integer” requires an integer greater than zero.
+Every configurable option named here is a public `defcustom`; the Type column
+freezes its Customize `:type` contract, and tests bind and assert its default
+and validated range. The one row marked as a fixed v1 invariant is deliberately
+not customizable. “Positive integer” requires an integer greater than zero.
 “Nonnegative seconds” requires a number greater than or equal to zero and is
 stored in seconds even when the displayed default is in milliseconds.
 
-| Limit | Public option | Default | Type | Failure behavior |
+| Limit | Public option or invariant | Default | Type | Failure behavior |
 |---|---|---:|---|---|
 | Ledger/recovery records per work slice | `epi-ledger-work-record-limit` | 256 | positive integer | Yield with private cursor |
+| Historical reachable objects in one prepared recovery | fixed v1 `epi-ledger--recovery-atomic-object-limit` | 256 | fixed compatibility ceiling | Derived set rejects with `epi-limit-exceeded(code=recovery-atomic-object-limit)`; decoded one-over manifest is `recovery-manifest-invalid`; preserve source |
 | Ledger/recovery I/O or lexical bytes per work slice | `epi-ledger-work-byte-limit` | 1 MiB | positive integer | Yield with private cursor |
 | Ledger/recovery wall time per work slice | `epi-ledger-work-time-budget` | 8 ms | nonnegative seconds | Yield after current bounded unit |
 | Canonical JSON bytes per record | `epi-record-json-byte-limit` | 15 MiB | positive integer | Reject before append; corrupt if stored input exceeds |
@@ -509,6 +511,14 @@ stored in seconds even when the displayed default is in milliseconds.
 | Tree label bytes per node | `epi-ui-tree-label-byte-limit` | 384 bytes | positive integer | Truncate display label; preserve ID on button |
 | Tree content per render action | `epi-ui-tree-action-byte-limit` | 512 KiB | positive integer | Insert continuation node |
 | Subscriber/settled callback budget | `epi-callback-time-budget` | 4 ms | nonnegative seconds | Diagnose; disable repeating subscriber |
+
+The fixed recovery ceiling counts only historical entries in
+`reachable_objects`; the current torn fragment's separate `fragment_object`
+does not count against it. Preparation verifies those objects cooperatively
+once under the source lock, freezes their exact identities, then raw-restats
+each identity after callback boundaries. That closing proof cannot yield
+without reopening the mutation race, so v1 bounds it independently of every
+user-tunable work-slice option.
 
 The remaining Task 1 public customization is also frozen:
 
@@ -1001,9 +1011,11 @@ Finalization produces a bounded private record index before a final
 chain-head check, deliberate yield, and identity restat; publication below
 that restat performs constructors and field stores only. The portable-Elisp
 pathname ABA boundary and the fixed header-value limit are normative design
-constraints, not unrecorded implementation exceptions. Impossible final JSON
-prefixes are interior corruption; only lexically completable prefixes qualify
-as a truncated tail.
+constraints, not unrecorded implementation exceptions. That boundary also
+governs identity-checked rollback deletion because portable Emacs has no
+inode-conditional remove primitive. Impossible final JSON prefixes are
+interior corruption; only lexically completable prefixes qualify as a
+truncated tail.
 
 - [x] Commit:
 
@@ -1097,16 +1109,19 @@ git commit -m "feat: append Epi ledgers under an explicit lock"
 
 **Interfaces produced:** the closed-ledger `epi-ledger-recover-tail` primitive, fragment object evidence, quarantine layout, recovery-origin records. The registry-aware public facade is added in Task 8 after the runtime registry exists.
 
-**Implementation progress (2026-07-22):** Waves 0–2 of the frozen eight-wave
+**Implementation progress (2026-07-22):** Waves 0–3 of the frozen eight-wave
 execution brief are committed. `0abdfe9` adds exact torn-tail inspection,
-`a32cad6` adds recovery-origin admission and evidence semantics, and `bcad789`
-adds deterministic frame-free planning plus streaming reseal. The Wave 2 close
-gate passed 62/62 recovery tests, 192/192 I/O tests, warning-as-error byte
-compilation, Checkdoc, diff checks, a 10,000-proof constant-stack regression,
-and independent correctness and simplicity review. Wave 3—same-device
-preflight and the durable `prepared` manifest—is the next implementation
-boundary. The remaining Task 6 checkboxes deliberately stay open until their
-transactional publication or resume behavior exists.
+`a32cad6` adds recovery-origin admission and evidence semantics, `bcad789` adds
+deterministic frame-free planning plus streaming reseal, and `9caa866` adds
+closed same-device preflight, the verified bounded object inventory, and
+exclusive durable publication of the canonical `prepared` manifest under the
+source lock. The Wave 3 close gate passed 153/153 recovery tests, 283/283 I/O
+tests, warning-as-error byte compilation, Checkdoc, parenthesis and diff checks,
+and a focused independent P1 review. Wave 4—private object transfer, hidden
+destination-ledger reconstruction, and the durable `objects-transferred`
+barrier—is the next implementation boundary. The remaining Task 6 checkboxes
+deliberately stay open until their transactional publication or resume behavior
+exists.
 
 - [ ] Write tests for truncation after every byte class in a final record, unchanged source bytes, new session identity, semantic preservation of the valid prefix, fragment hash/object, reachable-object transfer, recovery provenance, destination collision, and refusal of interior corruption.
 
@@ -1154,9 +1169,15 @@ Expected red: `epi-ledger-recover-tail` is missing.
   approved, started, result-pending, select-leaf, intended-message, and
   uncertainty suffix class, together with explicit Task 8 reopen fixtures.
 
-- [ ] Copy or hard-link every reachable source object into the new object's store, then verify its length and hash through the destination path. Iterate objects and bounded copy chunks through the recovery cursor, yielding between units; a verified same-inode hard link need not recopy bytes. Do not carry unreachable directory entries into the new session.
+- [ ] Copy or hard-link every reachable source object admitted by the fixed
+  256-entry v1 historical-object ceiling into the new object's store, then
+  verify its length and hash through the destination path. The current fragment
+  object is separate from that historical set. Iterate objects and bounded copy
+  chunks through the recovery cursor, yielding between units; a verified
+  same-inode hard link need not recopy bytes. Do not carry unreachable directory
+  entries into the new session.
 
-- [ ] Resolve quarantine before recovery creates anything. A default-store ledger uses `<epi-session-directory>/quarantine`; a custom ledger uses sibling `<source-parent>/.epi-quarantine`; an explicit override is accepted only after source-parent and quarantine-parent device identities prove same-filesystem rename. A cross-device or indeterminate result fails with unchanged source, objects, destination, and quarantine. Allocate a recovery UUID and write canonical, fsynced `<quarantine-directory>/.epi-recovery/<recovery-id>/manifest.jcs` before any publication or move. The immutable manifest binds exact source path/session/device/inode/size/change identity, header hash, valid-prefix end/head, fragment offset/size/hash, source-evidence digest, quarantine device, destination path/session/head, reachable-object set, hidden staging paths, and final quarantine path. Re-entry revalidates the chain and exact fragment rather than hashing the whole ledger in one unbounded operation. A replace-by-rename phase field has exactly these monotonic values: `prepared`, `objects-transferred`, `destination-objects-published`, `destination-ledger-published`, `source-ledger-staged`, `source-objects-staged`, and `quarantine-published`. Record an explicit absent-source-object marker so the same phases apply when no source object directory exists.
+- [ ] Resolve quarantine before recovery creates anything. A default-store ledger uses `<epi-session-directory>/quarantine`; a custom ledger uses sibling `<source-parent>/.epi-quarantine`; an explicit override is accepted only after source-parent and quarantine-parent device identities prove same-filesystem rename. A cross-device or indeterminate result fails with unchanged source, objects, destination, and quarantine. Allocate a recovery UUID and write canonical, fsynced `<quarantine-directory>/.epi-recovery/<recovery-id>/manifest.jcs` before any publication or move. The immutable manifest binds exact source path/session/device/inode/size/change identity, header hash, valid-prefix end/head, fragment offset/size/hash, source-evidence digest, quarantine device, destination path/session/head, and the sorted at-most-256-entry historical reachable-object set, together with hidden staging paths and the final quarantine path. Each live attempt establishes a fresh process-local identity epoch for those objects only after complete size/hash verification, then raw-restats that epoch across callback boundaries; identities are not persisted across crashes. Re-entry revalidates the chain, exact fragment, and reachable object contents rather than hashing the whole ledger in one unbounded operation. A replace-by-rename phase field has exactly these monotonic values: `prepared`, `objects-transferred`, `destination-objects-published`, `destination-ledger-published`, `source-ledger-staged`, `source-objects-staged`, and `quarantine-published`. Record an explicit absent-source-object marker so the same phases apply when no source object directory exists.
 
 - [ ] Build the destination under hidden sibling names. Exclusively reserve and populate the destination object directory first, publish its canonical verified completion marker, and publish the destination ledger last, so normal session discovery cannot observe a ledger whose objects are absent. Then move the original ledger and original object directory, without byte changes, through the manifest's hidden quarantine staging paths into an exclusively reserved visible quarantine directory and publish its canonical fsynced `complete.jcs` marker last. Never use check-then-rename as a no-clobber directory primitive; normal discovery ignores every hidden recovery/staging path and every quarantine directory without its marker.
 

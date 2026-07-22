@@ -1,18 +1,19 @@
 # Epi Implementation Wiggum Handoff
 
-Status: Tasks 1–5 complete; Task 6 Waves 0–2 complete and Wave 3 is next; productization remains at its approved later integration boundary
+Status: Tasks 1–5 complete; Task 6 Waves 0–3 complete and Wave 4 is next; productization remains at its approved later integration boundary
 
 Last updated: 2026-07-22
 
 ## Current implementation run
 
 The active objective is to implement the approved first slice under the Wiggum
-loop. Tasks 1–5 and Task 6 Waves 0–2 are complete on the isolated feature
+loop. Tasks 1–5 and Task 6 Waves 0–3 are complete on the isolated feature
 branch. The package foundation, pinned GPTel seam, canonical ledger codec,
 semantic loader, private storage/append layer, tail inspector, recovery
-semantics, and deterministic reseal are committed as `89a3437`, `a5b6924`,
-`813ea02`, `7125bfc`, `e14f9b2`, `0abdfe9`, `a32cad6`, and `bcad789`,
-respectively.
+semantics, deterministic reseal, and closed recovery preparation are committed
+as `89a3437`, `a5b6924`, `813ea02`, `7125bfc`, `e14f9b2`, `0abdfe9`,
+`a32cad6`, `bcad789`, and `9caa866`, respectively. The separate Wave 2
+documentation checkpoint is `d49fcbd`.
 
 Completed in this run:
 
@@ -91,11 +92,12 @@ cleanup races. All seven red/green waves and every additive review regression
 are green. Three final reviewers approved the exact source/test snapshot; the
 close gates passed 29/29 object tests, 130/130 ledger tests, 342/342 codec
 tests, the full suite, warning-as-error compilation, Checkdoc, artifact and
-process audits, and the Anvil unsaved-buffer check. Task 6 Waves 0–2 now supply
-exact tail inspection, recovery provenance semantics, and deterministic
-streaming reseal; Wave 3 preflight and durable prepared-manifest work is next.
-All changes remain in the isolated feature worktree; `main` remains outside
-the implementation path.
+process audits, and the Anvil unsaved-buffer check. Task 6 Waves 0–3 now supply
+exact tail inspection, recovery provenance semantics, deterministic streaming
+reseal, closed same-device preflight, verified bounded object inventory, and
+an exclusively published canonical `prepared` manifest. Wave 4 object transfer
+is next. All changes remain in the isolated feature worktree; `main` remains
+outside the implementation path.
 
 The user also invoked `command-productize`. Read-only reconnaissance and
 current-tool research are complete. Productization integrates after Task 15
@@ -147,7 +149,7 @@ The approved Pi-grade Epi architecture now has a detailed, executable,
 test-first implementation plan at
 `docs/superpowers/plans/2026-07-21-epi-first-slice.md`. The planning unit was
 documentation-only; implementation is now complete through Task 5 and Task 6
-Wave 2.
+Wave 3.
 
 The plan covers the bounded first slice in Section 16 of
 `docs/superpowers/specs/2026-07-21-epi-design.md` and the applicable Section
@@ -328,12 +330,14 @@ intermediate Wiggum work.
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
    install a dependency, enter `nix develop`, or substitute installed Pi.
-4. Resume Task 6 at Wave 3 test-first in its exact file scope: add same-device
-   preflight, deterministic transaction paths, collision refusal, reachable
-   object reference verification, and the durable canonical `prepared`
-   manifest. Preserve the committed Wave 0 inspector, Wave 1 provenance
-   semantics, Wave 2 reseal, and Task 5 storage/locking behavior as the
-   regression baseline.
+4. Resume Task 6 at Wave 4 test-first in its exact file scope: copy only the
+   manifest-bound historical and fragment objects into private destination
+   staging, reconstruct and verify the hidden destination ledger, and durably
+   advance the manifest to `objects-transferred` while retaining the source
+   lock through the phase barrier. Preserve the committed Wave 0 inspector,
+   Wave 1 provenance semantics, Wave 2 reseal, Wave 3 prepared authority, and
+   Task 5 storage/locking behavior as the regression baseline. Do not publish
+   the destination or move source evidence in this wave.
 5. Continue dependency-ready tasks numerically, one TDD/review/commit unit at
    a time, with architecture checkpoints after Tasks 2, 6, 12, and 15.
 6. Complete the separately approved productization spec and plan before
@@ -398,6 +402,11 @@ Task 6 progress facts:
 - Wave 0 is `0abdfe9` (`feat: inspect recoverable Epi ledger tails safely`).
   Wave 1 is `a32cad6` (`feat: validate Epi recovery provenance semantics`).
   Wave 2 is `bcad789` (`feat: stream deterministic Epi recovery reseals`).
+  Its documentation checkpoint is
+  `d49fcbd30f12df6df16dc263bb2507e241f3c262` (`docs: record Task 6 reseal
+  checkpoint`). Wave 3 is
+  `9caa86605b1aa19afc1af86f0900d20ce6400c85` (`feat: prepare torn-tail
+  recovery manifests`).
 - Wave 2 closes caller ownership before cooperative validation, preflights the
   complete copied proof chain before output, rejects malformed or cyclic
   private inspection graphs with structured conditions, preserves every
@@ -408,11 +417,23 @@ Task 6 progress facts:
   checks, the 10,000-proof constant-stack regression, and independent final
   correctness and simplicity reviews also passed. GitHub issue
   `jwiegley/epi#6` records the wave evidence and remains in progress.
-- Wave 3 owns only same-device path resolution, collision and link-count
-  preflight, typed reachable-object discovery, deterministic staging names,
-  and exclusive durable publication of canonical `manifest.jcs` in phase
-  `prepared`. It does not yet transfer objects, publish a destination, move
-  source evidence, or expose the public recovery facade.
+- Wave 3 adds closed same-device path and collision preflight, deterministic
+  staging layout, a typed sorted historical-object inventory under the fixed
+  256-entry v1 ceiling, fragment evidence, and exclusive durable publication
+  of canonical `manifest.jcs` in phase `prepared` under the source lock. Its
+  closing authentication pass independently replays the source proof so a
+  forged non-final destination proof cannot enter durable state. No fixture
+  file changed.
+- The exact Wave 3 close sequence passed 153/153 recovery tests and 283/283 I/O
+  tests. Warning-as-error compilation, Checkdoc, parenthesis checks, and
+  `git diff --check` passed; the focused independent P1 review reported no
+  blocker. The committed source SHA-256 is
+  `cc3aaaed3067b0a5e29103b18b59b750868c60505b4fa760b2e9dd52301af547`;
+  the committed test SHA-256 is
+  `5d66c7d9d7690be2194376420cae8459a83f8402c88dabe017d73c4d2c6ab933`.
+- Wave 4 is the next boundary. Wave 3 does not transfer objects, reconstruct
+  or publish the destination, move source evidence, resume an interrupted
+  transaction, or expose the public recovery facade.
 
 ## Stop-and-escalate counters
 
@@ -420,8 +441,8 @@ Task 6 progress facts:
 - Maximum unusable outputs from any one reviewer: 1/2; each affected reviewer
   recovered after one neutral local-quality prompt.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: none. Tasks 1–5 and Task 6 Waves 0–2 are committed;
-  Wave 3 is next and all exact source inputs remain present and validated.
+- Current stop reason: none. Tasks 1–5 and Task 6 Waves 0–3 are committed;
+  Wave 4 is next and all exact source inputs remain present and validated.
 - Terminal integration issue: none. The public remote, 18 issues, and linked
   Phase 1 project now exist; the feature branch remains intentionally unpushed
   until final landing.
