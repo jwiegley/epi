@@ -1,15 +1,16 @@
 # Epi Implementation Wiggum Handoff
 
-Status: Tasks 1–4 complete; Task 5 is next; productization remains at its approved later integration boundary
+Status: Tasks 1–5 complete; Task 6 is next; productization remains at its approved later integration boundary
 
 Last updated: 2026-07-22
 
 ## Current implementation run
 
 The active objective is to implement the approved first slice under the Wiggum
-loop. Tasks 1–4 are complete on the isolated feature branch. The package
-foundation, pinned GPTel seam, canonical ledger codec, and semantic loader are
-committed as `89a3437`, `a5b6924`, `813ea02`, and `7125bfc`, respectively.
+loop. Tasks 1–5 are complete on the isolated feature branch. The package
+foundation, pinned GPTel seam, canonical ledger codec, semantic loader, and
+private storage/append layer are committed as `89a3437`, `a5b6924`,
+`813ea02`, `7125bfc`, and `e14f9b2`, respectively.
 
 Completed in this run:
 
@@ -79,11 +80,18 @@ claim adversarial rename-away/read/restore ABA resistance. `recovery-origin`
 construction, provenance binding, and semantic admission remain a hard Task 6
 prerequisite.
 
-Task 5, private storage, locking, append, and immutable objects, is the next
-implementation frontier. Its Wave 0 capsule/CAS/index/batch contract and Wave
-1 path/byte-I/O contract are prepared in reviewed scratch artifacts; production
-work still begins from a meaningful red test. All changes remain in the
-isolated feature worktree; `main` remains outside the implementation path.
+Task 5 is committed as
+`e14f9b2d562cf0beb01aff97d4bc5bd7204da9a3`
+(`feat: append Epi ledgers under an explicit lock`). It supplies private
+creation, identity-bound locks and stale-lock recovery, verified single-batch
+append, immutable content-addressed objects, and fail-closed publication and
+cleanup races. All seven red/green waves and every additive review regression
+are green. Three final reviewers approved the exact source/test snapshot; the
+close gates passed 29/29 object tests, 130/130 ledger tests, 342/342 codec
+tests, the full suite, warning-as-error compilation, Checkdoc, artifact and
+process audits, and the Anvil unsaved-buffer check. Task 6, explicit torn-tail
+recovery, is the next frontier. All changes remain in the isolated feature
+worktree; `main` remains outside the implementation path.
 
 The user also invoked `command-productize`. Read-only reconnaissance and
 current-tool research are complete. Productization integrates after Task 15
@@ -92,14 +100,13 @@ complete delivered file set and the README remains the final truth check. Its
 5% comparator is a separate short productization check and does not replace
 Task 15's 2.0x elapsed and 1.5x RSS acceptance thresholds.
 
-One terminal integration decision is known but does not block intermediate
-implementation: this repository has no remote or upstream. The inherited
-parent instruction requires
-a successful push at final completion (the “Landing the Plane” directive in
-`/Users/johnw/src/dot-emacs/AGENTS.md`), while the Wiggum loop prohibits
-pushing during intermediate work. Before final completion, a remote must be
-supplied or that terminal push requirement explicitly waived for this nested
-repo.
+The user created the public GitHub destination during this run. `origin` is
+`git@github.com:jwiegley/epi.git`; the 18 plan-derived issues carry the
+`phase1` label, completed Tasks 1–5 are closed, and all issues are members of
+the public linked project at `https://github.com/users/jwiegley/projects/7`.
+The Wiggum loop still prohibits an intermediate push. The inherited successful
+push requirement will be satisfied only at final landing after every task and
+productization gate is complete.
 
 Locally verified inputs that do not require substitution:
 
@@ -302,9 +309,10 @@ form-hash boundaries all pass the frozen offline contract.
 
 The primary checkout remains clean on `main`. Feature implementation is in
 `.worktrees/epi-first-slice` on `codex/epi-first-slice`, based on
-`efc5ee1a6d41132e837c6c8f7c1daebf8fb35a31`. The repository has no configured
-remote or upstream; the final push requirement remains unresolved rather than
-silently downgraded to a local integration boundary.
+`efc5ee1a6d41132e837c6c8f7c1daebf8fb35a31`. The repository now has the
+public GitHub remote `origin` at `git@github.com:jwiegley/epi.git`; the feature
+branch deliberately has no upstream and has not been pushed during
+intermediate Wiggum work.
 
 ## Implementation resume procedure
 
@@ -314,10 +322,11 @@ silently downgraded to a local integration boundary.
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
    install a dependency, enter `nix develop`, or substitute installed Pi.
-4. Start Task 5 test-first in its exact file scope: modify `epi-ledger.el` and
-   create `test/epi-ledger-io-test.el`. Integrate the 12 Wave 0 capsule/CAS/
-   suffix-index/batch tests first, observe their targeted red results, and do
-   not begin filesystem mutation until that wave is green.
+4. Begin Task 6 test-first in its exact file scope: modify `epi-ledger.el` and
+   `test/epi-ledger-io-test.el`, and extend only the required
+   `test/fixtures/ledger/torn-*.org` fixtures. Establish focused recovery REDs
+   before adding `epi-ledger-recover-tail`; preserve Task 5's committed
+   storage and locking behavior as the regression baseline.
 5. Continue dependency-ready tasks numerically, one TDD/review/commit unit at
    a time, with architecture checkpoints after Tasks 2, 6, 12, and 15.
 6. Complete the separately approved productization spec and plan before
@@ -326,19 +335,32 @@ silently downgraded to a local integration boundary.
 7. Do not implement a later-slice roadmap capability without its own reviewed
    plan and capability gate.
 
-Task 5 boundary facts:
+Task 5 completion facts:
 
 - The implementation brief is `/var/tmp/epi-wg-task5/execution-brief.md`
   (SHA-256
-  `d7ef0e5e7b7a5ae865068f3019bc0d5e9948e1d0cbef876a9c854e42448a26b3`).
+  `d0780cf8dc5ac3a53dc6c3ee1fdd30145c4739096f9b6466b16af80c5af2570b`).
   Its seven ordered red/green waves are authoritative for the task.
-- Wave 0 is `/var/tmp/epi-wg-task5/wave0-tests.el` (SHA-256
-  `e478ed6ab7494d009a7fb2a22402dc0060f0b64c521acd735a0cce638b0142e1`),
-  exactly 12 clean targeted red tests. Wave 1 is
-  `/var/tmp/epi-wg-task5-wave1/wave1-tests.el` (SHA-256
-  `5f5c1e25055c3437102ce11dbc72139a11de41c767f7a07dbd614a8618abf748`),
-  exactly nine clean targeted red tests. Apply each through `apply_patch`; do
-  not copy scratch files over repository files.
+- All seven waves are integrated, red/green proven, and independently
+  approved. The final source SHA-256 is
+  `8e0bbf76d5079370eaa7a7edecdc8325d5f460942425053171560091b936d3ac`;
+  the final test SHA-256 is
+  `21ca8d9ae6e8d97bd2b493c573df4a4908d07cbc41771ee50f7cc8794b098031`.
+  Wave 5's frozen artifact is
+  `/var/tmp/epi-wg-task5-wave5/wave5-tests.el` at SHA-256
+  `76450ec8f71409fe3bb0dc451b623be406251c0effe9e27a03e0da1ac9ee4015`;
+  Wave 6's is `/var/tmp/epi-wg-task5-wave6/wave6-tests.el` at SHA-256
+  `2745503fc92255842cfeb21c3c3c724ccfb54b737dd2ce54e5977e9d4b27c0e4`.
+- The exact close sequence passed: ledger 130/130, codec 342/342 with
+  independent JCS goldens current, full `make test` exit 0, compile, Checkdoc,
+  `git diff --check`, artifact/process audit, and Anvil buffer-state check.
+  GitHub issue `jwiegley/epi#5` records this evidence and is closed.
+- Creation publishes with `add-name-to-file` and `OK-IF-ALREADY-EXISTS` nil:
+  a same-directory hard link is the atomic no-clobber publication point, after
+  which Epi unlinks its owned source name. A postpublication unlink failure
+  may leave two complete names and reports `storage-publication-failed` with
+  `:published t`; filesystems without hard-link support fail before
+  publication. Stale-lock archival uses the same link-then-unlink rule.
 - Reuse Task 4's immutable checkpoint and private checkpoint cell only to
   publish a verified append result as one replacement. Add the smallest
   successor operations required by Task 5; do not restore the deleted
@@ -352,12 +374,12 @@ Task 5 boundary facts:
 - Preserve exact preexisting bytes. A losing writer or pre-write failure writes
   nothing; uncertain post-write failure forces cold validation before another
   append.
-- Implement only create, lock/stale-lock recovery, batched append, and object
-  put/get/presence. Do not begin tail recovery, quarantine, recovery manifests,
-  or `recovery-origin` semantics; those remain Task 6.
-- Retain the frozen GPTel, Pi, JCS, Emacs, Transient, and Compat roots. Run the
-  focused Task 5 gate, every ledger/prior test, warning-as-error compile, and
-  Checkdoc before the Task 5 commit.
+- Task 6 may now reuse create, lock/stale-lock recovery, batched append, and
+  object put/get/presence. It must add tail recovery, quarantine, recovery
+  manifests, and `recovery-origin` semantics without weakening their Task 5
+  authority and cleanup contracts.
+- Retain the frozen GPTel, Pi, JCS, Emacs, Transient, and Compat roots for Task
+  6 and all later offline gates.
 
 ## Stop-and-escalate counters
 
@@ -365,7 +387,8 @@ Task 5 boundary facts:
 - Maximum unusable outputs from any one reviewer: 1/2; each affected reviewer
   recovered after one neutral local-quality prompt.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: none. Tasks 1–4 are committed and Task 5 is next; all
+- Current stop reason: none. Tasks 1–5 are committed and Task 6 is next; all
   exact preflight source inputs remain present and validated.
-- Terminal integration issue: no remote/upstream for the inherited push rule;
-  this does not block local implementation work.
+- Terminal integration issue: none. The public remote, 18 issues, and linked
+  Phase 1 project now exist; the feature branch remains intentionally unpushed
+  until final landing.

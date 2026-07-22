@@ -1020,7 +1020,7 @@ git commit -m "feat: validate Epi ledger structure and history"
 
 **Interfaces produced:** `epi-ledger-create`, private batched `epi-ledger--append`, object put/get/presence, explicit stale-lock recovery.
 
-- [ ] Write temporary-file tests for 0700 directories, 0600 files, staged no-clobber create, a crash before/after creation publication, one-flush batched append, distinct linked hashes within a batch, exact preservation of existing bytes, file-identity/head races, lock ownership, and immutable objects.
+- [x] Write temporary-file tests for 0700 directories, 0600 files, staged no-clobber create, a crash before/after creation publication, one-flush batched append, distinct linked hashes within a batch, exact preservation of existing bytes, file-identity/head races, lock ownership, and immutable objects.
 
 ```elisp
 (ert-deftest epi-ledger-append-rejects-a-stale-head-without-writing ()
@@ -1048,7 +1048,7 @@ git commit -m "feat: validate Epi ledger structure and history"
       (should (equal "abc" (epi-ledger-object-get ledger one))))))
 ```
 
-- [ ] Run:
+- [x] Run:
 
 ```sh
 direnv exec . make test-one TEST=test/epi-ledger-io-test.el SELECTOR='^epi-ledger-'
@@ -1056,29 +1056,29 @@ direnv exec . make test-one TEST=test/epi-ledger-io-test.el SELECTOR='^epi-ledge
 
 Expected red: append/create/object functions are absent.
 
-- [ ] Implement `epi-ledger-create` with canonical local-path checks, private directory creation, and one precomputed byte string containing the complete header plus `initial-drafts`, whose first and only session-default record must be a valid `session-info`. Acquire an exclusive create lock whose expected file identity is `absent`, write/flush/read-verify the complete mode-0600 bytes at a hidden temporary sibling, revalidate that the destination is absent, and publish by a no-clobber same-filesystem rename while the lock is held. Refuse an existing path. A crash may leave only a recognized hidden temporary or a complete normal ledger, never a header-only normal session.
+- [x] Implement `epi-ledger-create` with canonical local-path checks, private directory creation, and one precomputed byte string containing the complete header plus `initial-drafts`, whose first and only session-default record must be a valid `session-info`. Acquire an exclusive create lock whose expected file identity is `absent`, write/flush/read-verify the complete mode-0600 bytes at a hidden temporary sibling, revalidate that the destination is absent, and publish while the lock is held by atomically creating a same-directory hard link with `add-name-to-file` and overwrite disabled. Treat removal of the temporary source name as postpublication cleanup; a cleanup failure may leave both complete names for the same inode and must report `storage-publication-failed` with `:published t`. Refuse an existing path. A crash may expose only a recognized hidden temporary, a complete normal ledger, or both complete names, never a header-only normal session. A filesystem without hard-link support fails closed before publication.
 
-- [ ] Define a canonical lock token containing host, PID, process-start identity from `(alist-get 'start (process-attributes pid))`, nonce, canonical ledger path, expected file identifier, expected validated offset, and expected head hash. Create `FILE.epi-lock` through the private byte writer's exclusive-create mode, independent of `create-lockfiles`. Bind `default-directory` to the proven-local ledger parent while obtaining the current process identity; missing, malformed, or signaling self attributes fail with a structured conflict before lock creation or any other write.
+- [x] Define a canonical lock token containing host, PID, process-start identity from `(alist-get 'start (process-attributes pid))`, nonce, canonical ledger path, expected file identifier, expected validated offset, and expected head hash. Create `FILE.epi-lock` through the private byte writer's exclusive-create mode, independent of `create-lockfiles`. Bind `default-directory` to the proven-local ledger parent while obtaining the current process identity; missing, malformed, or signaling self attributes fail with a structured conflict before lock creation or any other write.
 
-- [ ] Permit automatic takeover only for a same-host token when either a present process has a different normalized start identity, proving PID reuse, or `process-attributes` is nil and a supported local `list-system-processes` snapshot omits the PID. Nil attributes alone are indeterminate, as are an unavailable process list, a listed PID whose start identity cannot be read, and a remote owner. Bind `default-directory` to the proven-local ledger parent for both probes and signal `epi-ledger-conflict` for every indeterminate case.
+- [x] Permit automatic takeover only for a same-host token when either a present process has a different normalized start identity, proving PID reuse, or `process-attributes` is nil and a supported local `list-system-processes` snapshot omits the PID. Nil attributes alone are indeterminate, as are an unavailable process list, a listed PID whose start identity cannot be read, and a remote owner. Bind `default-directory` to the proven-local ledger parent for both probes and signal `epi-ledger-conflict` for every indeterminate case.
 
-- [ ] Add module-level `epi-ledger-recover-stale-lock`. It accepts the expected token SHA-256, archives that exact token, obtains a fresh exclusive lock, and revalidates the complete file identity/head before doing anything. It never treats token age alone as proof.
+- [x] Add module-level `epi-ledger-recover-stale-lock`. It accepts the expected token SHA-256, archives that exact token, obtains a fresh exclusive lock, and revalidates the complete file identity/head before doing anything. It never treats token age alone as proof.
 
-- [ ] Implement the private no-conversion local-byte writer specified above and use it for create, lock tokens, append, object temporaries, recovery artifacts, and manifests. Bind `write-region-inhibit-fsync` to nil at durability barriers. Hostile coding-system, format, file-name-handler, annotation, and post-annotation tests must leave exact bytes unchanged.
+- [x] Implement the private no-conversion local-byte writer specified above and use it for create, lock tokens, append, object temporaries, recovery artifacts, and manifests. Bind `write-region-inhibit-fsync` to nil at durability barriers. Hostile coding-system, format, file-name-handler, annotation, and post-annotation tests must leave exact bytes unchanged.
 
-- [ ] Implement append as one critical section: lock; restat and validate identity/head; fill draft IDs/times from deterministic indirections; pre-seal all records in order; render one UTF-8/LF unibyte string; append once through the byte writer; parse and hash the realized suffix; update the in-memory ledger only after verification; release only the token this process owns.
+- [x] Implement append as one critical section: lock; restat and validate identity/head; fill draft IDs/times from deterministic indirections; pre-seal all records in order; render one UTF-8/LF unibyte string; append once through the byte writer; parse and hash the realized suffix; update the in-memory ledger only after verification; release only the token this process owns.
 
-- [ ] Add injected operation seams for lock creation, append, flush boundary, stat, read-back, and unlock. Tests simulate every failure without advising built-ins globally. Any failure before the append leaves bytes unchanged; any uncertain post-write failure forces a fresh full validation before another append.
+- [x] Add injected operation seams for lock creation, append, flush boundary, stat, read-back, and unlock. Tests simulate every failure without advising built-ins globally. Any failure before the append leaves bytes unchanged; any uncertain post-write failure forces a fresh full validation before another append.
 
-- [ ] Implement object storage at `FILE.objects/sha256/<prefix>/<hash>`. Enforce the first-slice object-byte limit before hashing or writing, and reject any ledger object reference whose declared size exceeds it during validation. Treat each at-most-16-MiB object SHA-256 as a measured nonpreemptible primitive with a cooperative yield immediately before and after; chunked copy/write I/O still obeys the ordinary slice budget. Write a mode-0600 temporary sibling, flush, and rename without overwrite. If a concurrent writer won, accept the existing object only after byte length and SHA-256 verification. A mismatched pre-existing path is corruption.
+- [x] Implement object storage at `FILE.objects/sha256/<prefix>/<hash>`. Enforce the first-slice object-byte limit before hashing or writing, and reject any ledger object reference whose declared size exceeds it during validation. Treat each at-most-16-MiB object SHA-256 as a measured nonpreemptible primitive with a cooperative yield immediately before and after; chunked copy/write I/O still obeys the ordinary slice budget. Write and flush a mode-0600 temporary sibling, then atomically publish with same-directory `add-name-to-file` and overwrite disabled before unlinking the temporary source name as postpublication cleanup. If a concurrent writer won, accept the existing object only after byte length and SHA-256 verification. A mismatched pre-existing path is corruption, and a filesystem without hard-link support fails closed before publication.
 
-- [ ] Make object reads unibyte, size/hash verified, and fail with `epi-missing-object` for absence or mismatch. Before reading, stat the path and reject a file larger than either the declared bounded size or 16 MiB; read at most declared-size-plus-one bytes, require exact length, then hash. Add exact-cap, declared-size mismatch, replaced-oversize, and one-byte-over tests. Never infer reachability or semantic order from directory contents.
+- [x] Make object reads unibyte, size/hash verified, and fail with `epi-missing-object` for absence or mismatch. Before reading, stat the path and reject a file larger than either the declared bounded size or 16 MiB; read at most declared-size-plus-one bytes, require exact length, then hash. Add exact-cap, declared-size mismatch, replaced-oversize, and one-byte-over tests. Never infer reachability or semantic order from directory contents.
 
-- [ ] Test disabled ordinary Emacs lockfiles, malformed/remote/indeterminate tokens, nil or signaling current-process attributes, nil process attributes with a listed PID, signaling or unavailable process lists, same-host death proven by a supported process list, PID reuse with a different start identity, canonical-local `default-directory` for current-process identity and both stale-owner probes even under a remote ambient value, failure before write or takeover when those probes are inconclusive, a one-shot takeover race, token replacement during unlock, a competing head update, mismatched pre-existing object, and missing referenced object.
+- [x] Test disabled ordinary Emacs lockfiles, malformed/remote/indeterminate tokens, nil or signaling current-process attributes, nil process attributes with a listed PID, signaling or unavailable process lists, same-host death proven by a supported process list, PID reuse with a different start identity, canonical-local `default-directory` for current-process identity and both stale-owner probes even under a remote ambient value, failure before write or takeover when those probes are inconclusive, a one-shot takeover race, token replacement during unlock, a competing head update, mismatched pre-existing object, and missing referenced object.
 
-- [ ] Run all ledger tests and all prior tests.
+- [x] Run all ledger tests and all prior tests.
 
-- [ ] Commit:
+- [x] Commit:
 
 ```sh
 git add epi-ledger.el test/epi-ledger-io-test.el

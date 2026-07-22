@@ -385,9 +385,13 @@ atomic append.
 
 Session creation uses the same discipline with expected file identity
 `absent`: write and verify the complete header plus `session-info` at a hidden
-sibling, revalidate absence, and publish by a no-clobber same-filesystem rename
-under the create lock. A process crash can expose a recognized hidden
-temporary or a complete normal ledger, never a header-only normal session.
+sibling, revalidate absence, and atomically publish by creating a
+same-directory hard link with `add-name-to-file` and overwrite disabled under
+the create lock.  This avoids Emacs's check-then-overwrite fallback when a
+filesystem lacks atomic rename-no-replace.  Removing the temporary source name
+is postpublication cleanup; a crash or cleanup failure can expose both names
+for the same complete inode, but never a header-only normal session.  A
+filesystem without hard-link support fails closed before publication.
 
 Where several adjacent records share one crash barrier, Epi writes their
 complete hash-linked forms under one lock and performs one flush. This does
