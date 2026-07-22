@@ -1,0 +1,19 @@
+#+title: Epi session
+#+EPI_FORMAT: 1
+#+EPI_SESSION_ID: 11111111-1111-4111-8111-111111111111
+#+EPI_CREATED_AT: 2026-07-21T18:42:17-07:00
+#+EPI_PROJECT_ROOT: /tmp/epi-project/
+#+EPI_CODING_SYSTEM: utf-8-unix
+#+EPI_HEADER_SHA256: 42a532655547cb5af87ee33d3df6fd60944b3d5f44411063d73f4ade5dc661b1
+* session-info 10000000-0000-4000-8000-000000000001
+:PROPERTIES:
+:EPI_ID: 10000000-0000-4000-8000-000000000001
+:EPI_TYPE: session-info
+:EPI_SCHEMA: 1
+:EPI_AT: 2026-07-21T18:42:18-07:00
+:EPI_PREV_SHA256: 42a532655547cb5af87ee33d3df6fd60944b3d5f44411063d73f4ade5dc661b1
+:EPI_RECORD_SHA256: 292c27e18aee42b0e0ec463b56c897a049a9a2a712d324d1f24ee2667be975ec
+:END:
+#+begin_epi-json
+{"at":"2026-07-21T18:42:18-07:00","id":"10000000-0000-4000-8000-000000000001","payload":{"backend":"test-backend","base_system_prompt":"Be exact.","capability":"openai-chat-completions/sequential-tools-v1","model":"best-model","request_params":{},"session_id":"11111111-1111-4111-8111-111111111111","tools":[],"working_directory":"/tmp/epi-project/"},"previous_hash":"42a532655547cb5af87ee33d3df6fd60944b3d5f44411063d73f4ade5dc661b1","schema":1,"type":"session-info"}
+#+end_epi-json

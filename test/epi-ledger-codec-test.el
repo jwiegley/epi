@@ -27,6 +27,10 @@
 
 (defvar epi-golden-skip-main)
 
+;; Dynamically bound by loader work-accounting tests.  Production treats the
+;; value as a private collector cell, never as an executable callback.
+(defvar epi-ledger--open-work-observer nil)
+
 (let ((epi-golden-skip-main t))
   (load (expand-file-name "test/generate-jcs-goldens.el"
                           epi-test-repository-root)
@@ -3544,7 +3548,9 @@ When CAPTURE-UTF16-CHUNKS is non-nil, also track the chunk list returned by
                 (string-make-unibyte (concat start (apply #'concat lines)))
                 0 1)))
           (should (eq 'invalid (plist-get result :state)))
-          (should (eq 'invalid-property-value
+          (should (eq (if (member ":EPI_SCHEMA: 2\n" lines)
+                          'unsupported-schema
+                        'invalid-property-value)
                       (plist-get result :code))))))))
 
 (ert-deftest epi-ledger-frame-cap-accounts-for-every-mandatory-stage ()
@@ -4665,6 +4671,3838 @@ When CAPTURE-UTF16-CHUNKS is non-nil, also track the chunk list returned by
         "42a532655547cb5af87ee33d3df6fd60944b3d5f44411063d73f4ade5dc661b1"
         1)
        :type 'epi-ledger-format-error))))
+
+(defun epi-test-ledger--session-info-draft (&optional session-id record-id)
+  "Return a deterministic first-record session-info draft.
+SESSION-ID defaults to the fixed fixture session, and RECORD-ID defaults to a
+distinct deterministic record identifier."
+  (make-epi-draft
+   :id (or record-id "10000000-0000-4000-8000-000000000001")
+   :type 'session-info
+   :at "2026-07-21T18:42:18-07:00"
+   :payload
+   `(("session_id" .
+      ,(or session-id "11111111-1111-4111-8111-111111111111"))
+     ("working_directory" . "/tmp/epi-project/")
+     ("base_system_prompt" . "Be exact.")
+     ("backend" . "test-backend")
+     ("model" . "test-model")
+     ("request_params")
+     ("tools" . [])
+     ("capability" . "openai-chat-completions/sequential-tools-v1"))))
+
+(defun epi-test-ledger--document-bytes (drafts &optional previous-hash)
+  "Return a complete fixed-header document containing DRAFTS.
+PREVIOUS-HASH overrides the chain root used for the first draft."
+  (let* ((header (epi-test-ledger--header))
+         (tail (or previous-hash (epi-header-hash header)))
+         (sequence 1)
+         (chunks (list (epi-ledger-render-header header))))
+    (dolist (draft drafts)
+      (let ((record (epi-ledger-seal-record draft tail sequence)))
+        (setq chunks (append chunks (list (epi-ledger-render-record record)))
+              tail (epi-record-hash record)
+              sequence (1+ sequence))))
+    (apply #'concat chunks)))
+
+(defconst epi-test-ledger--task4-session-id
+  "11111111-1111-4111-8111-111111111111")
+(defconst epi-test-ledger--task4-operation-id
+  "20000000-0000-4000-8000-000000000001")
+(defconst epi-test-ledger--task4-turn-id
+  "30000000-0000-4000-8000-000000000001")
+(defconst epi-test-ledger--task4-user-id
+  "10000000-0000-4000-8000-000000000012")
+(defconst epi-test-ledger--task4-proposal-id
+  "10000000-0000-4000-8000-000000000013")
+
+(defun epi-test-ledger--task4-draft
+    (record-id type payload &rest envelope)
+  "Return a deterministic Task 4 draft with RECORD-ID, TYPE, and PAYLOAD.
+ENVELOPE supplies any parent, target, turn, or operation keywords."
+  (apply #'make-epi-draft
+         :id record-id :type type :at "2026-07-21T18:43:02-07:00"
+         :payload payload envelope))
+
+(defun epi-test-ledger--task4-operation-started
+    (&optional record-id operation kind)
+  "Return a deterministic operation-started draft."
+  (let ((operation (or operation epi-test-ledger--task4-operation-id)))
+    (epi-test-ledger--task4-draft
+     (or record-id "10000000-0000-4000-8000-000000000010")
+     'operation-started
+     `(("operation_id" . ,operation) ("kind" . ,(or kind "prompt")))
+     :operation operation)))
+
+(defun epi-test-ledger--task4-turn-started (&optional record-id turn operation
+                                                      message-id)
+  "Return a deterministic turn-started draft."
+  (let ((turn (or turn epi-test-ledger--task4-turn-id))
+        (operation (or operation epi-test-ledger--task4-operation-id)))
+    (epi-test-ledger--task4-draft
+     (or record-id "10000000-0000-4000-8000-000000000011")
+     'turn-started
+     `(("turn_id" . ,turn)
+       ("operation_id" . ,operation)
+       ("attempt_id" . "40000000-0000-4000-8000-000000000001")
+       ("message_id" . ,(or message-id epi-test-ledger--task4-user-id))
+       ("working_directory" . "/tmp/epi-project/")
+       ("base_system_prompt" . "Be exact.")
+       ("resources" . [])
+       ("system_prompt" . "Be exact.")
+       ("backend" . "test-backend")
+       ("model" . "test-model")
+       ("request_params")
+       ("tools" . [])
+       ("snapshot_hash" .
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"))
+     :turn turn :operation operation)))
+
+(defun epi-test-ledger--task4-text-message
+    (record-id role text turn &optional parent)
+  "Return a deterministic text message draft."
+  (apply #'epi-test-ledger--task4-draft
+         record-id 'message
+         `(("role" . ,role)
+           ("content" . [( ("type" . "text") ("text" . ,text))]))
+         :turn turn
+         (when parent (list :parent parent))))
+
+(defun epi-test-ledger--task4-leaf
+    (&optional record-id target operation)
+  "Return a deterministic turnless leaf-selection draft."
+  (epi-test-ledger--task4-draft
+   (or record-id "10000000-0000-4000-8000-000000000091")
+   'leaf nil
+   :target (or target epi-test-ledger--task4-user-id)
+   :operation (or operation "20000000-0000-4000-8000-000000000090")))
+
+(defun epi-test-ledger--task4-proposal
+    (&optional record-id call-id name arguments order parent turn)
+  "Return an assistant tool-call proposal message draft."
+  (epi-test-ledger--task4-draft
+   (or record-id epi-test-ledger--task4-proposal-id)
+   'message
+   `(("role" . "assistant")
+     ("content" .
+      [( ("type" . "tool-call")
+         ("call_id" . ,(or call-id "call-1"))
+         ("name" . ,(or name "read_file"))
+         ("arguments" . ,(or arguments '(("path" . "/tmp/a"))))
+         ("order" . ,(or order 0))
+         ("group_id" . ,epi-json-null))]))
+   :parent (or parent epi-test-ledger--task4-user-id)
+   :turn (or turn epi-test-ledger--task4-turn-id)))
+
+(defun epi-test-ledger--task4-tool-planned
+    (&optional record-id call-id name arguments order target turn operation)
+  "Return a deterministic tool-planned draft."
+  (epi-test-ledger--task4-draft
+   (or record-id "10000000-0000-4000-8000-000000000014")
+   'tool-planned
+   `(("call_id" . ,(or call-id "call-1"))
+     ("name" . ,(or name "read_file"))
+     ("arguments" . ,(or arguments '(("path" . "/tmp/a"))))
+     ("authority")
+     ("order" . ,(or order 0)))
+   :target (or target epi-test-ledger--task4-proposal-id)
+   :turn (or turn epi-test-ledger--task4-turn-id)
+   :operation (or operation epi-test-ledger--task4-operation-id)))
+
+(defun epi-test-ledger--task4-tool-approved
+    (&optional record-id call-id target turn operation)
+  "Return a deterministic tool-approved draft."
+  (epi-test-ledger--task4-draft
+   (or record-id "10000000-0000-4000-8000-000000000015")
+   'tool-approved
+   `(("call_id" . ,(or call-id "call-1")) ("policy"))
+   :target (or target epi-test-ledger--task4-proposal-id)
+   :turn (or turn epi-test-ledger--task4-turn-id)
+   :operation (or operation epi-test-ledger--task4-operation-id)))
+
+(defun epi-test-ledger--task4-tool-started
+    (&optional record-id call-id target turn operation)
+  "Return a deterministic tool-started draft."
+  (epi-test-ledger--task4-draft
+   (or record-id "10000000-0000-4000-8000-000000000016")
+   'tool-started
+   `(("call_id" . ,(or call-id "call-1")) ("tool_version" . "1"))
+   :target (or target epi-test-ledger--task4-proposal-id)
+   :turn (or turn epi-test-ledger--task4-turn-id)
+   :operation (or operation epi-test-ledger--task4-operation-id)))
+
+(defun epi-test-ledger--task4-tool-finished
+    (&optional record-id call-id status model-result target turn operation)
+  "Return a deterministic tool-finished draft."
+  (let ((payload
+         (list (cons "call_id" (or call-id "call-1"))
+               (cons "status" (or status "success"))
+               (list "details"))))
+    (unless (equal status "uncertain")
+      (setq payload
+            (append payload
+                    (list (cons "model_result"
+                                (or model-result "contents"))))))
+    (epi-test-ledger--task4-draft
+     (or record-id "10000000-0000-4000-8000-000000000017")
+     'tool-finished payload
+     :target (or target epi-test-ledger--task4-proposal-id)
+     :turn (or turn epi-test-ledger--task4-turn-id)
+     :operation (or operation epi-test-ledger--task4-operation-id))))
+
+(defun epi-test-ledger--task4-tool-denied
+    (&optional record-id call-id model-result target turn operation)
+  "Return a deterministic tool-denied draft."
+  (epi-test-ledger--task4-draft
+   (or record-id "10000000-0000-4000-8000-000000000017")
+   'tool-denied
+   (list (cons "call_id" (or call-id "call-1"))
+         (cons "reason" "policy")
+         (cons "model_result" (or model-result "Denied")))
+   :target (or target epi-test-ledger--task4-proposal-id)
+   :turn (or turn epi-test-ledger--task4-turn-id)
+   :operation (or operation epi-test-ledger--task4-operation-id)))
+
+(defun epi-test-ledger--task4-tool-result
+    (&optional record-id call-id name result status parent turn)
+  "Return a deterministic tool-result message draft."
+  (epi-test-ledger--task4-draft
+   (or record-id "10000000-0000-4000-8000-000000000018")
+   'message
+   `(("role" . "tool")
+     ("content" .
+      [( ("type" . "tool-result")
+         ("call_id" . ,(or call-id "call-1"))
+         ("name" . ,(or name "read_file"))
+         ("result" . ,(or result "contents"))
+         ("status" . ,(or status "success")))]))
+   :parent (or parent epi-test-ledger--task4-proposal-id)
+   :turn (or turn epi-test-ledger--task4-turn-id)))
+
+(defun epi-test-ledger--task4-turn-terminal
+    (type &optional record-id turn operation)
+  "Return a deterministic turn terminal draft of TYPE."
+  (let ((turn (or turn epi-test-ledger--task4-turn-id)))
+    (epi-test-ledger--task4-draft
+     (or record-id "10000000-0000-4000-8000-000000000019") type
+     (pcase type
+       ('turn-finished
+        (list (cons "turn_id" turn) (cons "status" "success")))
+       ('turn-failed
+        (list (cons "turn_id" turn) (cons "code" "provider")
+              (list "details")))
+       (_ (list (cons "turn_id" turn)
+                (cons "reason" "interrupted"))))
+     :turn turn :operation (or operation epi-test-ledger--task4-operation-id))))
+
+(defun epi-test-ledger--task4-operation-terminal
+    (type &optional record-id operation)
+  "Return a deterministic operation terminal draft of TYPE."
+  (let ((operation (or operation epi-test-ledger--task4-operation-id)))
+    (epi-test-ledger--task4-draft
+     (or record-id "10000000-0000-4000-8000-000000000020") type
+     (pcase type
+       ('operation-finished
+        (list (cons "operation_id" operation) (cons "status" "success")))
+       ('operation-failed
+        (list (cons "operation_id" operation) (cons "code" "provider")
+              (list "details")))
+       (_ (list (cons "operation_id" operation)
+                (cons "reason" "interrupted"))))
+     :operation operation)))
+
+(defun epi-test-ledger--task4-valid-drafts ()
+  "Return a fresh complete valid Task 4 tool-call history."
+  (list
+   (epi-test-ledger--session-info-draft)
+   (epi-test-ledger--task4-operation-started)
+   (epi-test-ledger--task4-turn-started)
+   (epi-test-ledger--task4-text-message
+    epi-test-ledger--task4-user-id "user" "hello"
+    epi-test-ledger--task4-turn-id)
+   (epi-test-ledger--task4-proposal)
+   (epi-test-ledger--task4-tool-planned)
+   (epi-test-ledger--task4-tool-approved)
+   (epi-test-ledger--task4-tool-started)
+   (epi-test-ledger--task4-tool-finished)
+   (epi-test-ledger--task4-tool-result)
+   (epi-test-ledger--task4-turn-terminal 'turn-finished)
+   (epi-test-ledger--task4-operation-terminal 'operation-finished)))
+
+(defun epi-test-ledger--task4-draft-envelope (draft)
+  "Return a mutable owned canonical envelope for DRAFT."
+  (copy-tree
+   (cdr (epi-ledger--snapshot-draft-envelope
+         draft (make-string 64 ?0) 1))
+   t))
+
+(defun epi-test-ledger--task4-record-from-envelope (envelope sequence)
+  "Return a sealed raw record for canonical ENVELOPE at SEQUENCE.
+This fixture-only constructor intentionally bypasses semantic field validation
+so hash-valid schema and lifecycle contradictions can be represented."
+  (let* ((type-text (epi-ledger--object-value envelope "type"))
+         (type (intern type-text))
+         (json (epi-ledger--jcs-encode envelope))
+         (hash (secure-hash 'sha256 json)))
+    (epi-ledger--make-record
+     :id (epi-ledger--object-value envelope "id")
+     :type type
+     :schema (epi-ledger--object-value envelope "schema")
+     :at (epi-ledger--object-value envelope "at")
+     :previous-hash (epi-ledger--object-value envelope "previous_hash")
+     :parent (epi-ledger--object-value envelope "parent")
+     :target (epi-ledger--object-value envelope "target")
+     :turn (epi-ledger--object-value envelope "turn")
+     :operation (epi-ledger--object-value envelope "operation")
+     :payload (epi-ledger--object-value envelope "payload")
+     :hash hash :sequence sequence :sealed-json json)))
+
+(defun epi-test-ledger--task4-document-from-envelopes
+    (envelopes &optional header)
+  "Return a hash-linked document containing mutable ENVELOPES."
+  (let* ((header (or header (epi-test-ledger--header)))
+         (tail (epi-header-hash header))
+         (sequence 1)
+         (chunks (list (epi-ledger-render-header header))))
+    (dolist (source envelopes)
+      (let* ((envelope (copy-tree source t))
+             (previous (assoc "previous_hash" envelope)))
+        (setcdr previous tail)
+        (let ((record
+               (epi-test-ledger--task4-record-from-envelope
+                envelope sequence)))
+          (setq chunks
+                (append chunks (list (epi-ledger-render-record record)))
+                tail (epi-record-hash record)
+                sequence (1+ sequence)))))
+    (apply #'concat chunks)))
+
+(defun epi-test-ledger--task4-document (drafts)
+  "Return a hash-valid document containing DRAFTS without semantic checks."
+  (epi-test-ledger--task4-document-from-envelopes
+   (mapcar #'epi-test-ledger--task4-draft-envelope drafts)))
+
+(defun epi-test-ledger--task4-document-with-broken-final-chain (drafts)
+  "Return DRAFTS with a self-consistent but unlinked final record."
+  (let* ((header (epi-test-ledger--header))
+         (tail (epi-header-hash header))
+         (sequence 1)
+         (chunks (list (epi-ledger-render-header header))))
+    (dolist (draft (butlast drafts))
+      (let ((record (epi-ledger-seal-record draft tail sequence)))
+        (setq chunks (append chunks (list (epi-ledger-render-record record)))
+              tail (epi-record-hash record)
+              sequence (1+ sequence))))
+    (let ((record
+           (epi-ledger-seal-record
+            (car (last drafts)) (make-string 64 ?0) sequence)))
+      (apply #'concat
+             (append chunks (list (epi-ledger-render-record record)))))))
+
+(defun epi-test-ledger--task4-uuid (domain index)
+  "Return a deterministic UUID in DOMAIN for INDEX."
+  (format "%08x-0000-4000-8000-%012x" domain index))
+
+(defun epi-test-ledger--task4-dense-document (operation-count)
+  "Return a valid ledger containing OPERATION-COUNT adjacent prompt turns."
+  (let ((drafts (list (epi-test-ledger--session-info-draft))))
+    (dotimes (zero-index operation-count)
+      (let* ((index (1+ zero-index))
+             (base (* index 10))
+             (operation
+              (epi-test-ledger--task4-uuid #x20000001 index))
+             (turn (epi-test-ledger--task4-uuid #x30000001 index))
+             (message (epi-test-ledger--task4-uuid #x10000001 (+ base 3))))
+        (setq drafts
+              (nconc
+               drafts
+               (list
+                (epi-test-ledger--task4-operation-started
+                 (epi-test-ledger--task4-uuid #x10000001 (+ base 1))
+                 operation)
+                (epi-test-ledger--task4-turn-started
+                 (epi-test-ledger--task4-uuid #x10000001 (+ base 2))
+                 turn operation message)
+                (epi-test-ledger--task4-text-message
+                 message "user" "dense" turn)
+                (epi-test-ledger--task4-turn-terminal
+                 'turn-finished
+                 (epi-test-ledger--task4-uuid #x10000001 (+ base 4))
+                 turn operation)
+                (epi-test-ledger--task4-operation-terminal
+                 'operation-finished
+                 (epi-test-ledger--task4-uuid #x10000001 (+ base 5))
+                 operation))))))
+    (epi-test-ledger--task4-document drafts)))
+
+(defun epi-test-ledger--task4-maximum-json-document ()
+  "Return a valid one-record document whose stored JSON reaches its cap."
+  (let* ((bytes
+          (epi-test-ledger--task4-document
+           (list (epi-test-ledger--session-info-draft))))
+         (begin "#+begin_epi-json\n")
+         (end "\n#+end_epi-json\n")
+         (json-start (+ (string-match (regexp-quote begin) bytes)
+                        (length begin)))
+         (json-end (string-match (regexp-quote end) bytes json-start))
+         (json (substring bytes json-start json-end))
+         (prompt-prefix "\"base_system_prompt\":\"")
+         (prompt-start (+ (string-match (regexp-quote prompt-prefix) json)
+                          (length prompt-prefix)))
+         (prompt-end (string-match "\"" json prompt-start))
+         (growth (- epi-record-json-byte-limit (length json)))
+         (maximum-json
+          (concat (substring json 0 prompt-start)
+                  (make-string (+ (- prompt-end prompt-start) growth) ?x)
+                  (substring json prompt-end)))
+         (hash-prefix ":EPI_RECORD_SHA256: ")
+         (hash-start (+ (string-match (regexp-quote hash-prefix) bytes)
+                        (length hash-prefix)))
+         (hash (secure-hash 'sha256 maximum-json)))
+    (should (>= growth 0))
+    (should (= epi-record-json-byte-limit (length maximum-json)))
+    (let ((document
+           (concat (substring bytes 0 hash-start)
+                   hash
+                   (substring bytes (+ hash-start 64) json-start)
+                   maximum-json
+                   (substring bytes json-end))))
+      (should (<= (- (length document)
+                     (string-match (regexp-quote "* session-info ")
+                                   document))
+                  epi-record-frame-byte-limit))
+      document)))
+
+(defun epi-test-ledger--task4-raw-header (&optional format coding-system)
+  "Return a self-consistent raw header with FORMAT and CODING-SYSTEM."
+  (let* ((format (or format 1))
+         (coding-system (or coding-system "utf-8-unix"))
+         (object
+          `(("title" . "Epi session")
+            ("format" . ,format)
+            ("session_id" . ,epi-test-ledger--task4-session-id)
+            ("created_at" . "2026-07-21T18:42:17-07:00")
+            ("project_root" . "/tmp/epi-project/")
+            ("coding_system" . ,coding-system)))
+         (hash (secure-hash 'sha256 (epi-ledger--jcs-encode object))))
+    (string-make-unibyte
+     (concat
+      "#+title: Epi session\n"
+      "#+EPI_FORMAT: " (number-to-string format) "\n"
+      "#+EPI_SESSION_ID: " epi-test-ledger--task4-session-id "\n"
+      "#+EPI_CREATED_AT: 2026-07-21T18:42:17-07:00\n"
+      "#+EPI_PROJECT_ROOT: /tmp/epi-project/\n"
+      "#+EPI_CODING_SYSTEM: " coding-system "\n"
+      "#+EPI_HEADER_SHA256: " hash "\n"))))
+
+(defun epi-test-ledger--task4-set-payload (draft key value)
+  "Set DRAFT's payload KEY to VALUE and return DRAFT."
+  (setcdr (assoc key (epi-draft-payload draft)) value)
+  draft)
+
+(defun epi-test-ledger--task4-set-result-field (draft key value)
+  "Set tool-result message DRAFT's content KEY to VALUE and return DRAFT."
+  (setcdr (assoc key (aref (cdr (assoc "content" (epi-draft-payload draft))) 0))
+          value)
+  draft)
+
+(defun epi-test-ledger--task4-prefix (drafts count)
+  "Return the first COUNT members of DRAFTS as a fresh list spine."
+  (let (result)
+    (dotimes (index count)
+      (setq result (append result (list (nth index drafts)))))
+    result))
+
+(defun epi-test-ledger--task4-replace-once (bytes old new)
+  "Return owned BYTES with the single literal OLD occurrence replaced by NEW."
+  (let ((start (string-match (regexp-quote old) bytes)))
+    (unless start
+      (error "Fixture source does not contain %S" old))
+    (when (string-match (regexp-quote old) bytes (+ start (length old)))
+      (error "Fixture source contains multiple occurrences of %S" old))
+    (concat (substring bytes 0 start) new
+            (substring bytes (+ start (length old))))))
+
+(defun epi-test-ledger--task4-basic-fixtures ()
+  "Return static corruption fixture documents outside tool semantics."
+  (let* ((session (epi-test-ledger--session-info-draft))
+         (clean-session (epi-test-ledger--task4-document (list session)))
+         (unsupported-envelope
+          (epi-test-ledger--task4-draft-envelope
+           (epi-test-ledger--session-info-draft))))
+    (setcdr (assoc "schema" unsupported-envelope) 2)
+    (list
+     (cons "corrupt-bad-header.org"
+           (epi-test-ledger--task4-replace-once
+            clean-session "#+title:" "#+Title:"))
+     (cons "corrupt-missing-session-info.org"
+           (epi-ledger-render-header (epi-test-ledger--header)))
+     (cons "corrupt-duplicate-session-info.org"
+           (epi-test-ledger--task4-document
+            (list (epi-test-ledger--session-info-draft)
+                  (epi-test-ledger--session-info-draft
+                   nil "10000000-0000-4000-8000-000000000002"))))
+     (cons "corrupt-nonfirst-session-info.org"
+           (epi-test-ledger--task4-document
+            (list (epi-test-ledger--task4-operation-started)
+                  (epi-test-ledger--session-info-draft))))
+     (cons "corrupt-session-id-mismatch.org"
+           (epi-test-ledger--task4-document
+            (list
+             (epi-test-ledger--session-info-draft
+              "11111111-1111-4111-8111-111111111112"))))
+     (cons "corrupt-unsupported-format.org"
+           (epi-test-ledger--task4-raw-header 2))
+     (cons "corrupt-unsupported-schema.org"
+           (epi-test-ledger--task4-document-from-envelopes
+            (list unsupported-envelope)))
+     (cons "corrupt-duplicate-id.org"
+           (let ((operation (epi-test-ledger--task4-operation-started
+                             "10000000-0000-4000-8000-000000000001")))
+             (epi-test-ledger--task4-document
+              (list (epi-test-ledger--session-info-draft) operation))))
+     (cons "corrupt-forward-parent.org"
+           (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+             (setf (epi-draft-parent (nth 3 drafts))
+                   epi-test-ledger--task4-proposal-id)
+             (epi-test-ledger--task4-document
+              (epi-test-ledger--task4-prefix drafts 5))))
+     (cons "corrupt-forward-target.org"
+           (epi-test-ledger--task4-document
+            (list
+             (epi-test-ledger--session-info-draft)
+             (epi-test-ledger--task4-operation-started nil nil "select-leaf")
+             (epi-test-ledger--task4-draft
+              "10000000-0000-4000-8000-000000000011" 'leaf nil
+              :target epi-test-ledger--task4-user-id
+              :operation epi-test-ledger--task4-operation-id)
+             (epi-test-ledger--task4-operation-terminal 'operation-finished)
+             (epi-test-ledger--task4-operation-started
+              "10000000-0000-4000-8000-000000000014"
+              "20000000-0000-4000-8000-000000000002")
+             (epi-test-ledger--task4-turn-started
+              "10000000-0000-4000-8000-000000000015"
+              "30000000-0000-4000-8000-000000000002"
+              "20000000-0000-4000-8000-000000000002"
+              epi-test-ledger--task4-user-id)
+             (epi-test-ledger--task4-text-message
+              epi-test-ledger--task4-user-id "user" "hello"
+              "30000000-0000-4000-8000-000000000002"))))
+     (cons "corrupt-wrong-family-target.org"
+           (epi-test-ledger--task4-document
+            (list
+             (epi-test-ledger--session-info-draft)
+             (epi-test-ledger--task4-operation-started nil nil "select-leaf")
+             (epi-test-ledger--task4-draft
+              "10000000-0000-4000-8000-000000000011" 'leaf nil
+              :target "10000000-0000-4000-8000-000000000010"
+              :operation epi-test-ledger--task4-operation-id))))
+     (cons "corrupt-missing-target.org"
+           (epi-test-ledger--task4-document
+            (list
+             (epi-test-ledger--session-info-draft)
+             (epi-test-ledger--task4-operation-started nil nil "select-leaf")
+             (epi-test-ledger--task4-draft
+              "10000000-0000-4000-8000-000000000011" 'leaf nil
+              :target "10000000-0000-4000-8000-000000000099"
+              :operation epi-test-ledger--task4-operation-id))))
+     (cons "corrupt-wrong-family-parent.org"
+           (epi-test-ledger--task4-document
+            (list
+             (epi-test-ledger--session-info-draft)
+             (epi-test-ledger--task4-operation-started)
+             (epi-test-ledger--task4-turn-started)
+             (epi-test-ledger--task4-text-message
+              epi-test-ledger--task4-user-id "user" "hello"
+              epi-test-ledger--task4-turn-id
+              "10000000-0000-4000-8000-000000000010"))))
+     (cons "corrupt-operation-envelope-payload-id.org"
+           (let ((envelopes
+                  (mapcar
+                   #'epi-test-ledger--task4-draft-envelope
+                   (list (epi-test-ledger--session-info-draft)
+                         (epi-test-ledger--task4-operation-started)))))
+             (setcdr (assoc "operation" (nth 1 envelopes))
+                     "20000000-0000-4000-8000-000000000002")
+             (epi-test-ledger--task4-document-from-envelopes envelopes)))
+     (cons "corrupt-turn-envelope-payload-id.org"
+           (let ((envelopes
+                  (mapcar
+                   #'epi-test-ledger--task4-draft-envelope
+                   (list (epi-test-ledger--session-info-draft)
+                         (epi-test-ledger--task4-operation-started)
+                         (epi-test-ledger--task4-turn-started)))))
+             (setcdr (assoc "turn" (nth 2 envelopes))
+                     "30000000-0000-4000-8000-000000000002")
+             (epi-test-ledger--task4-document-from-envelopes envelopes)))
+     (cons "corrupt-turn-operation-payload-id.org"
+           (let ((envelopes
+                  (mapcar
+                   #'epi-test-ledger--task4-draft-envelope
+                   (list (epi-test-ledger--session-info-draft)
+                         (epi-test-ledger--task4-operation-started)
+                         (epi-test-ledger--task4-turn-started)))))
+             (setcdr
+              (assoc "operation_id"
+                     (epi-ledger--object-value (nth 2 envelopes) "payload"))
+              "20000000-0000-4000-8000-000000000002")
+             (epi-test-ledger--task4-document-from-envelopes envelopes)))
+     (cons "corrupt-previous-hash.org"
+           (epi-test-ledger--task4-document-with-broken-final-chain
+            (epi-test-ledger--task4-prefix
+             (epi-test-ledger--task4-valid-drafts) 4)))
+     (cons "corrupt-payload-hash.org"
+           (epi-test-ledger--task4-replace-once
+            clean-session "test-model" "best-model"))
+     (cons "corrupt-property-mismatch.org"
+           (epi-test-ledger--task4-replace-once
+            clean-session
+            ":EPI_TYPE: session-info"
+            ":EPI_TYPE: recovery-origin"))
+     (cons "corrupt-bytes-after-fragment.org"
+           (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+                  (prefix
+                   (epi-test-ledger--task4-document
+                    (epi-test-ledger--task4-prefix drafts 3)))
+                  (complete
+                   (epi-test-ledger--task4-document
+                    (epi-test-ledger--task4-prefix drafts 4)))
+                  (frame (substring complete (length prefix)))
+                  (begin
+                   (string-match
+                    (regexp-quote "#+begin_epi-json\n") frame))
+                  (json-start (+ begin (length "#+begin_epi-json\n"))))
+             (concat prefix (substring frame 0 (+ json-start 8))
+                     (string-make-unibyte "\n* later-frame\n")))))))
+
+(defun epi-test-ledger--task4-proposal-mismatch (field)
+  "Return a full history whose proposal and plan disagree on FIELD."
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (planned (nth 5 drafts)))
+    (pcase field
+      ('call-id
+       (epi-test-ledger--task4-set-payload planned "call_id" "call-2")
+       (dolist (index '(6 7 8))
+         (epi-test-ledger--task4-set-payload
+          (nth index drafts) "call_id" "call-2"))
+       (epi-test-ledger--task4-set-result-field
+        (nth 9 drafts) "call_id" "call-2"))
+      ('name
+       (epi-test-ledger--task4-set-payload planned "name" "other_tool")
+       (epi-test-ledger--task4-set-result-field
+        (nth 9 drafts) "name" "other_tool"))
+      ('arguments
+       (epi-test-ledger--task4-set-payload
+        planned "arguments" '(("path" . "/tmp/b"))))
+      ('order
+       (epi-test-ledger--task4-set-payload planned "order" 1)))
+    (epi-test-ledger--task4-document drafts)))
+
+(defun epi-test-ledger--task4-two-call-prefix ()
+  "Return a valid same-turn completed call followed by a second plan."
+  (let ((prior-proposal "10000000-0000-4000-8000-000000000040")
+        (prior-result "10000000-0000-4000-8000-000000000045"))
+    (list
+     (epi-test-ledger--session-info-draft)
+     (epi-test-ledger--task4-operation-started)
+     (epi-test-ledger--task4-turn-started)
+     (epi-test-ledger--task4-text-message
+      epi-test-ledger--task4-user-id "user" "hello"
+      epi-test-ledger--task4-turn-id)
+     (epi-test-ledger--task4-proposal
+      prior-proposal "call-2" "other_tool" '(("path" . "/tmp/b")) 0)
+     (epi-test-ledger--task4-tool-planned
+      "10000000-0000-4000-8000-000000000041"
+      "call-2" "other_tool" '(("path" . "/tmp/b")) 0 prior-proposal)
+     (epi-test-ledger--task4-tool-approved
+      "10000000-0000-4000-8000-000000000042" "call-2" prior-proposal)
+     (epi-test-ledger--task4-tool-started
+      "10000000-0000-4000-8000-000000000043" "call-2" prior-proposal)
+     (epi-test-ledger--task4-tool-finished
+      "10000000-0000-4000-8000-000000000044"
+      "call-2" "success" "prior" prior-proposal)
+     (epi-test-ledger--task4-tool-result
+      prior-result "call-2" "other_tool" "prior" "success"
+      prior-proposal)
+     (epi-test-ledger--task4-proposal
+      epi-test-ledger--task4-proposal-id "call-1" "read_file"
+      '(("path" . "/tmp/a")) 1 prior-result)
+     (epi-test-ledger--task4-tool-planned
+      nil "call-1" "read_file" '(("path" . "/tmp/a")) 1))))
+
+(defun epi-test-ledger--task4-two-call-history ()
+  "Return a valid same-turn two-call history through outer terminals."
+  (append
+   (epi-test-ledger--task4-two-call-prefix)
+   (list
+    (epi-test-ledger--task4-tool-approved)
+    (epi-test-ledger--task4-tool-started)
+    (epi-test-ledger--task4-tool-finished)
+    (epi-test-ledger--task4-tool-result)
+    (epi-test-ledger--task4-turn-terminal 'turn-finished)
+    (epi-test-ledger--task4-operation-terminal 'operation-finished))))
+
+(defun epi-test-ledger--task4-two-operation-history ()
+  "Return a valid completed operation followed by a current tool operation."
+  (let ((prior-operation "20000000-0000-4000-8000-000000000002")
+        (prior-turn "30000000-0000-4000-8000-000000000002")
+        (prior-user "10000000-0000-4000-8000-000000000050")
+        (prior-assistant "10000000-0000-4000-8000-000000000051"))
+    (list
+     (epi-test-ledger--session-info-draft)
+     (epi-test-ledger--task4-operation-started
+      "10000000-0000-4000-8000-000000000048" prior-operation)
+     (epi-test-ledger--task4-turn-started
+      "10000000-0000-4000-8000-000000000049"
+      prior-turn prior-operation prior-user)
+     (epi-test-ledger--task4-text-message
+      prior-user "user" "earlier" prior-turn)
+     (epi-test-ledger--task4-text-message
+      prior-assistant "assistant" "done" prior-turn prior-user)
+     (epi-test-ledger--task4-turn-terminal
+      'turn-finished "10000000-0000-4000-8000-000000000052"
+      prior-turn prior-operation)
+     (epi-test-ledger--task4-operation-terminal
+      'operation-finished "10000000-0000-4000-8000-000000000053"
+      prior-operation)
+     (epi-test-ledger--task4-operation-started)
+     (epi-test-ledger--task4-turn-started)
+     (epi-test-ledger--task4-text-message
+      epi-test-ledger--task4-user-id "user" "hello"
+      epi-test-ledger--task4-turn-id prior-assistant)
+     (epi-test-ledger--task4-proposal)
+     (epi-test-ledger--task4-tool-planned)
+     (epi-test-ledger--task4-tool-approved)
+     (epi-test-ledger--task4-tool-started)
+     (epi-test-ledger--task4-tool-finished)
+     (epi-test-ledger--task4-tool-result)
+     (epi-test-ledger--task4-turn-terminal 'turn-finished)
+     (epi-test-ledger--task4-operation-terminal 'operation-finished))))
+
+(defun epi-test-ledger--task4-lifecycle-mismatch (field)
+  "Return a valid-prefix history whose approved lifecycle disagrees on FIELD."
+  (let* ((drafts
+          (pcase field
+            ((or 'target 'call) (epi-test-ledger--task4-two-call-prefix))
+            ('turn (epi-test-ledger--task4-valid-drafts))
+            (_ (epi-test-ledger--task4-two-operation-history))))
+         (approved
+          (pcase field
+            ((or 'target 'call) (epi-test-ledger--task4-tool-approved))
+            ('turn (nth 6 drafts))
+            (_ (nth 12 drafts)))))
+    (pcase field
+      ('target
+       (setf (epi-draft-target approved)
+             "10000000-0000-4000-8000-000000000040"))
+      ('turn
+       (setf (epi-draft-turn approved)
+             "30000000-0000-4000-8000-000000000099"))
+      ('operation
+       (setf (epi-draft-operation approved)
+             "20000000-0000-4000-8000-000000000002"))
+      ('call
+       (epi-test-ledger--task4-set-payload approved "call_id" "call-2")))
+    (epi-test-ledger--task4-document
+     (pcase field
+       ((or 'target 'call) (append drafts (list approved)))
+       ('turn (epi-test-ledger--task4-prefix drafts 7))
+       (_ (epi-test-ledger--task4-prefix drafts 13))))))
+
+(defun epi-test-ledger--task4-result-mismatch (field)
+  "Return a full history whose result disagrees with its call on FIELD."
+  (let* ((drafts
+         (cond
+           ((memq field '(parent call))
+            (epi-test-ledger--task4-two-call-history))
+           (t (epi-test-ledger--task4-valid-drafts))))
+         (result
+          (cond
+           ((memq field '(parent call)) (nth 15 drafts))
+           (t (nth 9 drafts)))))
+    (pcase field
+      ('parent
+       (setf (epi-draft-parent result)
+             "10000000-0000-4000-8000-000000000040"))
+      ('turn
+       (setf (epi-draft-turn result)
+             "30000000-0000-4000-8000-000000000099"))
+      ('call
+       (epi-test-ledger--task4-set-result-field result "call_id" "call-2"))
+      ('name
+       (epi-test-ledger--task4-set-result-field result "name" "other_tool"))
+      ('model-result
+       (epi-test-ledger--task4-set-result-field result "result" "different"))
+      ('status
+       (epi-test-ledger--task4-set-result-field result "status" "error")))
+    (epi-test-ledger--task4-document drafts)))
+
+(defun epi-test-ledger--task4-plan-mismatch (field)
+  "Return a valid prefix whose tool-planned envelope disagrees on FIELD."
+  (let* ((drafts
+          (pcase field
+            ('target (epi-test-ledger--task4-two-call-prefix))
+            ('turn (epi-test-ledger--task4-valid-drafts))
+            (_ (epi-test-ledger--task4-two-operation-history))))
+         (plan (pcase field ('target (nth 11 drafts))
+                      ('turn (nth 5 drafts)) (_ (nth 11 drafts)))))
+    (pcase field
+      ('target
+       (setf (epi-draft-target plan)
+             "10000000-0000-4000-8000-000000000040"))
+      ('turn
+       (setf (epi-draft-turn plan)
+             "30000000-0000-4000-8000-000000000099"))
+      ('operation
+       (setf (epi-draft-operation plan)
+             "20000000-0000-4000-8000-000000000002")))
+    (epi-test-ledger--task4-document
+     (epi-test-ledger--task4-prefix
+      drafts (pcase field ('turn 6) (_ 12))))))
+
+(defun epi-test-ledger--task4-tool-fixtures ()
+  "Return static corruption fixtures for tool and terminal semantics."
+  (list
+   (cons "corrupt-orphan-tool-result.org"
+         (epi-test-ledger--task4-document
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started)
+           (epi-test-ledger--task4-turn-started)
+           (epi-test-ledger--task4-text-message
+            epi-test-ledger--task4-user-id "user" "hello"
+            epi-test-ledger--task4-turn-id)
+           (epi-test-ledger--task4-tool-result
+            nil nil nil nil nil epi-test-ledger--task4-user-id))))
+   (cons "corrupt-invalid-tool-status.org"
+         (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+                (envelopes
+                 (mapcar #'epi-test-ledger--task4-draft-envelope
+                         (epi-test-ledger--task4-prefix drafts 9))))
+           (setcdr
+            (assoc "status"
+                   (epi-ledger--object-value (nth 8 envelopes) "payload"))
+            "bogus")
+           (epi-test-ledger--task4-document-from-envelopes envelopes)))
+   (cons "corrupt-invalid-tool-pairing.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 6)
+                    (list (nth 7 drafts))))))
+   (cons "corrupt-duplicate-call-id.org"
+         (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+                (second-proposal
+                 (epi-test-ledger--task4-proposal
+                  "10000000-0000-4000-8000-000000000021"
+                  "call-1" nil nil 1
+                  "10000000-0000-4000-8000-000000000018"))
+                (second-plan
+                 (epi-test-ledger--task4-tool-planned
+                  "10000000-0000-4000-8000-000000000022"
+                  "call-1" nil nil 1
+                  "10000000-0000-4000-8000-000000000021")))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 10)
+                    (list second-proposal second-plan)))))
+   (cons "corrupt-duplicate-terminal.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 11)
+                    (list
+                     (epi-test-ledger--task4-turn-terminal
+                      'turn-finished
+                      "10000000-0000-4000-8000-000000000021"))))))
+   (cons "corrupt-contradictory-terminal.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (setf (nth 10 drafts)
+                 (epi-test-ledger--task4-turn-terminal 'turn-failed))
+           (epi-test-ledger--task4-document drafts)))
+   (cons "corrupt-proposal-call-id-mismatch.org"
+         (epi-test-ledger--task4-proposal-mismatch 'call-id))
+   (cons "corrupt-proposal-name-mismatch.org"
+         (epi-test-ledger--task4-proposal-mismatch 'name))
+   (cons "corrupt-proposal-arguments-mismatch.org"
+         (epi-test-ledger--task4-proposal-mismatch 'arguments))
+   (cons "corrupt-proposal-order-mismatch.org"
+         (epi-test-ledger--task4-proposal-mismatch 'order))
+   (cons "corrupt-plan-target-mismatch.org"
+         (epi-test-ledger--task4-plan-mismatch 'target))
+   (cons "corrupt-plan-turn-mismatch.org"
+         (epi-test-ledger--task4-plan-mismatch 'turn))
+   (cons "corrupt-plan-operation-mismatch.org"
+         (epi-test-ledger--task4-plan-mismatch 'operation))
+   (cons "corrupt-lifecycle-target-mismatch.org"
+         (epi-test-ledger--task4-lifecycle-mismatch 'target))
+   (cons "corrupt-lifecycle-turn-mismatch.org"
+         (epi-test-ledger--task4-lifecycle-mismatch 'turn))
+   (cons "corrupt-lifecycle-operation-mismatch.org"
+         (epi-test-ledger--task4-lifecycle-mismatch 'operation))
+   (cons "corrupt-lifecycle-call-mismatch.org"
+         (epi-test-ledger--task4-lifecycle-mismatch 'call))
+   (cons "corrupt-result-parent-mismatch.org"
+         (epi-test-ledger--task4-result-mismatch 'parent))
+   (cons "corrupt-result-turn-mismatch.org"
+         (epi-test-ledger--task4-result-mismatch 'turn))
+   (cons "corrupt-result-call-mismatch.org"
+         (epi-test-ledger--task4-result-mismatch 'call))
+   (cons "corrupt-result-name-mismatch.org"
+         (epi-test-ledger--task4-result-mismatch 'name))
+   (cons "corrupt-result-model-result-mismatch.org"
+         (epi-test-ledger--task4-result-mismatch 'model-result))
+   (cons "corrupt-result-status-mismatch.org"
+         (epi-test-ledger--task4-result-mismatch 'status))))
+
+(defun epi-test-ledger--task4-wrong-outcome-map (terminal-status)
+  "Return history mapping TERMINAL-STATUS to a wrong success result."
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (finished (nth 8 drafts))
+         (result (nth 9 drafts)))
+    (epi-test-ledger--task4-set-payload finished "status" terminal-status)
+    (epi-test-ledger--task4-set-payload
+     finished "model_result"
+     (if (equal terminal-status "timeout") "Timed out" "Cancelled"))
+    (epi-test-ledger--task4-set-result-field
+     result "result"
+     (if (equal terminal-status "timeout") "Timed out" "Cancelled"))
+    (epi-test-ledger--task4-set-result-field result "status" "success")
+    (epi-test-ledger--task4-document drafts)))
+
+(defun epi-test-ledger--task4-additional-tool-fixtures ()
+  "Return result mapping, uncertainty, adjacency, and ordering fixtures."
+  (list
+   (cons "corrupt-timeout-result-mapping.org"
+         (epi-test-ledger--task4-wrong-outcome-map "timeout"))
+   (cons "corrupt-cancelled-result-mapping.org"
+         (epi-test-ledger--task4-wrong-outcome-map "cancelled"))
+   (cons "corrupt-result-after-uncertain.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (setf (nth 8 drafts)
+                 (epi-test-ledger--task4-tool-finished
+                  nil nil "uncertain"))
+           (epi-test-ledger--task4-document
+            (epi-test-ledger--task4-prefix drafts 10))))
+   (cons "corrupt-missing-required-result.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-document
+            (append
+             (epi-test-ledger--task4-prefix drafts 9)
+             (list
+              (epi-test-ledger--task4-draft
+               "10000000-0000-4000-8000-000000000030"
+               'reasoning
+               `(("text" . "missing result") ("leg" . 0)
+                 ("replay" . ,epi-json-false))
+               :turn epi-test-ledger--task4-turn-id))))))
+   (cons "corrupt-delayed-required-result.org"
+         (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+                (reasoning
+                 (epi-test-ledger--task4-draft
+                  "10000000-0000-4000-8000-000000000030"
+                  'reasoning
+                  `(("text" . "late") ("leg" . 0)
+                    ("replay" . ,epi-json-false))
+                  :turn epi-test-ledger--task4-turn-id)))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 9)
+                    (list reasoning (nth 9 drafts))))))
+   (cons "corrupt-finished-without-start.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 7)
+                    (list (nth 8 drafts))))))
+   (cons "corrupt-orphan-tool-planned.org"
+         (epi-test-ledger--task4-document
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started)
+           (epi-test-ledger--task4-turn-started)
+           (epi-test-ledger--task4-text-message
+            epi-test-ledger--task4-user-id "user" "hello"
+            epi-test-ledger--task4-turn-id)
+           (epi-test-ledger--task4-tool-planned
+            nil nil nil nil nil epi-test-ledger--task4-user-id))))
+   (cons "corrupt-denied-result-mapping.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (setf (nth 6 drafts) (epi-test-ledger--task4-tool-denied))
+           (setf (nth 7 drafts)
+                 (epi-test-ledger--task4-tool-result
+                  nil nil nil "Denied" "error"))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 8)
+                    (list (nth 10 drafts) (nth 11 drafts))))))
+   (cons "corrupt-denied-missing-result.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (setf (nth 6 drafts) (epi-test-ledger--task4-tool-denied))
+           (epi-test-ledger--task4-document
+            (append
+             (epi-test-ledger--task4-prefix drafts 7)
+             (list
+              (epi-test-ledger--task4-draft
+               "10000000-0000-4000-8000-000000000030"
+               'reasoning
+               `(("text" . "missing denied result") ("leg" . 0)
+                 ("replay" . ,epi-json-false))
+               :turn epi-test-ledger--task4-turn-id))))))
+   (cons "corrupt-error-result-mapping.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-set-payload (nth 8 drafts) "status" "error")
+           (epi-test-ledger--task4-set-payload
+            (nth 8 drafts) "model_result" "failed")
+           (epi-test-ledger--task4-set-result-field
+            (nth 9 drafts) "result" "failed")
+           (epi-test-ledger--task4-set-result-field
+            (nth 9 drafts) "status" "success")
+           (epi-test-ledger--task4-document drafts)))
+   (cons "corrupt-opposite-call-terminal.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 10)
+                    (list
+                     (epi-test-ledger--task4-tool-denied
+                      "10000000-0000-4000-8000-000000000030"))))))
+   (cons "corrupt-duplicate-call-terminal.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 10)
+                    (list
+                     (epi-test-ledger--task4-tool-finished
+                      "10000000-0000-4000-8000-000000000030"))))))
+   (cons "corrupt-uncertain-success-terminal.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (setf (nth 8 drafts)
+                 (epi-test-ledger--task4-tool-finished
+                  nil nil "uncertain"))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 9)
+                    (list (nth 10 drafts) (nth 11 drafts))))))
+   (cons "corrupt-orphan-tool-proposal.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-document
+            (append
+             (epi-test-ledger--task4-prefix drafts 5)
+             (list
+              (epi-test-ledger--task4-draft
+               "10000000-0000-4000-8000-000000000030"
+               'reasoning
+               `(("text" . "missing plan") ("leg" . 0)
+                 ("replay" . ,epi-json-false))
+               :turn epi-test-ledger--task4-turn-id))))))
+   (cons "corrupt-delayed-tool-plan.org"
+         (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+                (reasoning
+                 (epi-test-ledger--task4-draft
+                  "10000000-0000-4000-8000-000000000030"
+                  'reasoning
+                  `(("text" . "pause") ("leg" . 0)
+                    ("replay" . ,epi-json-false))
+                  :turn epi-test-ledger--task4-turn-id)))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 5)
+                    (list reasoning (nth 5 drafts))))))
+   (cons "corrupt-call-order-gap.org"
+         (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+                (second-proposal
+                 (epi-test-ledger--task4-proposal
+                  "10000000-0000-4000-8000-000000000021"
+                  "call-2" nil nil 2
+                  "10000000-0000-4000-8000-000000000018"))
+                (second-plan
+                 (epi-test-ledger--task4-tool-planned
+                  "10000000-0000-4000-8000-000000000022"
+                  "call-2" nil nil 2
+                  "10000000-0000-4000-8000-000000000021")))
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-prefix drafts 10)
+                    (list second-proposal second-plan)))))
+   (cons "corrupt-first-call-order-nonzero.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-set-result-field
+            (nth 4 drafts) "order" 1)
+           (epi-test-ledger--task4-set-payload (nth 5 drafts) "order" 1)
+           (epi-test-ledger--task4-document
+            (epi-test-ledger--task4-prefix drafts 6))))
+   (cons "corrupt-duplicate-call-order.org"
+         (let ((drafts (epi-test-ledger--task4-two-call-prefix)))
+           (epi-test-ledger--task4-set-result-field
+            (nth 10 drafts) "order" 0)
+           (epi-test-ledger--task4-set-payload (nth 11 drafts) "order" 0)
+           (epi-test-ledger--task4-document drafts)))
+   (cons "corrupt-result-different-operation.org"
+         (let ((drafts (epi-test-ledger--task4-two-operation-history)))
+           (setf (epi-draft-turn (nth 15 drafts))
+                 "30000000-0000-4000-8000-000000000002")
+           (epi-test-ledger--task4-document drafts)))))
+
+(defun epi-test-ledger--task4-operation-fixtures ()
+  "Return static operation and turn state-machine fixtures."
+  (list
+   (cons "corrupt-duplicate-operation-start.org"
+         (epi-test-ledger--task4-document
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started)
+           (epi-test-ledger--task4-operation-started
+            "10000000-0000-4000-8000-000000000021"))))
+   (cons "corrupt-duplicate-turn-start.org"
+         (epi-test-ledger--task4-document
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started)
+           (epi-test-ledger--task4-turn-started)
+           (epi-test-ledger--task4-text-message
+            epi-test-ledger--task4-user-id "user" "hello"
+            epi-test-ledger--task4-turn-id)
+           (epi-test-ledger--task4-turn-started
+            "10000000-0000-4000-8000-000000000021"))))
+   (cons "corrupt-turn-without-operation.org"
+         (epi-test-ledger--task4-document
+          (list (epi-test-ledger--session-info-draft)
+                (epi-test-ledger--task4-turn-started))))
+   (cons "corrupt-operation-terminal-before-turn.org"
+         (epi-test-ledger--task4-document
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started)
+           (epi-test-ledger--task4-turn-started)
+           (epi-test-ledger--task4-text-message
+            epi-test-ledger--task4-user-id "user" "hello"
+            epi-test-ledger--task4-turn-id)
+           (epi-test-ledger--task4-operation-terminal
+            'operation-finished))))
+   (cons "corrupt-record-after-operation-terminal.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-document
+            (append drafts
+                    (list
+                     (epi-test-ledger--task4-leaf
+                      "10000000-0000-4000-8000-000000000021"
+                      epi-test-ledger--task4-user-id
+                      epi-test-ledger--task4-operation-id))))))
+   (cons "corrupt-duplicate-operation-terminal.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-document
+            (append drafts
+                    (list
+                     (epi-test-ledger--task4-operation-terminal
+                      'operation-finished
+                      "10000000-0000-4000-8000-000000000021"))))))
+   (cons "corrupt-opposite-operation-terminal.org"
+         (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+           (epi-test-ledger--task4-document
+            (append drafts
+                    (list
+                     (epi-test-ledger--task4-operation-terminal
+                      'operation-failed
+                      "10000000-0000-4000-8000-000000000021"))))))))
+
+(defun epi-test-ledger--task4-intent-fixtures ()
+  "Return static turn-started intended-message mismatch fixtures."
+  (list
+   (cons "corrupt-intended-message-id.org"
+         (epi-test-ledger--task4-document
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started)
+           (epi-test-ledger--task4-turn-started)
+           (epi-test-ledger--task4-text-message
+            "10000000-0000-4000-8000-000000000098"
+            "user" "hello" epi-test-ledger--task4-turn-id))))
+   (cons "corrupt-intended-message-role.org"
+         (epi-test-ledger--task4-document
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started)
+           (epi-test-ledger--task4-turn-started)
+           (epi-test-ledger--task4-text-message
+            epi-test-ledger--task4-user-id
+            "assistant" "hello" epi-test-ledger--task4-turn-id))))
+   (cons "corrupt-intended-message-turn.org"
+         (let ((second-operation
+                "20000000-0000-4000-8000-000000000002")
+               (second-turn "30000000-0000-4000-8000-000000000002")
+               (second-user "10000000-0000-4000-8000-000000000098"))
+           (epi-test-ledger--task4-document
+            (list
+             (epi-test-ledger--session-info-draft)
+             (epi-test-ledger--task4-operation-started)
+             (epi-test-ledger--task4-turn-started)
+             (epi-test-ledger--task4-turn-terminal 'turn-interrupted)
+             (epi-test-ledger--task4-operation-terminal
+              'operation-interrupted)
+             (epi-test-ledger--task4-operation-started
+              "10000000-0000-4000-8000-000000000091" second-operation)
+             (epi-test-ledger--task4-turn-started
+              "10000000-0000-4000-8000-000000000092"
+              second-turn second-operation second-user)
+             (epi-test-ledger--task4-text-message
+              second-user "user" "current" second-turn)
+             (epi-test-ledger--task4-text-message
+              epi-test-ledger--task4-user-id "user" "wrong turn"
+              second-turn second-user)))))))
+
+(defun epi-test-ledger--task4-torn-fixtures ()
+  "Return one valid-prefix fixture for each incomplete final-frame region."
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (prefix
+          (epi-test-ledger--task4-document
+           (epi-test-ledger--task4-prefix drafts 3)))
+         (through-message
+          (epi-test-ledger--task4-document
+           (epi-test-ledger--task4-prefix drafts 4)))
+         (frame (substring through-message (length prefix)))
+         (drawer (string-match ":PROPERTIES:\n" frame))
+         (begin (string-match (regexp-quote "#+begin_epi-json\n") frame))
+         (json-start (+ begin (length "#+begin_epi-json\n")))
+         (json-end
+          (string-match (regexp-quote "\n#+end_epi-json\n")
+                        frame json-start))
+         (end-start (1+ json-end)))
+    (list
+     (cons "torn-final-headline.org"
+           (concat prefix (substring frame 0 7)))
+     (cons "torn-final-drawer.org"
+           (concat prefix (substring frame 0 (+ drawer 19))))
+     (cons "torn-final-begin-block.org"
+           (concat prefix (substring frame 0 (+ begin 9))))
+     (cons "torn-final-json.org"
+           (concat prefix
+                   (substring frame 0 (+ json-start
+                                         (/ (- json-end json-start) 2)))))
+     (cons "torn-final-end-block.org"
+           (concat prefix (substring frame 0 (+ end-start 9)))))))
+
+(defun epi-test-ledger--task4-fixture-documents ()
+  "Return the complete deterministic Task 4 static fixture manifest."
+  (append (epi-test-ledger--task4-basic-fixtures)
+          (epi-test-ledger--task4-tool-fixtures)
+          (epi-test-ledger--task4-additional-tool-fixtures)
+          (epi-test-ledger--task4-operation-fixtures)
+          (epi-test-ledger--task4-intent-fixtures)
+          (epi-test-ledger--task4-torn-fixtures)))
+
+(defun epi-test-ledger--task4-valid-outcome-history (status)
+  "Return a valid complete history for tool outcome STATUS."
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (pcase status
+      ('denied
+       (setf (nth 6 drafts) (epi-test-ledger--task4-tool-denied))
+       (setf (nth 7 drafts)
+             (epi-test-ledger--task4-tool-result
+              nil nil nil "Denied" "denied"))
+       (append (epi-test-ledger--task4-prefix drafts 8)
+               (list (nth 10 drafts) (nth 11 drafts))))
+      ((or 'error 'timeout 'cancelled)
+       (let* ((status-text (symbol-name status))
+              (model-result
+               (pcase status
+                 ('error "failed") ('timeout "Timed out") (_ "Cancelled"))))
+         (epi-test-ledger--task4-set-payload
+          (nth 8 drafts) "status" status-text)
+         (epi-test-ledger--task4-set-payload
+          (nth 8 drafts) "model_result" model-result)
+         (epi-test-ledger--task4-set-result-field
+          (nth 9 drafts) "result" model-result)
+         (epi-test-ledger--task4-set-result-field
+          (nth 9 drafts) "status" "error")
+         (when (eq status 'cancelled)
+           (setf (nth 10 drafts)
+                 (epi-test-ledger--task4-turn-terminal 'turn-cancelled)
+                 (nth 11 drafts)
+                 (epi-test-ledger--task4-operation-terminal
+                  'operation-cancelled)))
+         drafts))
+      ('uncertain-failed
+       (append
+        (epi-test-ledger--task4-prefix drafts 8)
+        (list
+         (epi-test-ledger--task4-tool-finished nil nil "uncertain")
+         (let ((turn (epi-test-ledger--task4-turn-terminal 'turn-failed)))
+           (epi-test-ledger--task4-set-payload turn "code" "tool-uncertain"))
+         (let ((operation
+                (epi-test-ledger--task4-operation-terminal
+                 'operation-failed)))
+           (epi-test-ledger--task4-set-payload
+            operation "code" "tool-uncertain")))))
+      ('uncertain-interrupted
+       (append
+        (epi-test-ledger--task4-prefix drafts 8)
+        (list
+         (epi-test-ledger--task4-tool-finished nil nil "uncertain")
+         (let ((turn
+                (epi-test-ledger--task4-turn-terminal 'turn-interrupted)))
+           (epi-test-ledger--task4-set-payload
+            turn "reason" "tool-uncertain"))
+         (let ((operation
+                (epi-test-ledger--task4-operation-terminal
+                 'operation-interrupted)))
+           (epi-test-ledger--task4-set-payload
+            operation "reason" "tool-uncertain")))))
+      (_ drafts))))
+
+(defun epi-test-ledger--task4-uncertain-prefix ()
+  "Return history through a committed uncertain tool terminal."
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (append (epi-test-ledger--task4-prefix drafts 8)
+            (list (epi-test-ledger--task4-tool-finished
+                   nil nil "uncertain")))))
+
+(defun epi-test-ledger--task4-uncertain-turn-terminal
+    (class &optional detail)
+  "Return an uncertainty turn terminal of CLASS with DETAIL."
+  (let* ((type (if (eq class 'failed) 'turn-failed 'turn-interrupted))
+         (terminal (epi-test-ledger--task4-turn-terminal type)))
+    (epi-test-ledger--task4-set-payload
+     terminal (if (eq class 'failed) "code" "reason")
+     (or detail "tool-uncertain"))))
+
+(defun epi-test-ledger--task4-uncertain-operation-terminal
+    (class &optional detail)
+  "Return an uncertainty operation terminal of CLASS with DETAIL."
+  (let* ((type (if (eq class 'failed)
+                   'operation-failed
+                 'operation-interrupted))
+         (terminal (epi-test-ledger--task4-operation-terminal type)))
+    (epi-test-ledger--task4-set-payload
+     terminal (if (eq class 'failed) "code" "reason")
+     (or detail "tool-uncertain"))))
+
+(defun epi-test-ledger--task4-select-leaf-prefix ()
+  "Return a completed prompt history followed by a select-leaf start."
+  (append
+   (list
+    (epi-test-ledger--session-info-draft)
+    (epi-test-ledger--task4-operation-started)
+    (epi-test-ledger--task4-turn-started)
+    (epi-test-ledger--task4-text-message
+     epi-test-ledger--task4-user-id "user" "select me"
+     epi-test-ledger--task4-turn-id)
+    (epi-test-ledger--task4-turn-terminal 'turn-finished)
+    (epi-test-ledger--task4-operation-terminal 'operation-finished))
+   (list
+    (epi-test-ledger--task4-operation-started
+     "10000000-0000-4000-8000-000000000090"
+     "20000000-0000-4000-8000-000000000090"
+     "select-leaf"))))
+
+(defun epi-test-ledger--task4-select-leaf-terminal (class)
+  "Return the second operation's terminal for CLASS."
+  (epi-test-ledger--task4-operation-terminal
+   (pcase class
+     ('success 'operation-finished)
+     ('failed 'operation-failed)
+     (_ 'operation-interrupted))
+   "10000000-0000-4000-8000-000000000092"
+   "20000000-0000-4000-8000-000000000090"))
+
+(defun epi-test-ledger--task4-assert-open-code (drafts expected)
+  "Assert that opening DRAFTS fails with EXPECTED semantic code."
+  (let ((bytes (epi-test-ledger--task4-document drafts)))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((condition
+             (should-error (epi-ledger-open file)
+                           :type 'epi-ledger-corrupt)))
+        (should (eq expected
+                    (epi-test-ledger--condition-code condition)))))))
+
+(defun epi-test-ledger--task4-valid-control-cases ()
+  "Return named programmatic positive histories for Task 4."
+  (let ((base (epi-test-ledger--task4-valid-drafts)))
+    `((clean-complete . ,base)
+      (intended-message-exact . ,(epi-test-ledger--task4-prefix
+                                  (epi-test-ledger--task4-valid-drafts) 4))
+      (intended-message-absent . ,(epi-test-ledger--task4-prefix
+                                   (epi-test-ledger--task4-valid-drafts) 3))
+      (unfinished-operation . ,(epi-test-ledger--task4-prefix
+                                (epi-test-ledger--task4-valid-drafts) 2))
+      (unfinished-turn . ,(epi-test-ledger--task4-prefix
+                           (epi-test-ledger--task4-valid-drafts) 4))
+      (unfinished-planned . ,(epi-test-ledger--task4-prefix
+                              (epi-test-ledger--task4-valid-drafts) 6))
+      (unfinished-approved . ,(epi-test-ledger--task4-prefix
+                               (epi-test-ledger--task4-valid-drafts) 7))
+      (unfinished-started . ,(epi-test-ledger--task4-prefix
+                              (epi-test-ledger--task4-valid-drafts) 8))
+      (outcome-denied . ,(epi-test-ledger--task4-valid-outcome-history
+                          'denied))
+      (outcome-success . ,(epi-test-ledger--task4-valid-outcome-history
+                           'success))
+      (outcome-error . ,(epi-test-ledger--task4-valid-outcome-history
+                         'error))
+      (outcome-timeout . ,(epi-test-ledger--task4-valid-outcome-history
+                           'timeout))
+      (outcome-cancelled . ,(epi-test-ledger--task4-valid-outcome-history
+                             'cancelled))
+      (outcome-uncertain-failed .
+                                ,(epi-test-ledger--task4-valid-outcome-history
+                                  'uncertain-failed))
+      (outcome-uncertain-interrupted .
+                                     ,(epi-test-ledger--task4-valid-outcome-history
+                                       'uncertain-interrupted)))))
+
+(defun epi-test-ledger--write-task4-fixtures ()
+  "Materialize the deterministic Task 4 fixture documents.
+This developer helper is never called by the test suite."
+  (let ((directory
+         (expand-file-name "test/fixtures/ledger/" epi-test-repository-root)))
+    (make-directory directory t)
+    (dolist (entry (epi-test-ledger--task4-fixture-documents))
+      (let ((file (expand-file-name (car entry) directory))
+            (bytes (cdr entry)))
+        (with-temp-buffer
+          (set-buffer-multibyte nil)
+          (insert bytes)
+          (let ((coding-system-for-write 'no-conversion)
+                (write-region-annotate-functions nil)
+                (write-region-post-annotation-function nil))
+            (write-region (point-min) (point-max) file nil 'silent)))))))
+
+(defconst epi-test-ledger--task4-static-fixture-names
+  '("corrupt-bad-header.org"
+    "corrupt-missing-session-info.org"
+    "corrupt-duplicate-session-info.org"
+    "corrupt-nonfirst-session-info.org"
+    "corrupt-session-id-mismatch.org"
+    "corrupt-unsupported-format.org"
+    "corrupt-unsupported-schema.org"
+    "corrupt-duplicate-id.org"
+    "corrupt-forward-parent.org"
+    "corrupt-forward-target.org"
+    "corrupt-wrong-family-target.org"
+    "corrupt-missing-target.org"
+    "corrupt-wrong-family-parent.org"
+    "corrupt-operation-envelope-payload-id.org"
+    "corrupt-turn-envelope-payload-id.org"
+    "corrupt-turn-operation-payload-id.org"
+    "corrupt-previous-hash.org"
+    "corrupt-payload-hash.org"
+    "corrupt-property-mismatch.org"
+    "corrupt-bytes-after-fragment.org"
+    "corrupt-orphan-tool-result.org"
+    "corrupt-invalid-tool-status.org"
+    "corrupt-invalid-tool-pairing.org"
+    "corrupt-duplicate-call-id.org"
+    "corrupt-duplicate-terminal.org"
+    "corrupt-contradictory-terminal.org"
+    "corrupt-proposal-call-id-mismatch.org"
+    "corrupt-proposal-name-mismatch.org"
+    "corrupt-proposal-arguments-mismatch.org"
+    "corrupt-proposal-order-mismatch.org"
+    "corrupt-plan-target-mismatch.org"
+    "corrupt-plan-turn-mismatch.org"
+    "corrupt-plan-operation-mismatch.org"
+    "corrupt-lifecycle-target-mismatch.org"
+    "corrupt-lifecycle-turn-mismatch.org"
+    "corrupt-lifecycle-operation-mismatch.org"
+    "corrupt-lifecycle-call-mismatch.org"
+    "corrupt-result-parent-mismatch.org"
+    "corrupt-result-turn-mismatch.org"
+    "corrupt-result-call-mismatch.org"
+    "corrupt-result-name-mismatch.org"
+    "corrupt-result-model-result-mismatch.org"
+    "corrupt-result-status-mismatch.org"
+    "corrupt-timeout-result-mapping.org"
+    "corrupt-cancelled-result-mapping.org"
+    "corrupt-result-after-uncertain.org"
+    "corrupt-missing-required-result.org"
+    "corrupt-delayed-required-result.org"
+    "corrupt-finished-without-start.org"
+    "corrupt-orphan-tool-planned.org"
+    "corrupt-denied-result-mapping.org"
+    "corrupt-denied-missing-result.org"
+    "corrupt-error-result-mapping.org"
+    "corrupt-opposite-call-terminal.org"
+    "corrupt-duplicate-call-terminal.org"
+    "corrupt-uncertain-success-terminal.org"
+    "corrupt-orphan-tool-proposal.org"
+    "corrupt-delayed-tool-plan.org"
+    "corrupt-call-order-gap.org"
+    "corrupt-first-call-order-nonzero.org"
+    "corrupt-duplicate-call-order.org"
+    "corrupt-result-different-operation.org"
+    "corrupt-duplicate-operation-start.org"
+    "corrupt-duplicate-turn-start.org"
+    "corrupt-turn-without-operation.org"
+    "corrupt-operation-terminal-before-turn.org"
+    "corrupt-record-after-operation-terminal.org"
+    "corrupt-duplicate-operation-terminal.org"
+    "corrupt-opposite-operation-terminal.org"
+    "corrupt-intended-message-id.org"
+    "corrupt-intended-message-role.org"
+    "corrupt-intended-message-turn.org"
+    "torn-final-headline.org"
+    "torn-final-drawer.org"
+    "torn-final-begin-block.org"
+    "torn-final-json.org"
+    "torn-final-end-block.org")
+  "Exact checked-in Task 4 static fixture set.")
+
+(defun epi-test-ledger--task4-expected-code (file)
+  "Return the frozen structured loader error code for fixture FILE."
+  (cond
+   ((string-prefix-p "torn-" file) 'truncated-frame)
+   ((equal file "corrupt-bad-header.org") 'invalid-header-line)
+   ((equal file "corrupt-previous-hash.org") 'previous-hash-mismatch)
+   ((equal file "corrupt-payload-hash.org") 'record-hash-mismatch)
+   ((equal file "corrupt-property-mismatch.org")
+    'drawer-json-disagreement)
+   ((member file '("corrupt-missing-required-result.org"
+                   "corrupt-denied-missing-result.org"))
+    'delayed-required-result)
+   ((equal file "corrupt-orphan-tool-proposal.org")
+    'delayed-tool-plan)
+   ((equal file "corrupt-nonfirst-session-info.org")
+    'missing-session-info)
+   (t
+    (intern (string-remove-suffix
+             ".org" (string-remove-prefix "corrupt-" file))))))
+
+(defconst epi-test-ledger--task4-expected-locations
+  '(("corrupt-bad-header.org" 0 nil)
+    ("corrupt-missing-session-info.org" 1 nil)
+    ("corrupt-duplicate-session-info.org" 2
+     "10000000-0000-4000-8000-000000000002")
+    ("corrupt-nonfirst-session-info.org" 1
+     "10000000-0000-4000-8000-000000000010")
+    ("corrupt-session-id-mismatch.org" 1
+     "10000000-0000-4000-8000-000000000001")
+    ("corrupt-unsupported-format.org" 0 nil)
+    ("corrupt-unsupported-schema.org" 1
+     "10000000-0000-4000-8000-000000000001")
+    ("corrupt-duplicate-id.org" 2
+     "10000000-0000-4000-8000-000000000001")
+    ("corrupt-forward-parent.org" 4
+     "10000000-0000-4000-8000-000000000012")
+    ("corrupt-forward-target.org" 3
+     "10000000-0000-4000-8000-000000000011")
+    ("corrupt-wrong-family-target.org" 3
+     "10000000-0000-4000-8000-000000000011")
+    ("corrupt-missing-target.org" 3
+     "10000000-0000-4000-8000-000000000011")
+    ("corrupt-wrong-family-parent.org" 4
+     "10000000-0000-4000-8000-000000000012")
+    ("corrupt-operation-envelope-payload-id.org" 2
+     "10000000-0000-4000-8000-000000000010")
+    ("corrupt-turn-envelope-payload-id.org" 3
+     "10000000-0000-4000-8000-000000000011")
+    ("corrupt-turn-operation-payload-id.org" 3
+     "10000000-0000-4000-8000-000000000011")
+    ("corrupt-previous-hash.org" 4
+     "10000000-0000-4000-8000-000000000012")
+    ("corrupt-payload-hash.org" 1
+     "10000000-0000-4000-8000-000000000001")
+    ("corrupt-property-mismatch.org" 1
+     "10000000-0000-4000-8000-000000000001")
+    ("corrupt-bytes-after-fragment.org" 4
+     "10000000-0000-4000-8000-000000000012")
+    ("corrupt-orphan-tool-result.org" 5
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-invalid-tool-status.org" 9
+     "10000000-0000-4000-8000-000000000017")
+    ("corrupt-invalid-tool-pairing.org" 7
+     "10000000-0000-4000-8000-000000000016")
+    ("corrupt-duplicate-call-id.org" 11
+     "10000000-0000-4000-8000-000000000021")
+    ("corrupt-duplicate-terminal.org" 12
+     "10000000-0000-4000-8000-000000000021")
+    ("corrupt-contradictory-terminal.org" 12
+     "10000000-0000-4000-8000-000000000020")
+    ("corrupt-proposal-call-id-mismatch.org" 6
+     "10000000-0000-4000-8000-000000000014")
+    ("corrupt-proposal-name-mismatch.org" 6
+     "10000000-0000-4000-8000-000000000014")
+    ("corrupt-proposal-arguments-mismatch.org" 6
+     "10000000-0000-4000-8000-000000000014")
+    ("corrupt-proposal-order-mismatch.org" 6
+     "10000000-0000-4000-8000-000000000014")
+    ("corrupt-plan-target-mismatch.org" 12
+     "10000000-0000-4000-8000-000000000014")
+    ("corrupt-plan-turn-mismatch.org" 6
+     "10000000-0000-4000-8000-000000000014")
+    ("corrupt-plan-operation-mismatch.org" 12
+     "10000000-0000-4000-8000-000000000014")
+    ("corrupt-lifecycle-target-mismatch.org" 13
+     "10000000-0000-4000-8000-000000000015")
+    ("corrupt-lifecycle-turn-mismatch.org" 7
+     "10000000-0000-4000-8000-000000000015")
+    ("corrupt-lifecycle-operation-mismatch.org" 13
+     "10000000-0000-4000-8000-000000000015")
+    ("corrupt-lifecycle-call-mismatch.org" 13
+     "10000000-0000-4000-8000-000000000015")
+    ("corrupt-result-parent-mismatch.org" 16
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-result-turn-mismatch.org" 10
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-result-call-mismatch.org" 16
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-result-name-mismatch.org" 10
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-result-model-result-mismatch.org" 10
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-result-status-mismatch.org" 10
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-timeout-result-mapping.org" 10
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-cancelled-result-mapping.org" 10
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-result-after-uncertain.org" 10
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-missing-required-result.org" 10
+     "10000000-0000-4000-8000-000000000030")
+    ("corrupt-delayed-required-result.org" 10
+     "10000000-0000-4000-8000-000000000030")
+    ("corrupt-finished-without-start.org" 8
+     "10000000-0000-4000-8000-000000000017")
+    ("corrupt-orphan-tool-planned.org" 5
+     "10000000-0000-4000-8000-000000000014")
+    ("corrupt-denied-result-mapping.org" 8
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-denied-missing-result.org" 8
+     "10000000-0000-4000-8000-000000000030")
+    ("corrupt-error-result-mapping.org" 10
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-opposite-call-terminal.org" 11
+     "10000000-0000-4000-8000-000000000030")
+    ("corrupt-duplicate-call-terminal.org" 11
+     "10000000-0000-4000-8000-000000000030")
+    ("corrupt-uncertain-success-terminal.org" 10
+     "10000000-0000-4000-8000-000000000019")
+    ("corrupt-orphan-tool-proposal.org" 6
+     "10000000-0000-4000-8000-000000000030")
+    ("corrupt-delayed-tool-plan.org" 6
+     "10000000-0000-4000-8000-000000000030")
+    ("corrupt-call-order-gap.org" 11
+     "10000000-0000-4000-8000-000000000021")
+    ("corrupt-first-call-order-nonzero.org" 5
+     "10000000-0000-4000-8000-000000000013")
+    ("corrupt-duplicate-call-order.org" 11
+     "10000000-0000-4000-8000-000000000013")
+    ("corrupt-result-different-operation.org" 16
+     "10000000-0000-4000-8000-000000000018")
+    ("corrupt-duplicate-operation-start.org" 3
+     "10000000-0000-4000-8000-000000000021")
+    ("corrupt-duplicate-turn-start.org" 5
+     "10000000-0000-4000-8000-000000000021")
+    ("corrupt-turn-without-operation.org" 2
+     "10000000-0000-4000-8000-000000000011")
+    ("corrupt-operation-terminal-before-turn.org" 5
+     "10000000-0000-4000-8000-000000000020")
+    ("corrupt-record-after-operation-terminal.org" 13
+     "10000000-0000-4000-8000-000000000021")
+    ("corrupt-duplicate-operation-terminal.org" 13
+     "10000000-0000-4000-8000-000000000021")
+    ("corrupt-opposite-operation-terminal.org" 13
+     "10000000-0000-4000-8000-000000000021")
+    ("corrupt-intended-message-id.org" 4
+     "10000000-0000-4000-8000-000000000098")
+    ("corrupt-intended-message-role.org" 4
+     "10000000-0000-4000-8000-000000000012")
+    ("corrupt-intended-message-turn.org" 9
+     "10000000-0000-4000-8000-000000000012")
+    ("torn-final-headline.org" 4 nil)
+    ("torn-final-drawer.org" 4
+     "10000000-0000-4000-8000-000000000012")
+    ("torn-final-begin-block.org" 4
+     "10000000-0000-4000-8000-000000000012")
+    ("torn-final-json.org" 4
+     "10000000-0000-4000-8000-000000000012")
+    ("torn-final-end-block.org" 4
+     "10000000-0000-4000-8000-000000000012"))
+  "Exact offending sequence and recoverable record ID for each fixture.")
+
+(defconst epi-test-ledger--task4-representative-offsets
+  '(("corrupt-bad-header.org" . 0)
+    ("corrupt-previous-hash.org" . 3217)
+    ("corrupt-payload-hash.org" . 668)
+    ("corrupt-property-mismatch.org" . 430)
+    ("corrupt-bytes-after-fragment.org" . 3640)
+    ("corrupt-plan-operation-mismatch.org" . 10268)
+    ("corrupt-result-different-operation.org" . 14089)
+    ("torn-final-headline.org" . 3224)
+    ("torn-final-json.org" . 3783))
+  "Frozen byte offsets spanning header, frame, semantic, and torn failures.")
+
+(ert-deftest epi-ledger-open-static-fixtures-match-builders ()
+  (let* ((documents (epi-test-ledger--task4-fixture-documents))
+         (generated-names (mapcar #'car documents))
+         (directory
+          (expand-file-name "test/fixtures/ledger/" epi-test-repository-root))
+         (disk-names
+          (seq-filter
+           (lambda (name)
+             (or (string-prefix-p "corrupt-" name)
+                 (string-prefix-p "torn-" name)))
+           (directory-files directory nil "\\.org\\'"))))
+    (should (= (length generated-names)
+               (length (delete-dups (copy-sequence generated-names)))))
+    (should (equal (sort (copy-sequence
+                          epi-test-ledger--task4-static-fixture-names)
+                         #'string<)
+                   (sort (copy-sequence generated-names) #'string<)))
+    (should (equal (sort (copy-sequence generated-names) #'string<)
+                   (sort disk-names #'string<)))
+    (should
+     (equal (sort (copy-sequence generated-names) #'string<)
+            (sort (mapcar #'car
+                          epi-test-ledger--task4-expected-locations)
+                  #'string<)))
+    (dolist (entry documents)
+      (should
+       (equal (cdr entry)
+              (epi-test-ledger--literal-file-bytes
+               (expand-file-name (car entry) directory)))))))
+
+(ert-deftest epi-ledger-open-torn-fixtures-end-in-one-incomplete-frame ()
+  (dolist (file (seq-filter
+                 (lambda (name) (string-prefix-p "torn-" name))
+                 epi-test-ledger--task4-static-fixture-names))
+    (let* ((bytes (epi-test-ledger--fixture-bytes (concat "ledger/" file)))
+           (header (epi-ledger-parse-header bytes))
+           (offset (epi-header-end-offset header))
+           (sequence 1)
+           result)
+      (while (< offset (length bytes))
+        (setq result (epi-ledger--scan-frame bytes offset sequence))
+        (if (eq (plist-get result :state) 'complete)
+            (setq offset (plist-get result :next-offset)
+                  sequence (1+ sequence))
+          (setq offset (length bytes))))
+      (should (eq 'incomplete (plist-get result :state)))
+      (should (= 4 sequence)))))
+
+(dolist (file epi-test-ledger--task4-static-fixture-names)
+  (let ((test-name
+         (intern
+          (concat "epi-ledger-open-static-"
+                  (string-remove-suffix ".org" file))))
+        (condition-type
+         (if (string-prefix-p "torn-" file)
+             'epi-ledger-truncated-tail
+           'epi-ledger-corrupt))
+        (code (epi-test-ledger--task4-expected-code file))
+        (location (assoc file epi-test-ledger--task4-expected-locations))
+        (representative-offset
+         (cdr (assoc file epi-test-ledger--task4-representative-offsets))))
+    (eval
+     `(ert-deftest ,test-name ()
+        (let* ((path
+                (expand-file-name
+                 ,(concat "test/fixtures/ledger/" file)
+                 epi-test-repository-root))
+               (condition
+                (should-error (epi-ledger-open path)
+                              :type ',condition-type))
+               (detail (car (cdr condition))))
+          (should (= 2 (length condition)))
+          (should (proper-list-p detail))
+          (should (zerop (% (length detail) 2)))
+          (should (eq :code (car detail)))
+          (should (eq ',code (plist-get detail :code)))
+          (dolist (key '(:path :sequence :record-id :offset :cause))
+            (should (plist-member detail key)))
+          (should (equal (file-truename path) (plist-get detail :path)))
+          (should (= ,(nth 1 location) (plist-get detail :sequence)))
+          (should (equal ,(nth 2 location) (plist-get detail :record-id)))
+          (should (integerp (plist-get detail :offset)))
+          ,@(when representative-offset
+              `((should (= ,representative-offset
+                           (plist-get detail :offset)))))
+          (let ((cause (plist-get detail :cause)))
+            (should (proper-list-p cause))
+            (should (= 2 (length cause)))
+            (should (eq :code (car cause)))
+            (should (symbolp (plist-get cause :code)))))))))
+
+(dolist (case (epi-test-ledger--task4-valid-control-cases))
+  (let ((test-name
+         (intern (format "epi-ledger-open-accepts-%s" (car case))))
+        (drafts (cdr case)))
+    (eval
+     `(ert-deftest ,test-name ()
+        (let ((bytes (epi-test-ledger--task4-document ',drafts)))
+          (epi-test-ledger--with-document-file (file bytes)
+            (let ((ledger (epi-ledger-open file)))
+              (should (= ,(length drafts)
+                         (length (epi-ledger-records ledger))))
+              (should (= (length bytes)
+                         (epi-ledger-validated-end-offset ledger))))))))))
+
+(ert-deftest epi-ledger-open-semantic-fixtures-have-valid-physical-chains ()
+  (let ((excluded
+         '("corrupt-bad-header.org"
+           "corrupt-unsupported-format.org"
+           "corrupt-unsupported-schema.org"
+           "corrupt-invalid-tool-status.org"
+           "corrupt-operation-envelope-payload-id.org"
+           "corrupt-turn-envelope-payload-id.org"
+           "corrupt-turn-operation-payload-id.org"
+           "corrupt-previous-hash.org"
+           "corrupt-payload-hash.org"
+           "corrupt-property-mismatch.org"
+           "corrupt-bytes-after-fragment.org")))
+    (dolist (file epi-test-ledger--task4-static-fixture-names)
+      (unless (or (string-prefix-p "torn-" file)
+                  (member file excluded))
+        (let* ((bytes
+                (epi-test-ledger--fixture-bytes (concat "ledger/" file)))
+               (header (epi-ledger-parse-header bytes))
+               (offset (epi-header-end-offset header))
+               (tail (epi-header-hash header))
+               (sequence 1))
+          (while (< offset (length bytes))
+            (let* ((scan (epi-ledger--scan-frame bytes offset sequence))
+                   (record (plist-get scan :record)))
+              (should (eq 'complete (plist-get scan :state)))
+              (should (equal tail (epi-record-previous-hash record)))
+              (setq tail (epi-record-hash record)
+                    offset (plist-get scan :next-offset)
+                    sequence (1+ sequence)))))))))
+
+(ert-deftest epi-ledger-open-task4-instrumentation-uses-private-seams ()
+  (let* ((source
+          (epi-test-ledger--literal-file-bytes
+           (expand-file-name "test/epi-ledger-codec-test.el"
+                             epi-test-repository-root)))
+         (start
+          (string-match
+           "^(defconst epi-test-ledger--task4-session-id" source))
+         (task4-source (and start (substring source start))))
+    (should task4-source)
+    (dolist (primitive
+             '(insert-file-contents-literally write-region delete-file
+               rename-file make-directory set-file-modes display-buffer
+               pop-to-buffer find-file-noselect))
+      (should-not
+       (string-match-p
+        (regexp-quote (format "(symbol-function '%s)" primitive))
+        task4-source)))))
+
+(ert-deftest epi-ledger-open-validates-monotonically-then-rereads-bounded-head ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (epi-test-ledger--task4-valid-drafts)))
+        (epi-ledger-work-byte-limit 256))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((original epi-ledger--open-source-inserter)
+            (original-head epi-ledger--open-head-inserter)
+            ranges head-ranges ledger)
+        (let ((epi-ledger--open-source-inserter
+               (lambda (path &optional visit begin end replace)
+                 (when (equal (file-truename path) (file-truename file))
+                   (push (cons (or begin 0) (or end (length bytes)))
+                         ranges))
+                 (funcall original path visit begin end replace)))
+              (epi-ledger--open-head-inserter
+               (lambda (path &optional visit begin end replace)
+                 (when (equal (file-truename path) (file-truename file))
+                   (push (cons begin end) head-ranges))
+                 (funcall original-head path visit begin end replace))))
+          (setq ledger (epi-ledger-open file)))
+        (setq ranges (nreverse ranges)
+              head-ranges (nreverse head-ranges))
+        (let ((cursor 0))
+          (dolist (range ranges)
+            (should (= cursor (car range)))
+            (should (<= (car range) (cdr range)))
+            (setq cursor (cdr range)))
+          (should (= (length bytes) cursor)))
+        (let* ((records (epi-ledger-records ledger))
+               (last (aref records (1- (length records))))
+               (cursor (epi-record-start-offset last))
+               (end (epi-record-json-start-offset last)))
+          (should head-ranges)
+          (dolist (range head-ranges)
+            (should (= cursor (car range)))
+            (should (<= (- (cdr range) (car range))
+                        epi-ledger-work-byte-limit))
+            (setq cursor (cdr range)))
+          (should (= end cursor)))))))
+
+(ert-deftest epi-ledger-open-maps-a-short-final-head-read ()
+  (let* ((bytes
+          (epi-test-ledger--task4-document
+           (list (epi-test-ledger--session-info-draft))))
+         (header (epi-ledger-parse-header bytes))
+         (record
+          (plist-get
+           (epi-ledger--scan-frame bytes (epi-header-end-offset header) 1)
+           :record))
+         (epi-ledger-work-byte-limit 256))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((original epi-ledger--open-head-inserter))
+        (let ((epi-ledger--open-head-inserter
+               (lambda (path &optional visit begin end replace)
+                 (funcall original path visit begin (1- end) replace))))
+          (let* ((condition
+                  (should-error (epi-ledger-open file)
+                                :type 'epi-ledger-corrupt))
+                 (detail (car (cdr condition))))
+            (should (eq 'short-ledger-read (plist-get detail :code)))
+            (should (equal (file-truename file) (plist-get detail :path)))
+            (should (= 2 (plist-get detail :sequence)))
+            (should (equal (epi-record--raw-id record)
+                           (plist-get detail :record-id)))
+            (should (= (epi-record--raw-start-offset record)
+                       (plist-get detail :offset)))
+            (should (equal '(:code short-ledger-read)
+                           (plist-get detail :cause)))))))))
+
+(ert-deftest epi-ledger-open-maps-a-final-head-reader-error ()
+  (let* ((bytes
+          (epi-test-ledger--task4-document
+           (list (epi-test-ledger--session-info-draft))))
+         (header (epi-ledger-parse-header bytes))
+         (record
+          (plist-get
+           (epi-ledger--scan-frame bytes (epi-header-end-offset header) 1)
+           :record))
+         (epi-ledger-work-byte-limit 256))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger--open-head-inserter
+             (lambda (&rest _arguments)
+               (signal 'file-error '("injected final head read error")))))
+        (let* ((condition
+                (should-error (epi-ledger-open file)
+                              :type 'epi-ledger-corrupt))
+               (detail (car (cdr condition))))
+          (should (eq 'ledger-read-failed (plist-get detail :code)))
+          (should (equal (file-truename file) (plist-get detail :path)))
+          (should (= 2 (plist-get detail :sequence)))
+          (should (equal (epi-record--raw-id record)
+                         (plist-get detail :record-id)))
+          (should (= (epi-record--raw-start-offset record)
+                     (plist-get detail :offset)))
+          (should (equal '(:code ledger-read-failed)
+                         (plist-get detail :cause))))))))
+
+(ert-deftest epi-ledger-open-does-not-render-or-recanonicalize-records ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (epi-test-ledger--task4-valid-drafts)))
+        (encoder-calls 0)
+        (render-calls 0)
+        (original-encoder (symbol-function 'epi-ledger--jcs-encode))
+        (original-record-renderer (symbol-function 'epi-ledger-render-record))
+        (original-header-renderer (symbol-function 'epi-ledger-render-header)))
+    (epi-test-ledger--with-document-file (file bytes)
+      (cl-letf (((symbol-function 'epi-ledger--jcs-encode)
+                 (lambda (&rest arguments)
+                   (setq encoder-calls (1+ encoder-calls))
+                   (apply original-encoder arguments)))
+                ((symbol-function 'epi-ledger-render-record)
+                 (lambda (&rest arguments)
+                   (setq render-calls (1+ render-calls))
+                   (apply original-record-renderer arguments)))
+                ((symbol-function 'epi-ledger-render-header)
+                 (lambda (&rest arguments)
+                   (setq render-calls (1+ render-calls))
+                   (apply original-header-renderer arguments))))
+        (epi-ledger-open file)))
+    (should (= 0 encoder-calls))
+    (should (= 0 render-calls))))
+
+(ert-deftest epi-ledger-open-record-json-passes-are-exact-and-distinct ()
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (bytes (epi-test-ledger--task4-document drafts))
+         (original-hash (symbol-function 'epi-ledger--source-hash))
+         (original-lex (symbol-function 'epi-ledger--jcs-validate-bytes))
+         (original-decode (symbol-function 'epi-ledger--decode-json-source))
+         hashed lexed decoded events)
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger--nonpreemptible-observer
+             (lambda (event) (push event events))))
+        (cl-letf (((symbol-function 'epi-ledger--source-hash)
+                   (lambda (input field)
+                     (when (eq field 'record)
+                       (push input hashed))
+                     (funcall original-hash input field)))
+                  ((symbol-function 'epi-ledger--jcs-validate-bytes)
+                   (lambda (&rest arguments)
+                     (push (car arguments) lexed)
+                     (apply original-lex arguments)))
+                  ((symbol-function 'epi-ledger--decode-json-source)
+                   (lambda (input)
+                     (push input decoded)
+                     (funcall original-decode input))))
+          (epi-ledger-open file))))
+    (setq hashed (nreverse hashed)
+          lexed (nreverse lexed)
+          decoded (nreverse decoded)
+          events (nreverse events))
+    (should (= (length drafts) (length hashed)))
+    (should (= (length hashed) (length lexed) (length decoded)))
+    (cl-mapc (lambda (hash-input lex-input decode-input)
+               (should (eq hash-input lex-input))
+               (should (eq lex-input decode-input)))
+             hashed lexed decoded)
+    (let* ((stored-json-bytes
+            (apply #'+ (mapcar #'epi-ledger--source-length hashed)))
+           (hash-events
+            (seq-filter
+             (lambda (event)
+               (and (eq 'hash (plist-get event :kind))
+                    (eq 'record (plist-get event :field))))
+             events))
+           (decode-events
+            (seq-filter
+             (lambda (event)
+               (and (eq 'decode (plist-get event :kind))
+                    (eq 'record-json (plist-get event :field))))
+             events)))
+      (should (= (length drafts) (length hash-events)))
+      (should (= (length drafts) (length decode-events)))
+      (should (= stored-json-bytes
+                 (apply #'+ (mapcar (lambda (event)
+                                      (plist-get event :bytes))
+                                    hash-events))))
+      (should (= stored-json-bytes
+                 (apply #'+ (mapcar (lambda (event)
+                                      (plist-get event :bytes))
+                                    decode-events)))))))
+
+(defun epi-test-ledger--task4-inertness-snapshot (files)
+  "Return complete read-only loader state for existing FILES."
+  (list
+   :files
+   (mapcar
+    (lambda (file)
+      (let* ((canonical (file-truename file))
+             (attributes (file-attributes canonical 'string))
+             (directory (file-name-directory canonical))
+             (basename (file-name-nondirectory canonical)))
+        (list
+         canonical
+         (list (file-attribute-device-number attributes)
+               (file-attribute-inode-number attributes)
+               (file-attribute-link-number attributes)
+               (file-attribute-size attributes)
+               (file-attribute-modification-time attributes)
+               (file-attribute-status-change-time attributes)
+               (file-modes canonical))
+         (epi-test-ledger--literal-file-bytes canonical)
+         (seq-filter
+          (lambda (name) (string-match-p (regexp-quote basename) name))
+          (directory-files directory nil nil t)))))
+    files)
+   :features (mapcar #'featurep '(org ob gptel))
+   :buffers
+   (mapcar
+    (lambda (buffer)
+      (list buffer
+            (buffer-name buffer)
+            (buffer-local-value 'buffer-file-name buffer)
+            (buffer-local-value 'major-mode buffer)
+            (buffer-modified-p buffer)))
+    (buffer-list))
+   :current-buffer (current-buffer)
+   :selected-window (selected-window)
+   :selected-window-buffer (window-buffer (selected-window))))
+
+(ert-deftest epi-ledger-open-performs-no-write-or-recovery-side-effects ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (list (epi-test-ledger--session-info-draft)))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((before (epi-test-ledger--task4-inertness-snapshot (list file))))
+        (should (epi-ledger-p (epi-ledger-open file)))
+        (should
+         (equal before
+                (epi-test-ledger--task4-inertness-snapshot (list file))))))))
+
+(ert-deftest epi-ledger-open-static-matrix-remains-byte-identical-and-artifact-free ()
+  (let* ((directory
+          (expand-file-name "test/fixtures/ledger/" epi-test-repository-root))
+         (files
+          (mapcar (lambda (name) (expand-file-name name directory))
+                  epi-test-ledger--task4-static-fixture-names))
+         (before (epi-test-ledger--task4-inertness-snapshot files)))
+    (dolist (file files)
+      (should-error
+       (epi-ledger-open file)
+       :type (if (string-prefix-p "torn-" (file-name-nondirectory file))
+                 'epi-ledger-truncated-tail
+               'epi-ledger-corrupt)))
+    (should (equal before (epi-test-ledger--task4-inertness-snapshot files)))))
+
+(ert-deftest epi-ledger-open-revalidates-file-identity-before-publication ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (list (epi-test-ledger--session-info-draft)))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((calls 0)
+            (original epi-ledger--open-identity-reader)
+            (before (epi-test-ledger--task4-inertness-snapshot (list file))))
+        (let ((epi-ledger--open-identity-reader
+               (lambda (path)
+                 (let ((identity (funcall original path)))
+                   (setq calls (1+ calls))
+                   (if (= calls 2)
+                       (append identity '(:race t))
+                     identity)))))
+          (let ((condition
+                 (should-error (epi-ledger-open file)
+                               :type 'epi-ledger-conflict)))
+            (should (eq 'file-identity-changed
+                        (epi-test-ledger--condition-code condition)))))
+        (should (= 2 calls))
+        (should
+         (equal before
+                (epi-test-ledger--task4-inertness-snapshot (list file))))))))
+
+(ert-deftest epi-ledger-open-public-records-and-header-are-defensive ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (list (epi-test-ledger--session-info-draft)))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let* ((ledger (epi-ledger-open file))
+             (header (epi-ledger-header ledger))
+             (record (aref (epi-ledger-records ledger) 0)))
+        (aset header 3 "90000000-0000-4000-8000-000000000009")
+        (aset record 1 "90000000-0000-4000-8000-000000000010")
+        (setcdr (assoc "session_id" (aref record 11))
+                "90000000-0000-4000-8000-000000000011")
+        (should (equal epi-test-ledger--task4-session-id
+                       (epi-header-session-id (epi-ledger-header ledger))))
+        (let ((fresh (aref (epi-ledger-records ledger) 0)))
+          (should (equal "10000000-0000-4000-8000-000000000001"
+                         (epi-record-id fresh)))
+          (should (equal epi-test-ledger--task4-session-id
+                         (epi-ledger--object-value
+                          (epi-record-payload fresh) "session_id"))))))))
+
+(ert-deftest epi-ledger-open-indexes-the-retained-record-objects ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (epi-test-ledger--task4-valid-drafts))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let* ((ledger (epi-ledger-open file))
+             (checkpoint (epi-ledger--checkpoint-snapshot ledger))
+             (records (epi-ledger--checkpoint-raw-records checkpoint))
+             (by-id (epi-ledger--checkpoint-raw-by-id checkpoint))
+             (identity
+              (epi-ledger--checkpoint-raw-file-identity checkpoint))
+             (turn-index
+              (epi-ledger--checkpoint-raw-turn-operation-index checkpoint))
+             (tool-facts
+              (epi-ledger--checkpoint-raw-tool-facts checkpoint))
+             (call (gethash "call-1" tool-facts)))
+        (epi-ledger--record-source-each
+         records
+         (lambda (record)
+           (should (eq record (gethash (epi-record--raw-id record) by-id)))
+           (should-not (epi-record--raw-sealed-json record))))
+        (should (equal (file-truename file) (plist-get identity :path)))
+        (should (= (length bytes) (plist-get identity :size)))
+        (should (= (length bytes)
+                   (epi-ledger--checkpoint-raw-validated-end-offset
+                    checkpoint)))
+        (should (equal (epi-record--raw-hash
+                        (epi-ledger--record-source-elt records 11))
+                       (epi-ledger--checkpoint-raw-tail-hash checkpoint)))
+        (should (equal epi-test-ledger--task4-operation-id
+                       (gethash epi-test-ledger--task4-turn-id turn-index)))
+        (should (eq (epi-ledger--record-source-elt records 4)
+                    (plist-get call :proposal)))
+        (should (eq (epi-ledger--record-source-elt records 5)
+                    (plist-get call :plan)))
+        (should (eq (epi-ledger--record-source-elt records 8)
+                    (plist-get call :terminal)))
+        (should (eq (epi-ledger--record-source-elt records 9)
+                    (plist-get call :result)))))))
+
+(ert-deftest epi-ledger-open-yields-under-the-record-budget ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (epi-test-ledger--task4-valid-drafts)))
+        (epi-ledger-work-record-limit 2)
+        (epi-ledger-work-byte-limit 1048576)
+        (epi-ledger-work-time-budget 1000.0)
+        (yields 0))
+    (epi-test-ledger--with-document-file (file bytes)
+      (cl-letf (((symbol-function 'epi--deadline-time) (lambda () 0.0))
+                ((symbol-function 'epi--yield)
+                 (lambda () (setq yields (1+ yields)))))
+        (epi-ledger-open file)))
+    (should (>= yields 5))))
+
+(ert-deftest epi-ledger-open-bounds-each-source-read-by-byte-budget ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (epi-test-ledger--task4-valid-drafts)))
+        (epi-ledger-work-record-limit 1000)
+        (epi-ledger-work-byte-limit 512)
+        (epi-ledger-work-time-budget 1000.0))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((original epi-ledger--open-source-inserter)
+            ranges)
+        (let ((epi-ledger--open-source-inserter
+               (lambda (path &optional visit begin end replace)
+                 (when (equal (file-truename path) (file-truename file))
+                   (push (cons (or begin 0) (or end (length bytes)))
+                         ranges))
+                 (funcall original path visit begin end replace))))
+          (epi-ledger-open file))
+        (should (> (length ranges) 1))
+        (dolist (range ranges)
+          (should (<= (- (cdr range) (car range)) 512)))))))
+
+(ert-deftest epi-ledger-open-rejects-an-oversized-header-at-the-cap ()
+  (let ((bytes (make-string 4096 ?x))
+        (epi-record-frame-byte-limit 1024)
+        (epi-ledger-work-byte-limit 128)
+        (collector (list nil)))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger--open-work-observer collector))
+        (let ((condition
+               (should-error (epi-ledger-open file)
+                             :type 'epi-ledger-corrupt)))
+          (should (eq 'header-byte-limit
+                      (epi-test-ledger--condition-code condition))))))
+    (let ((reads
+           (seq-filter
+            (lambda (event) (eq (plist-get event :field) 'source-read))
+            (car collector))))
+      (should reads)
+      (should (<= (apply #'max (mapcar (lambda (event)
+                                        (plist-get event :end))
+                                      reads))
+                  epi-record-frame-byte-limit)))))
+
+(ert-deftest epi-ledger-open-reports-a-short-truncated-header-at-eof ()
+  (let ((bytes (make-string 900 ?x))
+        (epi-record-frame-byte-limit 1024)
+        (epi-ledger-work-byte-limit 128)
+        (collector (list nil)))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger--open-work-observer collector))
+        (let ((condition
+               (should-error (epi-ledger-open file)
+                             :type 'epi-ledger-corrupt)))
+          (should (eq 'truncated-header
+                      (epi-test-ledger--condition-code condition))))))
+    (let ((reads
+           (seq-filter
+            (lambda (event) (eq (plist-get event :field) 'source-read))
+            (car collector))))
+      (should reads)
+      (should (= (length bytes)
+                 (apply #'max (mapcar (lambda (event)
+                                       (plist-get event :end))
+                                     reads)))))))
+
+(ert-deftest epi-ledger-open-does-not-intern-a-hostile-record-type ()
+  (let* ((hostile-type (concat "never-intern-" (make-string 24 ?z)))
+         (bytes
+          (epi-test-ledger--task4-document
+           (list (epi-test-ledger--session-info-draft))))
+         (headline-start (string-match "^\* session-info " bytes))
+         (type-start (+ headline-start 2))
+         (type-end (+ type-start (length "session-info")))
+         (hostile-bytes
+          (concat (substring bytes 0 type-start)
+                  hostile-type
+                  (substring bytes type-end))))
+    (should-not (intern-soft hostile-type))
+    (epi-test-ledger--with-document-file (file hostile-bytes)
+      (should-error (epi-ledger-open file) :type 'epi-ledger-corrupt))
+    (should-not (intern-soft hostile-type))))
+
+(ert-deftest epi-ledger-open-requires-an-adjacent-uncertainty-terminal ()
+  (epi-test-ledger--task4-assert-open-code
+   (append
+    (epi-test-ledger--task4-uncertain-prefix)
+    (list
+     (epi-test-ledger--task4-draft
+      "10000000-0000-4000-8000-000000000090" 'reasoning
+      `(("text" . "not a terminal") ("leg" . 0)
+        ("replay" . ,epi-json-false))
+      :turn epi-test-ledger--task4-turn-id)))
+   'uncertain-terminal-adjacency))
+
+(ert-deftest epi-ledger-open-requires-exact-uncertainty-terminal-detail ()
+  (dolist (case '((failed . "provider")
+                  (interrupted . "interrupted")))
+    (epi-test-ledger--task4-assert-open-code
+     (append
+      (epi-test-ledger--task4-uncertain-prefix)
+      (list
+       (epi-test-ledger--task4-uncertain-turn-terminal
+        (car case) (cdr case))))
+     'uncertain-terminal-detail)))
+
+(ert-deftest epi-ledger-open-requires-a-matched-uncertainty-terminal-pair ()
+  (epi-test-ledger--task4-assert-open-code
+   (append
+    (epi-test-ledger--task4-uncertain-prefix)
+    (list
+     (epi-test-ledger--task4-uncertain-turn-terminal 'interrupted)
+     (epi-test-ledger--task4-uncertain-operation-terminal 'failed)))
+   'uncertain-terminal-adjacency))
+
+(ert-deftest epi-ledger-open-blocks-admission-after-completed-uncertainty ()
+  (epi-test-ledger--task4-assert-open-code
+   (append
+    (epi-test-ledger--task4-uncertain-prefix)
+    (list
+     (epi-test-ledger--task4-uncertain-turn-terminal 'failed)
+     (epi-test-ledger--task4-uncertain-operation-terminal 'failed)
+     (epi-test-ledger--task4-operation-started
+      "10000000-0000-4000-8000-000000000090"
+      "20000000-0000-4000-8000-000000000090")))
+   'record-after-uncertainty))
+
+(ert-deftest epi-ledger-open-accepts-exact-uncertainty-crash-barriers ()
+  (dolist (class '(failed interrupted))
+    (let* ((prefix (epi-test-ledger--task4-uncertain-prefix))
+           (turn (epi-test-ledger--task4-uncertain-turn-terminal class))
+           (operation
+            (epi-test-ledger--task4-uncertain-operation-terminal class)))
+      (dolist (drafts (list prefix
+                            (append prefix (list turn))
+                            (append prefix (list turn operation))))
+        (let ((bytes (epi-test-ledger--task4-document drafts)))
+          (epi-test-ledger--with-document-file (file bytes)
+            (should (epi-ledger-p (epi-ledger-open file)))))))))
+
+(ert-deftest epi-ledger-open-rejects-a-record-after-its-turn-terminal ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (epi-test-ledger--task4-assert-open-code
+     (append
+      (epi-test-ledger--task4-prefix drafts 4)
+      (list
+       (epi-test-ledger--task4-turn-terminal 'turn-finished)
+       (epi-test-ledger--task4-draft
+        "10000000-0000-4000-8000-000000000090" 'reasoning
+        `(("text" . "too late") ("leg" . 0)
+          ("replay" . ,epi-json-false))
+        :turn epi-test-ledger--task4-turn-id)))
+     'record-after-turn-terminal)))
+
+(ert-deftest epi-ledger-open-allows-only-one-turn-per-agent-operation ()
+  (let ((second-turn "30000000-0000-4000-8000-000000000090")
+        (second-message "10000000-0000-4000-8000-000000000091"))
+    (epi-test-ledger--task4-assert-open-code
+     (list
+      (epi-test-ledger--session-info-draft)
+      (epi-test-ledger--task4-operation-started)
+      (epi-test-ledger--task4-turn-started)
+      (epi-test-ledger--task4-text-message
+       epi-test-ledger--task4-user-id "user" "first"
+       epi-test-ledger--task4-turn-id)
+      (epi-test-ledger--task4-turn-terminal 'turn-finished)
+      (epi-test-ledger--task4-turn-started
+       "10000000-0000-4000-8000-000000000092"
+       second-turn epi-test-ledger--task4-operation-id second-message))
+     'operation-turn-limit)))
+
+(ert-deftest epi-ledger-open-requires-intended-input-before-progress ()
+  (epi-test-ledger--task4-assert-open-code
+   (list
+    (epi-test-ledger--session-info-draft)
+    (epi-test-ledger--task4-operation-started)
+    (epi-test-ledger--task4-turn-started)
+    (epi-test-ledger--task4-draft
+     "10000000-0000-4000-8000-000000000090" 'reasoning
+     `(("text" . "premature") ("leg" . 0)
+       ("replay" . ,epi-json-false))
+     :turn epi-test-ledger--task4-turn-id))
+   'intended-message-adjacency))
+
+(ert-deftest epi-ledger-open-requires-intended-input-before-normal-terminal ()
+  (epi-test-ledger--task4-assert-open-code
+   (list
+    (epi-test-ledger--session-info-draft)
+    (epi-test-ledger--task4-operation-started)
+    (epi-test-ledger--task4-turn-started)
+    (epi-test-ledger--task4-turn-terminal 'turn-finished))
+   'intended-message-adjacency))
+
+(ert-deftest epi-ledger-open-allows-interrupted-recovery-before-input ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started)
+           (epi-test-ledger--task4-turn-started)
+           (epi-test-ledger--task4-turn-terminal 'turn-interrupted)
+           (epi-test-ledger--task4-operation-terminal
+            'operation-interrupted)))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (should (epi-ledger-p (epi-ledger-open file))))))
+
+(ert-deftest epi-ledger-open-requires-a-truly-forward-message-intent ()
+  (epi-test-ledger--task4-assert-open-code
+   (list
+    (epi-test-ledger--session-info-draft)
+    (epi-test-ledger--task4-operation-started)
+    (epi-test-ledger--task4-turn-started
+     nil nil nil "10000000-0000-4000-8000-000000000010"))
+   'intended-message-not-forward))
+
+(ert-deftest epi-ledger-open-requires-a-unique-message-intent ()
+  (let ((absent-message "10000000-0000-4000-8000-000000000090")
+        (second-operation "20000000-0000-4000-8000-000000000090")
+        (second-turn "30000000-0000-4000-8000-000000000090"))
+    (epi-test-ledger--task4-assert-open-code
+     (list
+      (epi-test-ledger--session-info-draft)
+      (epi-test-ledger--task4-operation-started)
+      (epi-test-ledger--task4-turn-started nil nil nil absent-message)
+      (epi-test-ledger--task4-turn-terminal 'turn-interrupted)
+      (epi-test-ledger--task4-operation-terminal 'operation-interrupted)
+      (epi-test-ledger--task4-operation-started
+       "10000000-0000-4000-8000-000000000091" second-operation)
+      (epi-test-ledger--task4-turn-started
+       "10000000-0000-4000-8000-000000000092"
+       second-turn second-operation absent-message))
+     'duplicate-intended-message)))
+
+(ert-deftest epi-ledger-open-charges-dense-frame-scan-and-copy-cadence ()
+  (let* ((operation-count 40)
+         (record-count (1+ (* operation-count 5)))
+         (bytes (epi-test-ledger--task4-dense-document operation-count))
+         (epi-ledger-work-byte-limit 512)
+         (collector (list nil)))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger--open-work-observer collector))
+        (should (= (length bytes)
+                   (epi-ledger-validated-end-offset
+                    (epi-ledger-open file))))))
+    (let* ((events (car collector))
+           (frame-copies
+            (seq-filter
+             (lambda (event) (eq (plist-get event :field) 'frame-copy))
+             events))
+           (header-copies
+            (seq-filter
+             (lambda (event) (eq (plist-get event :field) 'header-copy))
+             events))
+           (charged
+            (seq-filter
+             (lambda (event) (memq (plist-get event :kind) '(copy scan)))
+             events)))
+      (should-not frame-copies)
+      (should-not header-copies)
+      (should charged)
+      (dolist (event charged)
+        (if (eq (plist-get event :kind) 'scan)
+            (should (<= (plist-get event :bytes)
+                        epi-ledger-work-byte-limit))
+          (should (eq (plist-get event :bounded)
+                      (<= (plist-get event :bytes)
+                          epi-ledger-work-byte-limit)))))
+      (should (<= (apply #'+ (mapcar (lambda (event)
+                                      (plist-get event :bytes))
+                                    (seq-filter
+                                     (lambda (event)
+                                       (eq (plist-get event :kind) 'copy))
+                                     events)))
+                  (* 3 (length bytes)))))))
+
+(ert-deftest epi-ledger-open-maximum-json-yields-inside-the-record ()
+  (let* ((bytes (epi-test-ledger--task4-maximum-json-document))
+         (record-start (string-match "^\\* session-info " bytes))
+         (epi-ledger-work-record-limit 256)
+         (epi-ledger-work-byte-limit 1048576)
+         (epi-ledger-work-time-budget 1000.0)
+         (collector (list nil))
+         (original epi-ledger--open-source-inserter)
+         (bytes-read 0)
+         ranges yields-at)
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger--open-work-observer collector)
+            (epi-ledger--open-source-inserter
+             (lambda (path &optional visit begin end replace)
+               (when (equal (file-truename path) (file-truename file))
+                 (setq bytes-read (or end (length bytes)))
+                 (push (cons (or begin 0) bytes-read) ranges))
+               (funcall original path visit begin end replace))))
+        (cl-letf (((symbol-function 'epi--deadline-time) (lambda () 0.0))
+                  ((symbol-function 'epi--yield)
+                   (lambda () (push bytes-read yields-at))))
+          (let ((ledger (epi-ledger-open file)))
+            (should (= (length bytes)
+                       (epi-ledger-validated-end-offset ledger)))))))
+    (setq ranges (sort ranges (lambda (left right)
+                                (< (car left) (car right)))))
+    (let ((cursor 0))
+      (dolist (range ranges)
+        (should (= cursor (car range)))
+        (should (<= (- (cdr range) (car range))
+                    epi-ledger-work-byte-limit))
+        (setq cursor (cdr range)))
+      (should (= (length bytes) cursor)))
+    (should
+     (seq-some (lambda (offset)
+                 (and (> offset record-start) (< offset (length bytes))))
+               yields-at))
+    (let ((events (car collector)))
+      (dolist (event
+               (seq-filter
+                (lambda (candidate)
+                  (eq (plist-get candidate :kind) 'copy))
+                events))
+        (should (plist-get event :bounded))
+        (should (<= (plist-get event :bytes)
+                    epi-ledger-work-byte-limit)))
+      (dolist (event
+               (seq-filter
+                (lambda (candidate)
+                  (eq (plist-get candidate :kind) 'scan))
+                events))
+        (should (<= (plist-get event :bytes)
+                    epi-ledger-work-byte-limit))))))
+
+(ert-deftest epi-ledger-open-time-budget-adds-cooperative-yields ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (epi-test-ledger--task4-valid-drafts)))
+        (epi-ledger-work-record-limit 1000)
+        (epi-ledger-work-byte-limit 1048576))
+    (cl-labels
+        ((yield-count
+          (budget)
+          (epi-test-ledger--with-document-file (file bytes)
+            (let ((epi-ledger-work-time-budget budget)
+                  (clock 0.0)
+                  (yields 0))
+              (cl-letf (((symbol-function 'epi--deadline-time)
+                         (lambda () (setq clock (+ clock 0.01))))
+                        ((symbol-function 'epi--yield)
+                         (lambda () (setq yields (1+ yields)))))
+                (epi-ledger-open file))
+              yields))))
+      (should (> (yield-count 0.0) (yield-count 1000.0))))))
+
+(ert-deftest epi-ledger-open-rejects-record-after-unfinished-tool-state ()
+  (dolist (prefix-length '(6 7 8))
+    (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+           (reasoning
+            (epi-test-ledger--task4-draft
+             "10000000-0000-4000-8000-000000000090" 'reasoning
+             `(("text" . "not a final suffix") ("leg" . 0)
+               ("replay" . ,epi-json-false))
+             :turn epi-test-ledger--task4-turn-id))
+           (bytes
+            (epi-test-ledger--task4-document
+             (append (epi-test-ledger--task4-prefix drafts prefix-length)
+                     (list reasoning)))))
+      (epi-test-ledger--with-document-file (file bytes)
+        (let ((condition
+               (should-error (epi-ledger-open file)
+                             :type 'epi-ledger-corrupt)))
+          (should (eq 'invalid-tool-pairing
+                      (epi-test-ledger--condition-code condition))))))))
+
+(ert-deftest epi-ledger-open-rejects-denial-after-approval ()
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (bytes
+          (epi-test-ledger--task4-document
+           (append (epi-test-ledger--task4-prefix drafts 7)
+                   (list (epi-test-ledger--task4-tool-denied))))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((condition
+             (should-error (epi-ledger-open file)
+                           :type 'epi-ledger-corrupt)))
+        (should (eq 'invalid-tool-pairing
+                    (epi-test-ledger--condition-code condition)))))))
+
+(ert-deftest epi-ledger-open-rejects-unknown-turn-and-operation-ownership ()
+  (let* ((unknown-turn "30000000-0000-4000-8000-000000000099")
+         (unknown-operation "20000000-0000-4000-8000-000000000099")
+         (message-bytes
+          (epi-test-ledger--task4-document
+           (list
+            (epi-test-ledger--session-info-draft)
+            (epi-test-ledger--task4-text-message
+             "10000000-0000-4000-8000-000000000090"
+             "user" "orphan" unknown-turn))))
+         (drafts (epi-test-ledger--task4-valid-drafts))
+         (leaf-bytes
+          (epi-test-ledger--task4-document
+           (append
+            (epi-test-ledger--task4-prefix drafts 4)
+            (list
+             (epi-test-ledger--task4-draft
+              "10000000-0000-4000-8000-000000000091" 'leaf nil
+              :target epi-test-ledger--task4-user-id
+              :operation unknown-operation))))))
+    (dolist (case `((,message-bytes . missing-turn)
+                    (,leaf-bytes . missing-operation)))
+      (epi-test-ledger--with-document-file (file (car case))
+        (let ((condition
+               (should-error (epi-ledger-open file)
+                             :type 'epi-ledger-corrupt)))
+          (should (eq (cdr case)
+                      (epi-test-ledger--condition-code condition))))))))
+
+(ert-deftest epi-ledger-open-accepts-exact-turnless-select-leaf-operation ()
+  (let* ((drafts
+          (append
+           (epi-test-ledger--task4-select-leaf-prefix)
+           (list (epi-test-ledger--task4-leaf)
+                 (epi-test-ledger--task4-select-leaf-terminal 'success))))
+         (bytes (epi-test-ledger--task4-document drafts)))
+    (epi-test-ledger--with-document-file (file bytes)
+      (should (= (length drafts)
+                 (length (epi-ledger-records (epi-ledger-open file))))))))
+
+(ert-deftest epi-ledger-open-accepts-select-leaf-crash-prefixes ()
+  (let* ((prefix (epi-test-ledger--task4-select-leaf-prefix))
+         (leaf (epi-test-ledger--task4-leaf)))
+    (dolist
+        (drafts
+         (list
+          prefix
+          (append prefix (list leaf))
+          (append prefix
+                  (list (epi-test-ledger--task4-select-leaf-terminal
+                         'failed)))
+          (append prefix
+                  (list (epi-test-ledger--task4-select-leaf-terminal
+                         'interrupted)))
+          (append prefix
+                  (list leaf
+                        (epi-test-ledger--task4-select-leaf-terminal
+                         'failed)))
+          (append prefix
+                  (list leaf
+                        (epi-test-ledger--task4-select-leaf-terminal
+                         'interrupted)))))
+      (let ((bytes (epi-test-ledger--task4-document drafts)))
+        (epi-test-ledger--with-document-file (file bytes)
+          (should (epi-ledger-p (epi-ledger-open file))))))))
+
+(ert-deftest epi-ledger-open-requires-one-leaf-before-selection-success ()
+  (epi-test-ledger--task4-assert-open-code
+   (append
+    (epi-test-ledger--task4-select-leaf-prefix)
+    (list (epi-test-ledger--task4-select-leaf-terminal 'success)))
+   'select-leaf-count))
+
+(ert-deftest epi-ledger-open-rejects-a-second-selection-leaf ()
+  (epi-test-ledger--task4-assert-open-code
+   (append
+    (epi-test-ledger--task4-select-leaf-prefix)
+    (list
+     (epi-test-ledger--task4-leaf)
+     (epi-test-ledger--task4-leaf
+      "10000000-0000-4000-8000-000000000093")))
+   'select-leaf-order))
+
+(ert-deftest epi-ledger-open-requires-leaf-selection-operation-ownership ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (epi-test-ledger--task4-assert-open-code
+     (append
+      (epi-test-ledger--task4-prefix drafts 4)
+      (list
+       (epi-test-ledger--task4-leaf
+        "10000000-0000-4000-8000-000000000090"
+        epi-test-ledger--task4-user-id
+        epi-test-ledger--task4-operation-id)))
+     'leaf-operation-kind)))
+
+(ert-deftest epi-ledger-open-rejects-nonleaf-selection-progress ()
+  (epi-test-ledger--task4-assert-open-code
+   (append
+    (epi-test-ledger--task4-select-leaf-prefix)
+    (list
+     (epi-test-ledger--session-info-draft
+      nil "10000000-0000-4000-8000-000000000093")))
+   'select-leaf-order))
+
+(ert-deftest epi-ledger-open-preserves-earliest-missing-reference-precedence ()
+  (let* ((record-id "10000000-0000-4000-8000-000000000011")
+         (drafts
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started nil nil "select-leaf")
+           (epi-test-ledger--task4-leaf
+            record-id "10000000-0000-4000-8000-000000000099"
+            epi-test-ledger--task4-operation-id)
+           (epi-test-ledger--session-info-draft
+            nil "10000000-0000-4000-8000-000000000093")))
+         (bytes (epi-test-ledger--task4-document drafts)))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let* ((condition
+              (should-error (epi-ledger-open file)
+                            :type 'epi-ledger-corrupt))
+             (detail (car (cdr condition))))
+        (should (eq 'missing-target (plist-get detail :code)))
+        (should (= 3 (plist-get detail :sequence)))
+        (should (equal record-id (plist-get detail :record-id)))))))
+
+(ert-deftest epi-ledger-open-preserves-earliest-forward-reference-precedence ()
+  (let* ((future-id "10000000-0000-4000-8000-000000000099")
+         (record-id epi-test-ledger--task4-user-id)
+         (drafts
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started)
+           (epi-test-ledger--task4-turn-started)
+           (epi-test-ledger--task4-text-message
+            record-id "user" "input" epi-test-ledger--task4-turn-id
+            future-id)
+           (epi-test-ledger--session-info-draft
+            nil "10000000-0000-4000-8000-000000000093")
+           (epi-test-ledger--task4-text-message
+            future-id "user" "future" epi-test-ledger--task4-turn-id)))
+         (bytes (epi-test-ledger--task4-document drafts)))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let* ((condition
+              (should-error (epi-ledger-open file)
+                            :type 'epi-ledger-corrupt))
+             (detail (car (cdr condition))))
+        (should (eq 'forward-parent (plist-get detail :code)))
+        (should (= 4 (plist-get detail :sequence)))
+        (should (equal record-id (plist-get detail :record-id)))))))
+
+(ert-deftest epi-ledger-open-preserves-reference-over-invalid-suffix ()
+  (let* ((record-id "10000000-0000-4000-8000-000000000011")
+         (drafts
+          (list
+           (epi-test-ledger--session-info-draft)
+           (epi-test-ledger--task4-operation-started nil nil "select-leaf")
+           (epi-test-ledger--task4-leaf
+            record-id "10000000-0000-4000-8000-000000000099"
+            epi-test-ledger--task4-operation-id)
+           (epi-test-ledger--task4-operation-terminal 'operation-failed)))
+         (valid (epi-test-ledger--task4-document drafts))
+         (cases
+          (list
+           (epi-test-ledger--task4-document-with-broken-final-chain drafts)
+           (epi-test-ledger--task4-replace-once
+            valid "\"code\":\"provider\"" "\"code\":\"provideR\"")
+           (substring valid 0 (- (length valid) 7))))
+         observed)
+    (dolist (bytes cases)
+      (epi-test-ledger--with-document-file (file bytes)
+        (let* ((condition
+                (should-error (epi-ledger-open file)
+                              :type 'epi-ledger-error))
+               (detail (car (cdr condition))))
+          (push (list (car condition)
+                      (plist-get detail :code)
+                      (plist-get detail :sequence)
+                      (plist-get detail :record-id))
+                observed))))
+    (should
+     (equal (nreverse observed)
+            (make-list 3 (list 'epi-ledger-corrupt 'missing-target 3
+                               record-id))))))
+
+(ert-deftest epi-ledger-open-requires-cancelled-outer-terminal ()
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (finished (nth 8 drafts))
+         (result (nth 9 drafts)))
+    (epi-test-ledger--task4-set-payload finished "status" "cancelled")
+    (epi-test-ledger--task4-set-payload
+     finished "model_result" "Cancelled")
+    (epi-test-ledger--task4-set-result-field result "result" "Cancelled")
+    (epi-test-ledger--task4-set-result-field result "status" "error")
+    (let ((bytes (epi-test-ledger--task4-document drafts)))
+      (epi-test-ledger--with-document-file (file bytes)
+        (let ((condition
+               (should-error (epi-ledger-open file)
+                             :type 'epi-ledger-corrupt)))
+          (should (eq 'tool-cause-terminal-mismatch
+                      (epi-test-ledger--condition-code condition))))))))
+
+(defun epi-test-ledger--literal-file-bytes (file)
+  "Return the exact unibyte contents of FILE."
+  (with-temp-buffer
+    (set-buffer-multibyte nil)
+    (insert-file-contents-literally file)
+    (buffer-substring-no-properties (point-min) (point-max))))
+
+(cl-defmacro epi-test-ledger--with-document-file ((file bytes) &body body)
+  "Write unibyte BYTES to temporary FILE, evaluate BODY, then remove it."
+  (declare (indent 1) (debug ((symbolp form) body)))
+  `(let ((,file (make-temp-file "epi-ledger-open-" nil ".org")))
+     (unwind-protect
+         (progn
+           (with-temp-buffer
+             (set-buffer-multibyte nil)
+             (insert ,bytes)
+             (let ((coding-system-for-write 'no-conversion)
+                   (write-region-annotate-functions nil)
+                   (write-region-post-annotation-function nil))
+               (write-region (point-min) (point-max) ,file nil 'silent)))
+           ,@body)
+       (when (file-exists-p ,file)
+         (delete-file ,file)))))
+
+(ert-deftest epi-ledger-open-loads-a-clean-session-read-only ()
+  (let ((bytes
+         (epi-test-ledger--document-bytes
+          (list (epi-test-ledger--session-info-draft)))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let* ((ledger (epi-ledger-open file))
+             (records (epi-ledger-records ledger))
+             (path (epi-ledger-path ledger)))
+        (should (= 1 (length records)))
+        (should (eq 'session-info (epi-record-type (aref records 0))))
+        (should (equal "11111111-1111-4111-8111-111111111111"
+                       (epi-ledger-session-id ledger)))
+        (should (= (length bytes) (epi-ledger-validated-end-offset ledger)))
+        (aset records 0 nil)
+        (aset path 0 ?X)
+        (should (eq 'session-info
+                    (epi-record-type (aref (epi-ledger-records ledger) 0))))
+        (should (equal (file-truename file) (epi-ledger-path ledger)))))))
+
+(ert-deftest epi-ledger-open-identifies-corrupt-record ()
+  (let* ((path
+          (expand-file-name
+           "test/fixtures/ledger/corrupt-previous-hash.org"
+           epi-test-repository-root))
+         (condition
+          (should-error (epi-ledger-open path)
+                        :type 'epi-ledger-corrupt))
+         (detail (car (cdr condition))))
+    (should (eq 'previous-hash-mismatch
+                (epi-test-ledger--condition-code condition)))
+    (should (= 4 (plist-get detail :sequence)))
+    (should (equal epi-test-ledger--task4-user-id
+                   (plist-get detail :record-id)))))
+
+(ert-deftest epi-ledger-open-rejects-header-without-session-info ()
+  (let ((bytes (epi-ledger-render-header (epi-test-ledger--header))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((condition
+             (should-error (epi-ledger-open file)
+                           :type 'epi-ledger-corrupt)))
+        (should (eq 'missing-session-info
+                    (epi-test-ledger--condition-code condition)))))))
+
+(ert-deftest epi-ledger-open-does-not-repair-torn-tail ()
+  (let* ((whole
+          (epi-test-ledger--document-bytes
+           (list (epi-test-ledger--session-info-draft)
+                 (let ((draft (epi-test-ledger--message-draft "later")))
+                   (setf (epi-draft-id draft)
+                         "10000000-0000-4000-8000-000000000002")
+                   draft))))
+         (bytes (substring whole 0 (- (length whole) 7))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((before (epi-test-ledger--literal-file-bytes file))
+            condition)
+        (setq condition
+              (should-error (epi-ledger-open file)
+                            :type 'epi-ledger-truncated-tail))
+        (should (eq 'truncated-frame
+                    (epi-test-ledger--condition-code condition)))
+        (should (= 2 (plist-get (car (cdr condition)) :sequence)))
+        (should (equal before (epi-test-ledger--literal-file-bytes file)))))))
+
+;;;; Task 4 lifecycle-review regressions
+
+(ert-deftest epi-ledger-open-accepts-clean-eof-inside-crash-barriers ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (dolist (prefix-length '(5 7 9))
+      (let ((prefix (epi-test-ledger--task4-prefix drafts prefix-length)))
+        (when (= prefix-length 7)
+          (setf (nth 6 prefix) (epi-test-ledger--task4-tool-denied)))
+        (epi-test-ledger--with-document-file
+            (file (epi-test-ledger--task4-document prefix))
+          (should (epi-ledger-p (epi-ledger-open file))))))))
+
+(ert-deftest epi-ledger-open-allows-approved-call-reopen-denial-causes ()
+  (dolist (case '(("interrupted" turn-interrupted operation-interrupted)
+                  ("operation-cancelled" turn-cancelled
+                   operation-cancelled)))
+    (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+           (denied (epi-test-ledger--task4-tool-denied))
+           (turn (nth 1 case))
+           (operation (nth 2 case)))
+      (epi-test-ledger--task4-set-payload denied "reason" (car case))
+      (epi-test-ledger--with-document-file
+          (file
+           (epi-test-ledger--task4-document
+            (append
+             (epi-test-ledger--task4-prefix drafts 7)
+             (list denied
+                   (epi-test-ledger--task4-tool-result
+                    nil nil nil "Denied" "denied")
+                   (epi-test-ledger--task4-turn-terminal turn)
+                   (epi-test-ledger--task4-operation-terminal operation)))))
+        (should (epi-ledger-p (epi-ledger-open file)))))))
+
+(ert-deftest epi-ledger-open-still-rejects-policy-denial-after-approval ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (epi-test-ledger--task4-assert-open-code
+     (append (epi-test-ledger--task4-prefix drafts 7)
+             (list (epi-test-ledger--task4-tool-denied)))
+     'invalid-tool-pairing)))
+
+(ert-deftest epi-ledger-open-allows-reopen-interruption-at-prompt-boundaries ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (dolist
+        (history
+         (list
+          (list (epi-test-ledger--session-info-draft)
+                (epi-test-ledger--task4-operation-started)
+                (epi-test-ledger--task4-operation-terminal
+                 'operation-interrupted))
+          (append (epi-test-ledger--task4-prefix drafts 4)
+                  (list (epi-test-ledger--task4-turn-terminal
+                         'turn-finished)
+                        (epi-test-ledger--task4-operation-terminal
+                         'operation-interrupted)))
+          (append (epi-test-ledger--task4-prefix drafts 4)
+                  (list (epi-test-ledger--task4-turn-terminal
+                         'turn-failed)
+                        (epi-test-ledger--task4-operation-terminal
+                         'operation-interrupted)))
+          (append (epi-test-ledger--task4-prefix drafts 4)
+                  (list (epi-test-ledger--task4-turn-terminal
+                         'turn-cancelled)
+                        (epi-test-ledger--task4-operation-terminal
+                         'operation-interrupted)))))
+      (epi-test-ledger--with-document-file
+          (file (epi-test-ledger--task4-document history))
+        (should (epi-ledger-p (epi-ledger-open file)))))))
+
+(ert-deftest epi-ledger-open-allows-uncertain-failure-then-reopen-interruption ()
+  (let ((turn (epi-test-ledger--task4-uncertain-turn-terminal 'failed))
+        (operation
+         (epi-test-ledger--task4-uncertain-operation-terminal
+          'interrupted)))
+    (epi-ledger--with-operation-work-state
+      (epi-test-ledger--with-document-file
+          (file
+           (epi-test-ledger--task4-document
+            (append (epi-test-ledger--task4-uncertain-prefix)
+                    (list turn operation))))
+        (should (epi-ledger-p (epi-ledger-open file)))))))
+
+(ert-deftest epi-ledger-open-rejects-success-after-terminal-tool-causes ()
+  (dolist (case '(denied-interrupted denied-cancelled error-interrupted))
+    (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+           (prefix (epi-test-ledger--task4-prefix drafts 7))
+           terminal result)
+      (pcase case
+        ('denied-interrupted
+         (setq terminal (epi-test-ledger--task4-tool-denied)
+               result (epi-test-ledger--task4-tool-result
+                       nil nil nil "Denied" "denied"))
+         (epi-test-ledger--task4-set-payload terminal "reason" "interrupted"))
+        ('denied-cancelled
+         (setq terminal (epi-test-ledger--task4-tool-denied)
+               result (epi-test-ledger--task4-tool-result
+                       nil nil nil "Denied" "denied"))
+         (epi-test-ledger--task4-set-payload
+          terminal "reason" "operation-cancelled"))
+        ('error-interrupted
+         (setq prefix (epi-test-ledger--task4-prefix drafts 8)
+               terminal (epi-test-ledger--task4-tool-finished
+                         nil nil "error" "failed")
+               result (epi-test-ledger--task4-tool-result
+                       nil nil nil "failed" "error"))
+         (epi-test-ledger--task4-set-payload
+          terminal "details" '(("code" . "interrupted")))))
+      (epi-test-ledger--task4-assert-open-code
+       (append prefix
+               (list terminal result
+                     (epi-test-ledger--task4-turn-terminal 'turn-finished)
+                     (epi-test-ledger--task4-operation-terminal
+                      'operation-finished)))
+       'tool-cause-terminal-mismatch))))
+
+(ert-deftest epi-ledger-open-allows-crash-to-interrupt-cancelled-tool ()
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (terminal (epi-test-ledger--task4-tool-finished
+                    nil nil "cancelled" "Cancelled"))
+         (result (epi-test-ledger--task4-tool-result
+                  nil nil nil "Cancelled" "error")))
+    (epi-test-ledger--with-document-file
+        (file
+         (epi-test-ledger--task4-document
+          (append (epi-test-ledger--task4-prefix drafts 8)
+                  (list terminal result
+                        (epi-test-ledger--task4-turn-terminal
+                         'turn-interrupted)
+                        (epi-test-ledger--task4-operation-terminal
+                         'operation-interrupted)))))
+      (should (epi-ledger-p (epi-ledger-open file))))))
+
+(ert-deftest epi-ledger-open-rejects-extra-user-input-without-an-intent ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (epi-test-ledger--task4-assert-open-code
+     (append
+      (epi-test-ledger--task4-prefix drafts 4)
+      (list
+       (epi-test-ledger--task4-text-message
+        "10000000-0000-4000-8000-000000000090" "user" "extra"
+        epi-test-ledger--task4-turn-id epi-test-ledger--task4-user-id)))
+     'unexpected-user-message)))
+
+(ert-deftest epi-ledger-open-makes-first-session-info-invariant-dominant ()
+  (dolist
+      (drafts
+       (list
+        (list (epi-test-ledger--task4-operation-started
+               nil nil "select-leaf")
+              (epi-test-ledger--session-info-draft))
+        (list (epi-test-ledger--task4-operation-started)
+              (epi-test-ledger--task4-turn-started)
+              (epi-test-ledger--task4-text-message
+               epi-test-ledger--task4-user-id "user" "orphan"
+               epi-test-ledger--task4-turn-id
+               "10000000-0000-4000-8000-000000000099"))))
+    (epi-test-ledger--task4-assert-open-code drafts 'missing-session-info)))
+
+(ert-deftest epi-ledger-open-rejects-impossible-eof-residue-as-corruption ()
+  (let* ((clean
+          (epi-test-ledger--task4-document
+           (list (epi-test-ledger--session-info-draft))))
+         (residue-start (length clean)))
+    (epi-test-ledger--with-document-file (file (concat clean "garbage"))
+      (let* ((condition
+              (should-error (epi-ledger-open file)
+                            :type 'epi-ledger-corrupt))
+             (detail (car (cdr condition))))
+        (should (eq 'invalid-headline (plist-get detail :code)))
+        (should (eq 'invalid-headline
+                    (plist-get (plist-get detail :cause) :code)))
+        (should (= 2 (plist-get detail :sequence)))
+        (should (= residue-start (plist-get detail :offset)))))))
+
+(ert-deftest epi-ledger-open-preserves-valid-torn-eof-prefix-classification ()
+  (let* ((whole
+          (epi-test-ledger--task4-document
+           (list (epi-test-ledger--session-info-draft)
+                 (epi-test-ledger--task4-operation-started))))
+         (bytes (substring whole 0 (- (length whole) 11))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (should-error (epi-ledger-open file)
+                    :type 'epi-ledger-truncated-tail))))
+
+(ert-deftest epi-ledger-open-rejects-impossible-bytes-after-eof-fragment ()
+  (let ((clean
+         (epi-test-ledger--task4-document
+          (list (epi-test-ledger--session-info-draft)))))
+    (epi-test-ledger--with-document-file
+        (file
+         (concat clean
+                 "* message 10000000-0000-4000-8000-0000000000!"))
+      (should-error (epi-ledger-open file) :type 'epi-ledger-corrupt))))
+
+(ert-deftest epi-ledger-open-rejects-impossible-unterminated-drawer-fragment ()
+  (let* ((whole
+          (epi-test-ledger--task4-document
+           (list (epi-test-ledger--session-info-draft)
+                 (epi-test-ledger--task4-operation-started))))
+         (second (string-match "^\\* operation-started " whole))
+         (value-start
+          (+ (string-match ":EPI_AT: " whole second)
+             (length ":EPI_AT: ")))
+         (bytes
+          (concat (substring whole 0 value-start)
+                  "2026-07-21T18:42:18!")))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((condition
+             (should-error (epi-ledger-open file)
+                           :type 'epi-ledger-corrupt)))
+        (should (eq 'invalid-property-prefix
+                    (epi-test-ledger--condition-code condition)))))))
+
+(ert-deftest epi-ledger-open-keeps-completable-drawer-fragment-truncated ()
+  (let* ((whole
+          (epi-test-ledger--task4-document
+           (list (epi-test-ledger--session-info-draft)
+                 (epi-test-ledger--task4-operation-started))))
+         (second (string-match "^\\* operation-started " whole))
+         (value-start
+          (+ (string-match ":EPI_AT: " whole second)
+             (length ":EPI_AT: ")))
+         (bytes
+          (concat (substring whole 0 value-start)
+                  "2026-07-21T18:42:")))
+    (epi-test-ledger--with-document-file (file bytes)
+      (should-error (epi-ledger-open file)
+                    :type 'epi-ledger-truncated-tail))))
+
+(ert-deftest epi-ledger-open-rejects-impossible-unterminated-json-fragment ()
+  (let* ((whole
+          (epi-test-ledger--task4-document
+           (list (epi-test-ledger--session-info-draft)
+                 (epi-test-ledger--task4-operation-started))))
+         (second (string-match "^\\* operation-started " whole))
+         (json-start
+          (+ (string-match
+              (regexp-quote "#+begin_epi-json\n") whole second)
+             (length "#+begin_epi-json\n")))
+         (bytes (concat (substring whole 0 json-start) "!")))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((condition
+             (should-error (epi-ledger-open file)
+                           :type 'epi-ledger-corrupt)))
+        (should (eq 'invalid-json-prefix
+                    (epi-test-ledger--condition-code condition)))))))
+
+(ert-deftest epi-ledger-open-keeps-completable-json-fragment-truncated ()
+  (let* ((whole
+          (epi-test-ledger--task4-document
+           (list (epi-test-ledger--session-info-draft)
+                 (epi-test-ledger--task4-operation-started))))
+         (second (string-match "^\\* operation-started " whole))
+         (json-start
+          (+ (string-match
+              (regexp-quote "#+begin_epi-json\n") whole second)
+             (length "#+begin_epi-json\n")))
+         (bytes (concat (substring whole 0 json-start) "{\"")))
+    (epi-test-ledger--with-document-file (file bytes)
+      (should-error (epi-ledger-open file)
+                    :type 'epi-ledger-truncated-tail))))
+
+(ert-deftest
+    epi-ledger-open-requires-failed-outer-terminal-after-operation-failed-denial
+    ()
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (denied (epi-test-ledger--task4-tool-denied)))
+    (epi-test-ledger--task4-set-payload denied "reason" "operation-failed")
+    (epi-test-ledger--task4-assert-open-code
+     (append
+      (epi-test-ledger--task4-prefix drafts 6)
+      (list denied
+            (epi-test-ledger--task4-tool-result
+             nil nil nil "Denied" "denied")
+            (epi-test-ledger--task4-turn-terminal 'turn-finished)
+            (epi-test-ledger--task4-operation-terminal
+             'operation-finished)))
+     'tool-cause-terminal-mismatch)))
+
+(ert-deftest epi-ledger-open-accepts-approved-unstarted-operation-failure ()
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (denied (epi-test-ledger--task4-tool-denied)))
+    (epi-test-ledger--task4-set-payload denied "reason" "operation-failed")
+    (epi-test-ledger--with-document-file
+        (file
+         (epi-test-ledger--task4-document
+          (append
+           (epi-test-ledger--task4-prefix drafts 7)
+           (list denied
+                 (epi-test-ledger--task4-tool-result
+                  nil nil nil "Denied" "denied")
+                 (epi-test-ledger--task4-turn-terminal 'turn-failed)
+                 (epi-test-ledger--task4-operation-terminal
+                  'operation-failed)))))
+      (should (epi-ledger-p (epi-ledger-open file))))))
+
+(ert-deftest epi-ledger-open-allows-crash-to-interrupt-operation-failed-denial ()
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (denied (epi-test-ledger--task4-tool-denied)))
+    (epi-test-ledger--task4-set-payload denied "reason" "operation-failed")
+    (epi-test-ledger--with-document-file
+        (file
+         (epi-test-ledger--task4-document
+          (append
+           (epi-test-ledger--task4-prefix drafts 6)
+           (list denied
+                 (epi-test-ledger--task4-tool-result
+                  nil nil nil "Denied" "denied")
+                 (epi-test-ledger--task4-turn-terminal 'turn-interrupted)
+                 (epi-test-ledger--task4-operation-terminal
+                  'operation-interrupted)))))
+      (should (epi-ledger-p (epi-ledger-open file))))))
+
+(ert-deftest epi-ledger-open-rejects-duplicate-call-id-in-unplanned-eof-proposal
+    ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (epi-test-ledger--task4-assert-open-code
+     (append
+      (epi-test-ledger--task4-prefix drafts 10)
+      (list
+       (epi-test-ledger--task4-proposal
+        "10000000-0000-4000-8000-000000000090" "call-1" "read_file"
+        nil 1 "10000000-0000-4000-8000-000000000018")))
+     'duplicate-call-id)))
+
+(ert-deftest epi-ledger-open-rejects-first-order-in-unplanned-eof-proposal ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (epi-test-ledger--task4-assert-open-code
+     (append
+      (epi-test-ledger--task4-prefix drafts 4)
+      (list
+       (epi-test-ledger--task4-proposal
+        nil "call-1" "read_file" nil 1)))
+     'first-call-order-nonzero)))
+
+(ert-deftest epi-ledger-open-rejects-order-gap-in-unplanned-eof-proposal ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (epi-test-ledger--task4-assert-open-code
+     (append
+      (epi-test-ledger--task4-prefix drafts 10)
+      (list
+       (epi-test-ledger--task4-proposal
+        "10000000-0000-4000-8000-000000000090" "call-2" "read_file"
+        nil 2 "10000000-0000-4000-8000-000000000018")))
+     'call-order-gap)))
+
+(ert-deftest epi-ledger-open-reserves-call-id-after-proposal-interruption ()
+  (let ((second-operation "20000000-0000-4000-8000-000000000002")
+        (second-turn "30000000-0000-4000-8000-000000000002")
+        (second-user "10000000-0000-4000-8000-000000000093"))
+    (epi-test-ledger--task4-assert-open-code
+     (list
+      (epi-test-ledger--session-info-draft)
+      (epi-test-ledger--task4-operation-started)
+      (epi-test-ledger--task4-turn-started)
+      (epi-test-ledger--task4-text-message
+       epi-test-ledger--task4-user-id "user" "first"
+       epi-test-ledger--task4-turn-id)
+      (epi-test-ledger--task4-proposal)
+      (epi-test-ledger--task4-turn-terminal 'turn-interrupted)
+      (epi-test-ledger--task4-operation-terminal 'operation-interrupted)
+      (epi-test-ledger--task4-operation-started
+       "10000000-0000-4000-8000-000000000091" second-operation)
+      (epi-test-ledger--task4-turn-started
+       "10000000-0000-4000-8000-000000000092"
+       second-turn second-operation second-user)
+      (epi-test-ledger--task4-text-message
+       second-user "user" "second" second-turn)
+      (epi-test-ledger--task4-proposal
+       "10000000-0000-4000-8000-000000000094" "call-1" "read_file"
+       nil 0 second-user second-turn))
+     'duplicate-call-id)))
+
+(ert-deftest epi-ledger-open-gives-unknown-turn-precedence-for-intended-id ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (epi-test-ledger--task4-assert-open-code
+     (append
+      (epi-test-ledger--task4-prefix drafts 3)
+      (list
+       (epi-test-ledger--task4-text-message
+        epi-test-ledger--task4-user-id "user" "wrong turn"
+        "30000000-0000-4000-8000-000000000099")))
+     'missing-turn)))
+
+(ert-deftest epi-ledger-open-allows-proposal-only-reopen-interruption ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (epi-test-ledger--with-document-file
+        (file
+         (epi-test-ledger--task4-document
+          (append
+           (epi-test-ledger--task4-prefix drafts 5)
+           (list (epi-test-ledger--task4-turn-terminal 'turn-interrupted)
+                 (epi-test-ledger--task4-operation-terminal
+                  'operation-interrupted)))))
+      (should (epi-ledger-p (epi-ledger-open file))))))
+
+(ert-deftest epi-ledger-open-latches-terminalizing-call-to-turn-terminal ()
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (denied (epi-test-ledger--task4-tool-denied)))
+    (epi-test-ledger--task4-set-payload denied "reason" "interrupted")
+    (epi-test-ledger--task4-assert-open-code
+     (append
+      (epi-test-ledger--task4-prefix drafts 7)
+      (list denied
+            (epi-test-ledger--task4-tool-result
+             nil nil nil "Denied" "denied")
+            (epi-test-ledger--task4-text-message
+             "10000000-0000-4000-8000-000000000090" "assistant"
+             "must not continue" epi-test-ledger--task4-turn-id
+             "10000000-0000-4000-8000-000000000018")))
+     'tool-cause-terminal-mismatch)))
+
+(ert-deftest epi-ledger-open-requires-exact-ordinary-interruption-reasons ()
+  (let ((drafts (epi-test-ledger--task4-valid-drafts)))
+    (let ((turn (epi-test-ledger--task4-turn-terminal 'turn-interrupted)))
+      (epi-test-ledger--task4-set-payload turn "reason" "bogus")
+      (epi-test-ledger--task4-assert-open-code
+       (append (epi-test-ledger--task4-prefix drafts 3)
+               (list turn))
+       'interrupted-terminal-reason))
+    (let ((operation
+           (epi-test-ledger--task4-operation-terminal
+            'operation-interrupted)))
+      (epi-test-ledger--task4-set-payload operation "reason" "bogus")
+      (epi-test-ledger--task4-assert-open-code
+       (list (epi-test-ledger--session-info-draft)
+             (epi-test-ledger--task4-operation-started)
+             operation)
+       'interrupted-terminal-reason))))
+
+(ert-deftest epi-ledger-open-does-not-satisfy-intent-before-parent-validation ()
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (message
+          (epi-test-ledger--task4-text-message
+           epi-test-ledger--task4-user-id "user" "hello"
+           epi-test-ledger--task4-turn-id
+           "10000000-0000-4000-8000-000000000099"))
+         (bytes
+          (epi-test-ledger--task4-document
+           (append (epi-test-ledger--task4-prefix drafts 3)
+                   (list message))))
+         (original (symbol-function 'epi-ledger--validate-message-parent))
+         observed)
+    (epi-test-ledger--with-document-file (file bytes)
+      (cl-letf (((symbol-function 'epi-ledger--validate-message-parent)
+                 (lambda (state record)
+                   (prog1 (funcall original state record)
+                     (let ((turn
+                            (gethash
+                             epi-test-ledger--task4-turn-id
+                             (epi-ledger--validation-state-turns state))))
+                       (setq observed (plist-get turn :intent-state)))))))
+        (epi-test-ledger--task4-assert-open-code
+         (append (epi-test-ledger--task4-prefix drafts 3)
+                 (list message))
+         'missing-parent)))
+    (should (eq observed 'pending))))
+
+(ert-deftest epi-ledger-open-does-not-dispatch-file-name-handlers-for-stored-paths
+    ()
+  (let* ((hostile "/hostile:epi-project/")
+         (header
+          (epi-ledger-seal-header
+           :session-id epi-test-ledger--task4-session-id
+           :created-at "2026-07-21T18:42:17-07:00"
+           :project-root hostile))
+         (session (epi-test-ledger--session-info-draft))
+         (handler 'epi-test-ledger--cold-open-file-handler)
+         (calls 0))
+    (setf (epi-draft-payload session)
+          (copy-tree (epi-draft-payload session) t))
+    (setcdr (assoc "working_directory" (epi-draft-payload session)) hostile)
+    (let ((bytes
+           (epi-test-ledger--task4-document-from-envelopes
+            (list (epi-test-ledger--task4-draft-envelope session)) header)))
+      (epi-test-ledger--with-document-file (file bytes)
+        (let ((file-name-handler-alist `(("\\`/hostile:" . ,handler))))
+          (cl-letf (((symbol-function handler)
+                     (lambda (&rest _arguments)
+                       (setq calls (1+ calls))
+                       (error "stored path dispatched a file-name handler"))))
+            (should (epi-ledger-p (epi-ledger-open file)))))))
+    (should (= 0 calls))))
+
+(ert-deftest epi-ledger-open-bounds-valid-large-drawer-timestamp-work ()
+  (let* ((timestamp
+          (concat "2026-07-21T18:42:18." (make-string 10000 ?7) "Z"))
+         (session (epi-test-ledger--session-info-draft)))
+    (setf (epi-draft-at session) timestamp)
+    (let ((bytes (epi-test-ledger--task4-document (list session))))
+      (epi-test-ledger--with-document-file (file bytes)
+        (dolist (budget '(256 1024))
+          (let ((epi-ledger-work-byte-limit budget)
+                (epi-ledger-work-time-budget 1000.0)
+                events)
+            (let ((epi-ledger--nonpreemptible-observer
+                   (lambda (event) (push event events))))
+              (should (epi-ledger-p (epi-ledger-open file))))
+            (dolist (event events)
+              (when (> (plist-get event :bytes) budget)
+                (should (memq (plist-get event :kind) '(hash decode)))))))))))
+
+(ert-deftest epi-ledger-open-keeps-cold-drawer-fields-zero-copy-at-tiny-budget ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (list (epi-test-ledger--session-info-draft))))
+        (epi-ledger-work-byte-limit 1)
+        (epi-ledger-work-time-budget 1000.0)
+        (original (symbol-function 'epi-ledger--source-copy-range))
+        copied-fields)
+    (epi-test-ledger--with-document-file (file bytes)
+      (cl-letf (((symbol-function 'epi-ledger--source-copy-range)
+                 (lambda (source start end field work)
+                   (push field copied-fields)
+                   (funcall original source start end field work))))
+        (let* ((ledger (epi-ledger-open file))
+               (records
+                (epi-ledger--checkpoint-raw-records
+                 (epi-ledger--checkpoint-snapshot ledger)))
+               visited)
+          (should (epi-ledger-p ledger))
+          (should (= 1 (epi-ledger--record-source-length records)))
+          (epi-ledger--record-source-each
+           records
+           (lambda (record)
+             (push (epi-record--raw-id record) visited)))
+          (should
+           (equal '("10000000-0000-4000-8000-000000000001") visited))
+          (should (epi-record-p (epi-ledger--record-source-elt records 0)))
+          (should-error (epi-ledger--record-source-elt records 1)
+                        :type 'args-out-of-range)
+          (should (vectorp (epi-ledger-records ledger))))))
+    (should-not (memq 'drawer-property-name copied-fields))
+    (should-not (memq 'drawer-value copied-fields))))
+
+;;;; Task 4 bounded-cursor review regressions
+
+(ert-deftest epi-ledger-open-bounds-corrupt-frame-diagnostic-work ()
+  (let* ((epi-record-frame-byte-limit 4096)
+         (epi-ledger-work-byte-limit 256)
+         (header (epi-ledger-render-header (epi-test-ledger--header)))
+         (terminator "\n#+end_epi-json\n")
+         (frame
+          (concat "* "
+                  (make-string
+                   (- epi-record-frame-byte-limit 2 (length terminator)) ?x)
+                  terminator))
+         (bytes (concat header frame))
+         (collector (list nil))
+         nonpreemptible
+         (yields 0))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger--open-work-observer collector)
+            (epi-ledger--nonpreemptible-observer
+             (lambda (event) (push event nonpreemptible))))
+        (cl-letf (((symbol-function 'epi--yield)
+                   (lambda () (setq yields (1+ yields)))))
+          (should-error (epi-ledger-open file) :type 'epi-ledger-corrupt))))
+    (should (> yields 1))
+    (dolist (event (car collector))
+      (when (eq (plist-get event :kind) 'copy)
+        (should (plist-get event :bounded))
+        (should (<= (plist-get event :bytes)
+                    epi-ledger-work-byte-limit))))
+    (dolist (event nonpreemptible)
+      (when (> (plist-get event :bytes) epi-ledger-work-byte-limit)
+        (should (memq (plist-get event :kind) '(hash decode)))))))
+
+(ert-deftest epi-ledger-open-does-not-yield-after-publication-recheck ()
+  (let ((bytes
+         (epi-test-ledger--task4-dense-document 2))
+        (epi-ledger-work-record-limit 1)
+        (epi-ledger-work-byte-limit 256)
+        (epi-ledger-work-time-budget 1000.0))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((original epi-ledger--open-identity-reader)
+            publication-checked mutated ledger)
+        (let ((epi-ledger--open-identity-reader
+               (lambda (path)
+                 (prog1 (funcall original path)
+                   (when epi-ledger--open-publication-phase
+                     (setq publication-checked t))))))
+          (cl-letf (((symbol-function 'epi--deadline-time) (lambda () 0.0))
+                    ((symbol-function 'epi--yield)
+                     (lambda ()
+                       (when (and publication-checked (not mutated))
+                         (setq mutated t)
+                         (with-temp-buffer
+                           (set-buffer-multibyte nil)
+                           (insert "x")
+                           (let ((coding-system-for-write 'no-conversion))
+                             (write-region (point-min) (point-max)
+                                           file t 'silent)))))))
+            (setq ledger (epi-ledger-open file))))
+        (should publication-checked)
+        (should (epi-ledger-p ledger))
+        (should-not mutated)))))
+
+(ert-deftest epi-ledger-open-binds-range-stream-to-current-chain-head ()
+  (let* ((a-drafts (epi-test-ledger--task4-valid-drafts))
+         (b-drafts (epi-test-ledger--task4-valid-drafts))
+         (b-message
+          (epi-test-ledger--task4-text-message
+           epi-test-ledger--task4-user-id "user" "hullo"
+           epi-test-ledger--task4-turn-id))
+         (a-bytes (epi-test-ledger--task4-document a-drafts))
+         (b-bytes
+          (progn
+            (setf (nth 3 b-drafts) b-message)
+            (epi-test-ledger--task4-document b-drafts)))
+         (epi-ledger-work-byte-limit 256)
+         (epi-ledger-work-time-budget 1000.0))
+    (should (= (length a-bytes) (length b-bytes)))
+    (epi-test-ledger--with-document-file (file a-bytes)
+      (epi-test-ledger--with-document-file (alternate b-bytes)
+        (let ((original epi-ledger--open-source-inserter))
+          (let ((epi-ledger--open-source-inserter
+                 (lambda (_path &optional visit begin end replace)
+                   (funcall original alternate visit begin end replace))))
+            (let ((condition
+                   (should-error (epi-ledger-open file)
+                                 :type 'epi-ledger-conflict)))
+              (should (eq 'file-chain-head-changed
+                          (epi-test-ledger--condition-code condition))))))))))
+
+(ert-deftest epi-ledger-open-finalizes-record-index-in-bounded-chunks ()
+  (let ((bytes (epi-test-ledger--task4-dense-document 3))
+        (epi-ledger-work-record-limit 2)
+        (epi-ledger-work-byte-limit 32)
+        (epi-ledger-work-time-budget 1000.0)
+        (collector (list nil))
+        nonpreemptible)
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger--open-work-observer collector)
+            (epi-ledger--nonpreemptible-observer
+             (lambda (event) (push event nonpreemptible))))
+        (should (epi-ledger-p (epi-ledger-open file)))))
+    (let ((chunks
+           (seq-filter
+            (lambda (event)
+              (eq (plist-get event :field) 'record-index-chunk))
+            (car collector))))
+      (should chunks)
+      (dolist (event chunks)
+        (should (<= (plist-get event :records)
+                    epi-ledger-work-record-limit))
+        (should (<= (plist-get event :bytes)
+                    epi-ledger-work-byte-limit))))
+    (should-not
+     (seq-some
+      (lambda (event)
+        (and (eq (plist-get event :field) 'ledger-record-index)
+             (> (plist-get event :bytes) epi-ledger-work-byte-limit)))
+      nonpreemptible))))
+
+(ert-deftest epi-ledger-open-record-index-signals-out-of-range ()
+  (let ((bytes
+         (epi-test-ledger--task4-document
+          (list (epi-test-ledger--session-info-draft)))))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let* ((ledger (epi-ledger-open file))
+             (records
+              (epi-ledger--checkpoint-raw-records
+               (epi-ledger--checkpoint-snapshot ledger))))
+        (should-error (epi-ledger--record-source-elt records 1)
+                      :type 'args-out-of-range)))))
+
+(ert-deftest epi-ledger-open-record-index-elt-spans-all-chunks ()
+  (let* ((drafts (epi-test-ledger--task4-valid-drafts))
+         (expected-ids (mapcar #'epi-draft-id drafts))
+         (bytes (epi-test-ledger--task4-document drafts))
+        (epi-ledger-work-record-limit 2)
+        (epi-ledger-work-byte-limit 32)
+        (epi-ledger-work-time-budget 1000.0))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let* ((ledger (epi-ledger-open file))
+             (records
+              (epi-ledger--checkpoint-raw-records
+               (epi-ledger--checkpoint-snapshot ledger)))
+             ordered)
+        (should (epi-ledger--record-index-p records))
+        (should (> (length (epi-ledger--record-index-raw-chunks records)) 1))
+        (epi-ledger--record-source-each
+         records (lambda (record) (push record ordered)))
+        (setq ordered (nreverse ordered))
+        (should (= 12 (epi-ledger--record-source-length records)))
+        (should (= 12 (length ordered)))
+        (should (equal expected-ids
+                       (mapcar #'epi-record-id ordered)))
+        (dotimes (index 12)
+          (let ((record (epi-ledger--record-source-elt records index)))
+            (should (equal (nth index expected-ids)
+                           (epi-record-id record)))
+            (should (eq (nth index ordered) record))))))))
+
+(ert-deftest epi-ledger-open-header-value-cap-is-cadence-invariant ()
+  (let* ((value-cap epi-header-value-byte-limit)
+         (session-id "11111111-1111-4111-8111-111111111111")
+         (created-at "2026-07-21T18:42:17-07:00"))
+    (cl-labels
+        ((document
+          (project-root)
+          (let* ((hash
+                  (epi-ledger--header-hash-from-fields
+                   session-id created-at project-root))
+                 (header
+                  (epi-ledger--make-header
+                   :title "Epi session" :format 1
+                   :session-id session-id :created-at created-at
+                   :project-root project-root :coding-system "utf-8-unix"
+                   :hash hash))
+                 (record
+                  (epi-ledger-seal-record
+                   (epi-test-ledger--session-info-draft session-id)
+                   hash 1)))
+            (concat (epi-ledger-render-header header)
+                    (epi-ledger-render-record record)))))
+      (let ((valid
+             (document
+              (concat "/" (make-string (- value-cap 2) ?p) "/")))
+            (oversized
+             (document
+              (concat "/" (make-string (1- value-cap) ?p) "/"))))
+        (dolist (budget '(65536 262144))
+          (let ((epi-ledger-work-byte-limit budget)
+                (epi-ledger-work-time-budget 1000.0)
+                valid-events oversized-events)
+            (epi-test-ledger--with-document-file (file valid)
+              (let ((epi-ledger--nonpreemptible-observer
+                     (lambda (event) (push event valid-events))))
+                (should
+                 (equal (concat "/" (make-string (- value-cap 2) ?p) "/")
+                        (epi-ledger-project-root (epi-ledger-open file))))))
+            (let ((materializations
+                   (seq-filter
+                    (lambda (event)
+                      (and (eq (plist-get event :kind) 'copy)
+                           (eq (plist-get event :field) 'header-value)))
+                    valid-events)))
+              (should materializations)
+              (dolist (event materializations)
+                (should (<= (plist-get event :bytes) value-cap)))
+              (should-not
+               (seq-some
+                (lambda (event)
+                  (and (eq (plist-get event :kind) 'copy)
+                       (eq (plist-get event :field) 'line)
+                       (> (plist-get event :bytes) budget)))
+                valid-events)))
+            (epi-test-ledger--with-document-file (file oversized)
+              (let ((epi-ledger--nonpreemptible-observer
+                     (lambda (event) (push event oversized-events))))
+                (let ((condition
+                       (should-error (epi-ledger-open file)
+                                     :type 'epi-ledger-corrupt)))
+                  (should
+                   (eq 'header-value-byte-limit
+                       (epi-test-ledger--condition-code condition))))))
+            (should-not
+             (seq-some
+              (lambda (event)
+                (and (eq (plist-get event :kind) 'copy)
+                     (memq (plist-get event :field)
+                           '(line header-value))))
+              oversized-events))))))))
+
+(ert-deftest epi-ledger-open-compacts-a-partial-next-frame-in-bounded-units ()
+  (let* ((header-object (epi-test-ledger--header))
+         (header (epi-ledger-render-header header-object))
+         (first-record
+          (epi-ledger-seal-record
+           (epi-test-ledger--session-info-draft)
+           (epi-header-hash header-object) 1))
+         (first-frame (epi-ledger-render-record first-record))
+         (second-record
+          (epi-ledger-seal-record
+           (epi-test-ledger--task4-operation-started)
+           (epi-record-hash first-record) 2))
+         (partial (substring (epi-ledger-render-record second-record) 0 80))
+         (bytes (concat header first-frame partial))
+         (frame-end (+ (length header) (length first-frame)))
+         (budget
+          (seq-find
+           (lambda (candidate)
+             (let ((remainder (% frame-end candidate)))
+               (and (> remainder 0)
+                    (<= (- candidate remainder) (length partial)))))
+           (number-sequence 64 128)))
+         (next-boundary
+          (min (length bytes)
+               (* (1+ (/ frame-end budget)) budget)))
+         (residual (- next-boundary frame-end))
+         (epi-ledger-work-byte-limit budget)
+         (epi-ledger-work-time-budget 1000.0)
+         (collector (list nil)))
+    (should (> residual 0))
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger--open-work-observer collector))
+        (should-error (epi-ledger-open file)
+                      :type 'epi-ledger-truncated-tail)))
+    (dolist (field '(compaction-read compaction-write))
+      (let ((events
+             (seq-filter
+              (lambda (event) (eq (plist-get event :field) field))
+              (car collector))))
+        (should events)
+        (should
+         (seq-some (lambda (event)
+                     (= residual (plist-get event :bytes)))
+                   events))
+        (dolist (event events)
+          (should (plist-get event :bounded))
+          (should (<= (plist-get event :bytes) budget)))))))
+
+(ert-deftest epi-ledger-open-does-not-expose-carry-buffer-to-yields ()
+  (let* ((bytes (epi-test-ledger--task4-dense-document 1))
+         (original
+          (symbol-function 'epi-ledger--validate-record-semantic))
+         ready
+         mutated
+         carry-buffer
+         yield-buffer)
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger-work-record-limit 1)
+            (epi-ledger-work-byte-limit 1048576)
+            (epi-ledger-work-time-budget 1000.0)
+            (epi--yield-function
+             (lambda ()
+               (when (and ready (not mutated))
+                 (setq mutated t
+                       yield-buffer (current-buffer))
+                 (erase-buffer)))))
+        (cl-letf (((symbol-function 'epi-ledger--validate-record-semantic)
+                   (lambda (state header record)
+                     (prog1 (funcall original state header record)
+                       (setq ready t
+                             carry-buffer (current-buffer))))))
+          (let ((ledger (epi-ledger-open file)))
+            (should mutated)
+            (should-not (eq carry-buffer yield-buffer))
+            (should (= 6 (length (epi-ledger-records ledger))))
+            (should (= (length bytes)
+                       (epi-ledger-validated-end-offset ledger))))))
+      (should (equal bytes (epi-test-ledger--literal-file-bytes file))))))
+
+(ert-deftest epi-ledger-open-rejects-yield-time-carry-buffer-mutation ()
+  (let* ((bytes (epi-test-ledger--task4-dense-document 1))
+         (original
+          (symbol-function 'epi-ledger--validate-record-semantic))
+         ready
+         mutated
+         carry-buffer)
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger-work-record-limit 1)
+            (epi-ledger-work-byte-limit 1048576)
+            (epi-ledger-work-time-budget 1000.0)
+            (epi--yield-function
+             (lambda ()
+               (when (and ready (not mutated))
+                 (setq mutated t)
+                 (with-current-buffer carry-buffer
+                   (let ((inhibit-read-only t))
+                     (erase-buffer)))))))
+        (cl-letf (((symbol-function 'epi-ledger--validate-record-semantic)
+                   (lambda (state header record)
+                     (prog1 (funcall original state header record)
+                       (setq ready t
+                             carry-buffer (current-buffer))))))
+          (let* ((condition
+                  (should-error (epi-ledger-open file)
+                                :type 'epi-ledger-conflict))
+                 (detail (cadr condition)))
+            (should mutated)
+            (should (eq 'loader-buffer-modified
+                        (plist-get detail :code)))
+            (should (equal (file-truename file)
+                           (plist-get detail :path)))
+            (should (= 2 (plist-get detail :sequence)))
+            (should (stringp (plist-get detail :record-id)))
+            (should (integerp (plist-get detail :offset))))))
+      (should (equal bytes (epi-test-ledger--literal-file-bytes file))))))
+
+(ert-deftest epi-ledger-open-rejects-an-incomplete-clean-scan ()
+  (let* ((bytes (epi-test-ledger--task4-dense-document 1))
+         (original-yield (symbol-function 'epi-ledger--work-yield))
+         (original-validate
+          (symbol-function 'epi-ledger--validate-record-semantic))
+         ready
+         shortened)
+    (epi-test-ledger--with-document-file (file bytes)
+      (let ((epi-ledger-work-record-limit 1)
+            (epi-ledger-work-byte-limit 1048576)
+            (epi-ledger-work-time-budget 1000.0))
+        (cl-letf (((symbol-function 'epi-ledger--validate-record-semantic)
+                   (lambda (state header record)
+                     (prog1 (funcall original-validate state header record)
+                       (setq ready t))))
+                  ((symbol-function 'epi-ledger--work-yield)
+                   (lambda (&optional state)
+                     (if (and ready (not shortened))
+                         (progn
+                           (setq shortened t)
+                           (let ((inhibit-read-only t))
+                             (erase-buffer)))
+                       (funcall original-yield state)))))
+          (let* ((condition
+                  (should-error (epi-ledger-open file)
+                                :type 'epi-ledger-conflict))
+                 (detail (cadr condition)))
+            (should shortened)
+            (should (eq 'incomplete-ledger-scan
+                        (plist-get detail :code)))
+            (should (equal (file-truename file)
+                           (plist-get detail :path)))
+            (should (= 2 (plist-get detail :sequence)))
+            (should (stringp (plist-get detail :record-id)))
+            (should (< (plist-get detail :offset) (length bytes))))))
+      (should (equal bytes (epi-test-ledger--literal-file-bytes file))))))
+
+(ert-deftest epi-ledger-operation-yield-buffer-ignores-kill-queries ()
+  (let (yield-buffer)
+    (unwind-protect
+        (let ((epi--yield-function
+               (lambda ()
+                 (setq yield-buffer (current-buffer))
+                 (setq-local kill-buffer-query-functions
+                             (list (lambda () nil))))))
+          (epi-ledger--with-operation-work-state
+            (epi-ledger--work-yield))
+          (should-not (buffer-live-p yield-buffer)))
+      (when (buffer-live-p yield-buffer)
+        (with-current-buffer yield-buffer
+          (let ((kill-buffer-hook nil)
+                (kill-buffer-query-functions nil))
+            (kill-buffer yield-buffer)))))))
+
+(ert-deftest epi-ledger-operation-yield-cleanup-preserves-callback-error ()
+  (let (yield-buffer)
+    (unwind-protect
+        (let* ((epi--yield-function
+                (lambda ()
+                  (setq yield-buffer (current-buffer))
+                  (setq-local kill-buffer-hook
+                              (list
+                               (lambda ()
+                                 (error "cleanup hook failure"))))
+                  (error "callback failure")))
+               (condition
+                (should-error
+                 (epi-ledger--with-operation-work-state
+                   (epi-ledger--work-yield))
+                 :type 'error)))
+          (should (equal "callback failure" (cadr condition)))
+          (should-not (buffer-live-p yield-buffer)))
+      (when (buffer-live-p yield-buffer)
+        (with-current-buffer yield-buffer
+          (let ((kill-buffer-hook nil)
+                (kill-buffer-query-functions nil))
+            (kill-buffer yield-buffer)))))))
+
+(ert-deftest epi-ledger-nested-operations-reuse-one-yield-buffer ()
+  (let (outer-buffer inner-buffer inside)
+    (let ((epi--yield-function
+           (lambda ()
+             (if inside
+                 (setq inner-buffer (current-buffer))
+               (setq outer-buffer (current-buffer)
+                     inside t)
+               (unwind-protect
+                   (epi-ledger--with-operation-work-state
+                     (epi-ledger--work-yield))
+                 (setq inside nil))))))
+      (epi-ledger--with-operation-work-state
+        (epi-ledger--work-yield)))
+    (should (eq outer-buffer inner-buffer))
+    (should-not (buffer-live-p outer-buffer))))
+
+(ert-deftest epi-ledger-yield-buffer-creation-inhibits-global-hooks ()
+  (let ((before
+         (seq-filter
+          (lambda (buffer)
+            (string-prefix-p " *epi-ledger-yield*" (buffer-name buffer)))
+          (buffer-list)))
+        triggered)
+    (unwind-protect
+        (let ((buffer-list-update-hook
+               (list
+                (lambda ()
+                  (when (get-buffer " *epi-ledger-yield*")
+                    (setq triggered t)
+                    (error "yield buffer creation hook failure")))))
+              (epi--yield-function #'ignore))
+          (epi-ledger--with-operation-work-state
+            (epi-ledger--work-yield))
+          (should-not triggered)
+          (should
+           (equal before
+                  (seq-filter
+                   (lambda (buffer)
+                     (string-prefix-p " *epi-ledger-yield*"
+                                      (buffer-name buffer)))
+                   (buffer-list)))))
+      (dolist (buffer (buffer-list))
+        (when (and (not (memq buffer before))
+                   (string-prefix-p " *epi-ledger-yield*"
+                                    (buffer-name buffer)))
+          (with-current-buffer buffer
+            (let ((kill-buffer-hook nil)
+                  (kill-buffer-query-functions nil))
+              (kill-buffer buffer))))))))
 
 (provide 'epi-ledger-codec-test)
 ;;; epi-ledger-codec-test.el ends here

@@ -1,0 +1,74 @@
+#+title: Epi session
+#+EPI_FORMAT: 1
+#+EPI_SESSION_ID: 11111111-1111-4111-8111-111111111111
+#+EPI_CREATED_AT: 2026-07-21T18:42:17-07:00
+#+EPI_PROJECT_ROOT: /tmp/epi-project/
+#+EPI_CODING_SYSTEM: utf-8-unix
+#+EPI_HEADER_SHA256: 42a532655547cb5af87ee33d3df6fd60944b3d5f44411063d73f4ade5dc661b1
+* session-info 10000000-0000-4000-8000-000000000001
+:PROPERTIES:
+:EPI_ID: 10000000-0000-4000-8000-000000000001
+:EPI_TYPE: session-info
+:EPI_SCHEMA: 1
+:EPI_AT: 2026-07-21T18:42:18-07:00
+:EPI_PREV_SHA256: 42a532655547cb5af87ee33d3df6fd60944b3d5f44411063d73f4ade5dc661b1
+:EPI_RECORD_SHA256: 292c27e18aee42b0e0ec463b56c897a049a9a2a712d324d1f24ee2667be975ec
+:END:
+#+begin_epi-json
+{"at":"2026-07-21T18:42:18-07:00","id":"10000000-0000-4000-8000-000000000001","payload":{"backend":"test-backend","base_system_prompt":"Be exact.","capability":"openai-chat-completions/sequential-tools-v1","model":"test-model","request_params":{},"session_id":"11111111-1111-4111-8111-111111111111","tools":[],"working_directory":"/tmp/epi-project/"},"previous_hash":"42a532655547cb5af87ee33d3df6fd60944b3d5f44411063d73f4ade5dc661b1","schema":1,"type":"session-info"}
+#+end_epi-json
+* operation-started 10000000-0000-4000-8000-000000000010
+:PROPERTIES:
+:EPI_ID: 10000000-0000-4000-8000-000000000010
+:EPI_TYPE: operation-started
+:EPI_SCHEMA: 1
+:EPI_AT: 2026-07-21T18:43:02-07:00
+:EPI_OPERATION: 20000000-0000-4000-8000-000000000001
+:EPI_PREV_SHA256: 292c27e18aee42b0e0ec463b56c897a049a9a2a712d324d1f24ee2667be975ec
+:EPI_RECORD_SHA256: 748389f6c759cfdf3ba73633cbe3635b429ce9bdc097bfda3acab51beff65bbd
+:END:
+#+begin_epi-json
+{"at":"2026-07-21T18:43:02-07:00","id":"10000000-0000-4000-8000-000000000010","operation":"20000000-0000-4000-8000-000000000001","payload":{"kind":"prompt","operation_id":"20000000-0000-4000-8000-000000000001"},"previous_hash":"292c27e18aee42b0e0ec463b56c897a049a9a2a712d324d1f24ee2667be975ec","schema":1,"type":"operation-started"}
+#+end_epi-json
+* turn-started 10000000-0000-4000-8000-000000000011
+:PROPERTIES:
+:EPI_ID: 10000000-0000-4000-8000-000000000011
+:EPI_TYPE: turn-started
+:EPI_SCHEMA: 1
+:EPI_AT: 2026-07-21T18:43:02-07:00
+:EPI_TURN: 30000000-0000-4000-8000-000000000001
+:EPI_OPERATION: 20000000-0000-4000-8000-000000000001
+:EPI_PREV_SHA256: 748389f6c759cfdf3ba73633cbe3635b429ce9bdc097bfda3acab51beff65bbd
+:EPI_RECORD_SHA256: 439935d3d41f7c495e5cef651b2d29b63569ee3d4fae8d115519c8f72944ef61
+:END:
+#+begin_epi-json
+{"at":"2026-07-21T18:43:02-07:00","id":"10000000-0000-4000-8000-000000000011","operation":"20000000-0000-4000-8000-000000000001","payload":{"attempt_id":"40000000-0000-4000-8000-000000000001","backend":"test-backend","base_system_prompt":"Be exact.","message_id":"10000000-0000-4000-8000-000000000012","model":"test-model","operation_id":"20000000-0000-4000-8000-000000000001","request_params":{},"resources":[],"snapshot_hash":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","system_prompt":"Be exact.","tools":[],"turn_id":"30000000-0000-4000-8000-000000000001","working_directory":"/tmp/epi-project/"},"previous_hash":"748389f6c759cfdf3ba73633cbe3635b429ce9bdc097bfda3acab51beff65bbd","schema":1,"turn":"30000000-0000-4000-8000-000000000001","type":"turn-started"}
+#+end_epi-json
+* message 10000000-0000-4000-8000-000000000012
+:PROPERTIES:
+:EPI_ID: 10000000-0000-4000-8000-000000000012
+:EPI_TYPE: message
+:EPI_SCHEMA: 1
+:EPI_AT: 2026-07-21T18:43:02-07:00
+:EPI_TURN: 30000000-0000-4000-8000-000000000001
+:EPI_PREV_SHA256: 439935d3d41f7c495e5cef651b2d29b63569ee3d4fae8d115519c8f72944ef61
+:EPI_RECORD_SHA256: 8f207832544a47622eb52a562d3c6b20a00f83ccaef38f25b07afc6aa87a7e21
+:END:
+#+begin_epi-json
+{"at":"2026-07-21T18:43:02-07:00","id":"10000000-0000-4000-8000-000000000012","payload":{"content":[{"text":"hello","type":"text"}],"role":"user"},"previous_hash":"439935d3d41f7c495e5cef651b2d29b63569ee3d4fae8d115519c8f72944ef61","schema":1,"turn":"30000000-0000-4000-8000-000000000001","type":"message"}
+#+end_epi-json
+* tool-planned 10000000-0000-4000-8000-000000000014
+:PROPERTIES:
+:EPI_ID: 10000000-0000-4000-8000-000000000014
+:EPI_TYPE: tool-planned
+:EPI_SCHEMA: 1
+:EPI_AT: 2026-07-21T18:43:02-07:00
+:EPI_TARGET: 10000000-0000-4000-8000-000000000012
+:EPI_TURN: 30000000-0000-4000-8000-000000000001
+:EPI_OPERATION: 20000000-0000-4000-8000-000000000001
+:EPI_PREV_SHA256: 8f207832544a47622eb52a562d3c6b20a00f83ccaef38f25b07afc6aa87a7e21
+:EPI_RECORD_SHA256: adf822dc0da39c99a3f19306baec5107f2ed0e756366d5cb24415cb7844349ce
+:END:
+#+begin_epi-json
+{"at":"2026-07-21T18:43:02-07:00","id":"10000000-0000-4000-8000-000000000014","operation":"20000000-0000-4000-8000-000000000001","payload":{"arguments":{"path":"/tmp/a"},"authority":{},"call_id":"call-1","name":"read_file","order":0},"previous_hash":"8f207832544a47622eb52a562d3c6b20a00f83ccaef38f25b07afc6aa87a7e21","schema":1,"target":"10000000-0000-4000-8000-000000000012","turn":"30000000-0000-4000-8000-000000000001","type":"tool-planned"}
+#+end_epi-json
