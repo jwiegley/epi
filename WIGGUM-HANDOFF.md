@@ -1,10 +1,76 @@
-# Epi Implementation-Plan Wiggum Handoff
+# Epi Implementation Wiggum Handoff
 
-Status: complete
+Status: stopped at required implementation-worktree consent
 
 Last updated: 2026-07-21
 
-## Outcome
+## Current implementation run
+
+The active objective is to implement the approved first slice under the Wiggum
+loop. No implementation file has been created: the frozen plan requires the
+exact dependency preflight to pass before `epi.el` exists.
+
+Completed in this run:
+
+- Read the approved design, full executable plan, applicable repository
+  instructions, and Wiggum/superpowers procedures.
+- Drained and verified ten partner observations, then hardened the Task 1
+  bootstrap, condition, event, facade, clock, option, selector, fixture, and
+  file-manifest contracts discovered by independent follow-up reviews.
+- Committed the single cleanup unit as
+  `48100598ac24f5baf0702ec1c6eae3a463412fdb`
+  (`Address partner review observations`).
+- Re-ran `git diff --check`, both Pandoc GFM parses, task/file/commit/fence
+  counts, the 51-option inventory, focused consistency checks, and two
+  independent final reviews. The working tree and observation queue were clean
+  immediately after that commit.
+
+The following decision is required before Task 1 may begin:
+
+1. The `using-git-worktrees` procedure requires explicit user consent before
+   creating the isolated Epi worktree. If consent is granted without another
+   location preference, the skill default is a project-local
+   `.worktrees/epi-first-slice` on branch `codex/epi-first-slice`. Because no
+   ignore file exists yet, `.worktrees/` must first be added to `.gitignore`
+   and committed before creation.
+
+One terminal integration decision is known but does not block Task 1: this
+repository has no remote or upstream. The inherited parent instruction requires
+a successful push at final completion (the “Landing the Plane” directive in
+`/Users/johnw/src/dot-emacs/AGENTS.md`), while the Wiggum loop prohibits
+pushing during intermediate work. Before final completion, a remote must be
+supplied or that terminal push requirement explicitly waived for this nested
+repo.
+
+Locally verified inputs that do not require substitution:
+
+- `EPI_EMACS=/nix/store/1jy6wkqyckvs10q661zvpaxx52g97206-emacs-mac-macport-with-packages-30.2.50/bin/emacs`
+- `GPTEL_ROOT=/var/tmp/epi-gptel-8701e2bd` is a clean, detached, source-only
+  worktree at `8701e2bd80c5d2091ce2decef5d34d6fce4a3ada`. Its three frozen
+  source hashes match and no sibling `.elc` or `.eln` exists.
+- `PI_ROOT=/var/tmp/epi-upstreams.AwS1tp/pi` is clean at
+  `dd6bea41efa8caa7a10fe5a6401676dc5699f83f`; all five frozen source-anchor
+  hashes match.
+- `JCS_ORACLE_ROOT=/var/tmp/epi-jcs-oracle-20260721` is clean at
+  `19d51d7fe467d4706a3ff08adf8a748f29fc21e0`; both JavaScript source hashes and
+  the `823c07e7e1b1bbfc903354435b508026e43d2bf3183450a8773cf6cab7668933`
+  vector-manifest digest match.
+- `EPI_EXTRA_LOAD_PATH` may name the Transient and Compat directories under
+  `/nix/store/chhmf76w149f1zps5nh1y9nlvsnl2w1b-emacs-packages-deps/share/emacs/site-lisp/elpa/`;
+  the verified subdirectories are `transient-20260617.1137` and
+  `compat-31.0.0.1`.
+
+PAL consensus tooling was not advertised in this environment. Anvil is
+available through a dedicated Emacs 30.2.50 daemon; its clean-buffer checks do
+not certify a separate interactive Emacs process.
+
+Task 1 will use all four available slots in staged waves: three isolated
+scratch-output agents for preflight, runner, and package contracts or
+implementation candidates, while the coordinator alone integrates shared
+files, witnesses red/green gates, and owns Git. Three independent read-only
+reviews run in the final Task 1 wave.
+
+## Prior planning outcome
 
 The approved Pi-grade Epi architecture now has a detailed, executable,
 test-first implementation plan at
@@ -91,26 +157,38 @@ substituting dependencies.
 
 ## Repository boundary
 
-The branch is `main`. This repository has no configured remote or upstream, so
-there is no honest fetch, rebase, push, or PR step. The final local commit is
-the integration boundary for this work unit.
+The current checkout remains branch `main`. It has no configured remote or
+upstream. Feature implementation has not started here. The next implementation
+workspace requires the worktree consent above; the final push requirement
+remains unresolved rather than silently downgraded to a local integration
+boundary.
 
 ## Implementation resume procedure
 
-1. Read the approved design, the executable plan, and this handoff.
-2. Supply `EPI_EMACS`, `GPTEL_ROOT`, `PI_ROOT`, `JCS_ORACLE_ROOT`, and the
-   declared Transient/Compat load paths through the existing environment.
-3. Run `direnv exec . make preflight`; stop on any source, artifact, version,
-   or path mismatch.
-4. Execute Task 1, then continue numerically with
-   `superpowers:subagent-driven-development` or
-   `superpowers:executing-plans`, honoring the architecture checkpoints at
-   Tasks 2, 6, 12, and 15.
-5. Do not implement a later-slice capability from the roadmap without its own
-   reviewed plan and capability gate.
+1. Obtain explicit worktree consent. If granted without another preference,
+   add and commit the project-local `.worktrees/` ignore rule, then create
+   `.worktrees/epi-first-slice` on `codex/epi-first-slice`. If declined, treat
+   that as explicit authorization to work in the current checkout and run
+   `git switch -c codex/epi-first-slice` before any implementation edit or
+   commit; never implement directly on `main`.
+2. Use the already verified detached GPTel, Pi, and JCS roots listed above. Do
+   not delete the compiled files from the user's existing GPTel checkout.
+3. Export the five preflight inputs through the existing environment. Do not
+   install a dependency, enter `nix develop`, or substitute installed Pi.
+4. Execute Task 1's two documented direct red contracts. Implement only the
+   test harness/preflight machinery, then run `direnv exec . make preflight`.
+   Stop before `epi.el` on any mismatch.
+5. Continue tasks numerically, one TDD/review/commit unit at a time, with
+   architecture checkpoints after Tasks 2, 6, 12, and 15.
+6. Do not implement a later-slice roadmap capability without its own reviewed
+   plan and capability gate.
 
 ## Stop-and-escalate counters
 
 - Repeated failing gate signature: 0/3.
 - Unusable output from any one reviewer: 0/2.
 - Unresolved significant-decision consensus: 0/2.
+- Current stop reason: first occurrence of required worktree consent; all exact
+  preflight source inputs are present and no preflight attempt has been made.
+- Terminal integration issue: no remote/upstream for the inherited push rule;
+  this does not block local Task 1 work.
