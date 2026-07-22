@@ -1,14 +1,15 @@
 # Epi Implementation Wiggum Handoff
 
-Status: active on Task 1, Wave A contract drafting
+Status: Task 1 complete; Tasks 2 and 3 ready to start in parallel
 
 Last updated: 2026-07-21
 
 ## Current implementation run
 
 The active objective is to implement the approved first slice under the Wiggum
-loop. No implementation file has been created: the frozen plan requires the
-exact dependency preflight to pass before `epi.el` exists.
+loop. Task 1 is complete on the isolated feature branch; the package facade,
+deterministic test runner, source-only dependency validator, isolated compiler,
+and Checkdoc driver are committed as `89a3437`.
 
 Completed in this run:
 
@@ -31,9 +32,23 @@ Completed in this run:
 - Started Task 1 Wave A with isolated scratch agents drafting the preflight,
   runner, and package contracts while the coordinator alone owns integration,
   test gates, and Git.
+- Completed the two required direct red contracts before creating the runner
+  and package implementation, then passed the exact frozen dependency gate
+  before creating `epi.el`.
+- Hardened the validator after independent reviews: Make paths remain shell
+  data, selector and gate inventories cannot be overridden, preflight's parent
+  process never trusts GPTel or external package paths, the child hashes and
+  evaluates one source snapshot, and unverified dependency/version shadows are
+  inert.
+- Completed the immutable event facade, exact options/errors/autoloads, JSON
+  sentinels, canonical payload ownership, finite clocks, and injectable ID,
+  wall-clock, deadline-clock, and yield seams.
+- Committed Task 1 as `89a3437` (`build: establish the Epi package test
+  foundation`). The branch was clean immediately after the commit.
 
-Task 1 is unblocked. All implementation changes belong in the isolated feature
-worktree; `main` remains outside the implementation path.
+Tasks 2 and 3 are now the parallel frontier. All implementation changes belong
+in the isolated feature worktree; `main` remains outside the implementation
+path.
 
 One terminal integration decision is known but does not block Task 1: this
 repository has no remote or upstream. The inherited parent instruction requires
@@ -65,11 +80,10 @@ PAL consensus tooling was not advertised in this environment. Anvil is
 available through a dedicated Emacs 30.2.50 daemon; its clean-buffer checks do
 not certify a separate interactive Emacs process.
 
-Task 1 will use all four available slots in staged waves: three isolated
-scratch-output agents for preflight, runner, and package contracts or
-implementation candidates, while the coordinator alone integrates shared
-files, witnesses red/green gates, and owns Git. Three independent read-only
-reviews run in the final Task 1 wave.
+Task 1 used staged parallel contract, implementation, and review lanes while
+the coordinator owned integration, gates, and Git. The next wave keeps that
+ownership model: Task 2 owns only GPTel adapter files; Task 3 owns the ledger
+codec, fixtures, and its Makefile additions.
 
 ## Prior planning outcome
 
@@ -138,7 +152,20 @@ file remains under `doc/observations/`.
 
 ## Verification evidence
 
-The final documentation gate requires and has passed:
+The Task 1 implementation gate requires and has passed:
+
+- `make test`: 30/30 package tests and 26/26 preflight tests, each test file in
+  a fresh Emacs process.
+- A hostile command-line `TESTS`/`SELECTOR` override still ran all 26 preflight
+  tests and printed `Validated frozen Epi dependencies`.
+- `make compile`: warning-as-error byte compilation into `.build/elc` only.
+- `make checkdoc`: Checkdoc passed for the sole production file.
+- No source-tree `.elc`, injection sentinel, modified Anvil-visible buffer, or
+  parse error remained.
+- Two final focused trust-boundary re-reviews and one integrated Task 1 review
+  reported clean after their findings were fixed and regression-tested.
+
+The earlier documentation gate also passed:
 
 - Pandoc 3.7.0.2 parses both the design and plan as GitHub-flavored Markdown.
 - `git diff --check` passes for tracked edits, and the staged diff check covers
@@ -150,11 +177,10 @@ The final documentation gate requires and has passed:
   repository before the final edit/commit checkpoints. This does not certify
   a separate interactive Emacs process.
 
-No implementation ERT, compile, or GPTel compatibility test was run: there is
-no implementation yet, the shell environment has no `emacs` executable, and
-the dedicated Anvil daemon does not have GPTel on its load path. The plan makes
-that an explicit fail-closed Task 1 preflight instead of installing or
-substituting dependencies.
+The pinned GPTel semantic adapter contract is not yet implemented; Task 2 is
+the fail-closed seam proof. Read-only reconnaissance has already recorded the
+exact pinned FSM, WAIT/TOOL/post, Curl filter/parser, abort, dry-run, typed
+history, and form-hash boundaries needed to begin it.
 
 ## Repository boundary
 
@@ -172,11 +198,11 @@ silently downgraded to a local integration boundary.
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
    install a dependency, enter `nix develop`, or substitute installed Pi.
-4. Execute Task 1's two documented direct red contracts. Implement only the
-   test harness/preflight machinery, then run `direnv exec . make preflight`.
-   Stop before `epi.el` on any mismatch.
-5. Continue tasks numerically, one TDD/review/commit unit at a time, with
-   architecture checkpoints after Tasks 2, 6, 12, and 15.
+4. Start Tasks 2 and 3 in parallel from `89a3437`. Keep their file ownership
+   disjoint except for Task 3's explicit Makefile additions; preserve Task 2's
+   fail-closed GPTel seam gate.
+5. Continue dependency-ready tasks numerically, one TDD/review/commit unit at
+   a time, with architecture checkpoints after Tasks 2, 6, 12, and 15.
 6. Do not implement a later-slice roadmap capability without its own reviewed
    plan and capability gate.
 
@@ -185,7 +211,7 @@ silently downgraded to a local integration boundary.
 - Repeated failing gate signature: 0/3.
 - Unusable output from any one reviewer: 0/2.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: none. Task 1 Wave A is active; all exact preflight source
-  inputs are present and no preflight attempt has been made.
+- Current stop reason: none. Task 1 is committed and the Tasks 2/3 frontier is
+  active; all exact preflight source inputs remain present and validated.
 - Terminal integration issue: no remote/upstream for the inherited push rule;
   this does not block local Task 1 work.
