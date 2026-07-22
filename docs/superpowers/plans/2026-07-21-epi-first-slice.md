@@ -186,11 +186,19 @@ The immutable header is:
 #+title: Epi session
 #+EPI_FORMAT: 1
 #+EPI_SESSION_ID: <uuid>
-#+EPI_CREATED_AT: <RFC3339-with-offset>
+#+EPI_CREATED_AT: <Epi-RFC3339-profile>
 #+EPI_PROJECT_ROOT: <canonical-absolute-directory>
 #+EPI_CODING_SYSTEM: utf-8-unix
 #+EPI_HEADER_SHA256: <hash>
 ```
+
+The Epi RFC 3339 profile is deliberately narrower than the complete RFC
+grammar: it requires uppercase `T` and `Z`, a four-digit year from `0000`
+through `9999`, seconds from `00` through `59`, and an explicit `Z` or
+`±HH:MM` offset from `00:00` through `23:59`. Optional fractional seconds
+contain one or more decimal digits. Leap-second spellings are rejected because
+the first slice has neither a maintained occurrence table nor a wall clock that
+generates them.
 
 The header hash is SHA-256 over UTF-8 bytes of a JCS object with the string keys `title`, `format`, `session_id`, `created_at`, `project_root`, and `coding_system`. Each level-one record then has one exact property drawer and one `epi-json` special block. The JSON block is one JCS envelope line terminated by LF. Its self hash is not inside that envelope; `EPI_RECORD_SHA256` holds SHA-256 of the exact stored UTF-8 JCS bytes between the block delimiters, excluding the single framing LF. `previous_hash` inside the envelope and `EPI_PREV_SHA256` in the drawer agree and point to the header hash or previous record hash.
 
@@ -509,7 +517,8 @@ The remaining Task 1 public customization is also frozen:
 | Optional global instruction file | `epi-global-instructions-file` | `nil` | nil or file |
 
 Time has two separate private, dynamically bindable sources. The wall-clock
-source supplies time values only for RFC 3339 durable timestamps. The deadline
+source supplies time values only for durable timestamps in the Epi RFC 3339
+profile defined above. The deadline
 source supplies numeric seconds for budgets and timeouts. Its production
 default samples `float-time`'s epoch wall time and returns the maximum of that
 sample and a process-local high-water mark. It is therefore monotonicized wall
@@ -707,7 +716,7 @@ must report that it selected at least one `epi-package-*` test.
   `(signal condition (list plist))`.
 
 - [ ] Add dynamically bindable private functions/variables for UUID generation,
-  RFC 3339 wall time, the process-local nondecreasing deadline clock, its
+  Epi-profile RFC 3339 wall time, the process-local nondecreasing deadline clock, its
   high-water state, and cooperative yield. Implement the deadline default as
   the frozen process-local, nonpersisted high-water mark over `float-time` epoch
   wall time; do not describe or test it as an OS monotonic clock. Keep hard
@@ -909,7 +918,7 @@ Expected red: `void-function epi-ledger--jcs-encode`.
 
 - [ ] Implement strict header and level-one record framing without invoking Org Babel, property evaluation, or general Org interpretation. Hash the exact stored JSON byte range before decoding. A single-pass JCS lexical validator checks whitespace, minimal escapes, canonical number syntax, duplicate/sorted keys, and UTF-16 key order without rebuilding a second serialized copy; then parse the JSON as data and verify semantic drawer agreement.
 
-- [ ] Define the complete first-slice payload validators from the schema table. Verify timestamp, UUID/ID, lowercase hash, role, content type, call ordering, and sentinel types. Redacted details remain canonical data.
+- [ ] Define the complete first-slice payload validators from the schema table. Verify the frozen Epi RFC 3339 timestamp profile, including year `0000`, uppercase `T`/`Z`, explicit offset, and rejection of leap-second spellings; also verify UUID/ID, lowercase hash, role, content type, call ordering, and sentinel types. Redacted details remain canonical data.
 
 - [ ] Add delimiter-injection, control-character, CRLF input, malformed UTF-8, drawer/JSON disagreement, self-hash-in-envelope, unknown schema, unknown record type, and noncanonical-but-semantically-equivalent JSON failures.
 

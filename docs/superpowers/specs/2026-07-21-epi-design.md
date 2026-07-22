@@ -1408,12 +1408,17 @@ mutation cannot alter the committed outcome. Dispatch does not manufacture
 per-subscriber event copies; all subscribers to one dispatch, and the
 settlement callback when present, observe the same `eq` event object.
 
-Durable RFC 3339 timestamps and runtime deadlines use separate injectable
-clocks. The deadline default high-water-marks `float-time` epoch wall time
-within the Emacs process and never persists that mark. It is monotonicized wall
-time, not an OS monotonic primitive: a backward jump can stall the reported
-value and delay a budget until wall time catches up, while a forward jump may
-make a deadline fail closed early. Hard item/byte caps and relative timers
+Durable timestamps use an explicit Epi RFC 3339 profile: uppercase `T` and
+`Z`, a four-digit year from `0000` through `9999`, seconds from `00` through
+`59`, and a mandatory `Z` or `±HH:MM` offset from `00:00` through `23:59`.
+Optional fractional seconds contain one or more decimal digits. Leap-second
+spellings are rejected because Epi has neither a maintained occurrence table
+nor a wall clock that generates them. Durable timestamps and runtime deadlines
+use separate injectable clocks. The deadline default high-water-marks `float-time`
+epoch wall time within the Emacs process and never persists that mark. It is
+monotonicized wall time, not an OS monotonic primitive: a backward jump can
+stall the reported value and delay a budget until wall time catches up, while
+a forward jump may make a deadline fail closed early. Hard item/byte caps and relative timers
 remain authoritative. Tests bind both sources independently.
 
 Subscribers may reconstruct presentation from ledger plus events without

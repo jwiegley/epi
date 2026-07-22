@@ -65,6 +65,7 @@ endef
 	require-runtime-inputs \
 	require-preflight-inputs \
 	preflight \
+	jcs-goldens \
 	test-one \
 	test \
 	compile \
@@ -145,6 +146,23 @@ preflight: require-preflight-inputs
 	@$(EPI_BUILD_PREFLIGHT_ARGV); \
 	set -- "$$@" -l test/epi-test-helper.el \
 		--eval '(progn (epi-test-preflight-validate) (princ "Validated frozen Epi dependencies\n"))'; \
+	"$$@"
+
+jcs-goldens: preflight
+	@if ! command -v node >/dev/null 2>&1; then \
+		echo "Node is required only to regenerate JCS goldens" >&2; \
+		exit 2; \
+	fi
+	@verification=$$(node "$$JCS_ORACLE_ROOT/node-es6/verify-canonicalization.js"); \
+	status=$$?; printf '%s\n' "$$verification"; \
+	if [ $$status -ne 0 ] || \
+	   ! printf '%s\n' "$$verification" | grep -Fqx 'All tests succeeded!' || \
+	   printf '%s\n' "$$verification" | grep -Eq 'THE TEST ABOVE FAILED|\*\*\*\*\*\* ERRORS:'; then \
+		echo "Pinned JCS shipped-vector verification failed" >&2; \
+		exit 2; \
+	fi
+	@$(EPI_BUILD_PREFLIGHT_ARGV); \
+	set -- "$$@" -l test/generate-jcs-goldens.el; \
 	"$$@"
 
 test-one: override export TESTS := $(TEST)
