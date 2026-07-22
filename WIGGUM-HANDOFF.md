@@ -1,15 +1,15 @@
 # Epi Implementation Wiggum Handoff
 
-Status: Tasks 1 and 2 complete; Task 3 review hardening in progress
+Status: Tasks 1–3 complete; Task 4 is next; productization design awaits approval
 
 Last updated: 2026-07-21
 
 ## Current implementation run
 
 The active objective is to implement the approved first slice under the Wiggum
-loop. Task 1 is complete on the isolated feature branch; the package facade,
-deterministic test runner, source-only dependency validator, isolated compiler,
-and Checkdoc driver are committed as `89a3437`.
+loop. Tasks 1–3 are complete on the isolated feature branch. The package
+foundation, pinned GPTel seam, and canonical ledger codec are committed as
+`89a3437`, `a5b6924`, and `813ea02`, respectively.
 
 Completed in this run:
 
@@ -54,14 +54,30 @@ consumption, and continuation-exception terminality. An independent final
 semantic review reran the complete suite and isolated adversarial probes and
 reported no remaining blocker.
 
-Task 3 remains the active frontier. Its codec implementation is undergoing
-regression-first hardening against independent framing, canonicalization,
-resource, ownership, and provenance review. All implementation changes belong
-in the isolated feature worktree; `main` remains outside the implementation
-path.
+Task 3 is committed as `813ea02` (`feat: define the canonical Epi ledger
+codec`). Its 153 codec tests prove the version-one JCS encoder, strict Org
+framing, closed schema, ownership boundaries, resource caps, and physical
+cooperative cadence. Two independent final reviews repeated the complete codec
+suite, canonicalization oracles, golden verification, and work-slice probes on
+byte-identical source and test hashes and reported no remaining finding.
 
-One terminal integration decision is known but does not block Task 1: this
-repository has no remote or upstream. The inherited parent instruction requires
+Task 4, ledger loading and semantic validation, is the next implementation
+frontier. All implementation changes remain in the isolated feature worktree;
+`main` remains outside the implementation path.
+
+The user also invoked `command-productize`. Read-only reconnaissance and
+current-tool research are complete. The recommended integration point is after
+Task 15 and before the final README/documentation task, so the productized
+targets cover the complete delivered file set and the README remains the final
+truth check. Productization implementation remains behind its required design
+approval gate. The open choice is whether its 5% performance rule replaces
+Task 15's existing matching-host elapsed/RSS thresholds or becomes a separate
+short benchmark; replacing the existing thresholds with 1.05 times the frozen
+five-process medians is the current recommendation.
+
+One terminal integration decision is known but does not block intermediate
+implementation: this repository has no remote or upstream. The inherited
+parent instruction requires
 a successful push at final completion (the “Landing the Plane” directive in
 `/Users/johnw/src/dot-emacs/AGENTS.md`), while the Wiggum loop prohibits
 pushing during intermediate work. Before final completion, a remote must be
@@ -90,17 +106,18 @@ PAL consensus tooling was not advertised in this environment. Anvil is
 available through a dedicated Emacs 30.2.50 daemon; its clean-buffer checks do
 not certify a separate interactive Emacs process.
 
-Task 1 used staged parallel contract, implementation, and review lanes while
-the coordinator owned integration, gates, and Git. The next wave keeps that
-ownership model: Task 2 owns only GPTel adapter files; Task 3 owns the ledger
-codec, fixtures, and its Makefile additions.
+Tasks 1–3 used staged parallel contract, implementation, and review lanes while
+the coordinator owned integration, gates, and Git. Task 4 keeps that ownership
+model and owns `epi-ledger.el`, the codec tests, and its corruption/torn-tail
+fixtures. Productization remains a read-only design lane until approved and
+must not contend for Task 4 files.
 
 ## Prior planning outcome
 
 The approved Pi-grade Epi architecture now has a detailed, executable,
 test-first implementation plan at
-`docs/superpowers/plans/2026-07-21-epi-first-slice.md`. This work unit changes
-documentation only; it does not implement Epi.
+`docs/superpowers/plans/2026-07-21-epi-first-slice.md`. The planning unit was
+documentation-only; implementation is now complete through Task 3.
 
 The plan covers the bounded first slice in Section 16 of
 `docs/superpowers/specs/2026-07-21-epi-design.md` and the applicable Section
@@ -161,6 +178,27 @@ all reported clean with no remaining actionable finding. No partner observation
 file remains under `doc/observations/`.
 
 ## Verification evidence
+
+The Task 3 implementation gate requires and has passed:
+
+- The coordinator's final `make test` passed 288/288 tests in fresh Emacs
+  processes: 79 GPTel contract, 153 ledger codec, 30 package, and 26 preflight.
+- Warning-as-error compilation, Checkdoc over all three production files,
+  source/test/generator parenthesis checks, clean loads, Pandoc parses, and
+  staged/unstaged diff checks passed.
+- Independent oracles passed 20,000 canonical numbers and 448,689 prefixes,
+  1,000 composite objects and 41,356 prefixes, all 20 record schemas and 17,978
+  frame prefixes, and 1,500 stable-sort cases, with zero failures.
+- Two coordinator `make jcs-goldens` runs verified the shipped JCS vectors and
+  left `independent-goldens.json` byte-identical at SHA-256
+  `25edb6c8ad6d062841d3e30643149d2a61bf0709b887a06b8abecdb57a076b9d`.
+- The final cadence reviewer reran 153/153 tests and 16 physical probes without
+  observing work above a configured slice. The distinct correctness reviewer
+  repeated the complete 288-test matrix, both golden checks, and all oracles.
+- The sealed source SHA-256 is
+  `57f6b44b82e5ce57956145f41f6f66d57728c5c973a2f432a796c5ab32788c88`;
+  the sealed codec-test SHA-256 is
+  `7595d5f38e2a6a3cc69f646a296d673d1402e8c4b7b16dfaef48cec8efa2d1a1`.
 
 The Task 2 implementation gate requires and has passed:
 
@@ -223,19 +261,24 @@ silently downgraded to a local integration boundary.
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
    install a dependency, enter `nix develop`, or substitute installed Pi.
-4. Finish Task 3's independent review, full gates, reproducible goldens, and
-   atomic codec commit without modifying the committed Task 2 seam.
+4. Start Task 4 test-first: add isolated corrupt/torn fixtures and red
+   `epi-ledger-open` semantic-validation tests before extending the committed
+   Task 3 codec.
 5. Continue dependency-ready tasks numerically, one TDD/review/commit unit at
    a time, with architecture checkpoints after Tasks 2, 6, 12, and 15.
-6. Do not implement a later-slice roadmap capability without its own reviewed
+6. Complete the separately approved productization spec and plan before
+   productization edits; integrate its implementation after Task 15 and before
+   the final README task unless the approved design selects another boundary.
+7. Do not implement a later-slice roadmap capability without its own reviewed
    plan and capability gate.
 
 ## Stop-and-escalate counters
 
 - Repeated failing gate signature: 0/3.
-- Unusable output from any one reviewer: 0/2.
+- Maximum unusable outputs from any one reviewer: 1/2; each affected reviewer
+  recovered after one neutral local-quality prompt.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: none. Tasks 1 and 2 are committed and Task 3 is active;
-  all exact preflight source inputs remain present and validated.
+- Current stop reason: none. Tasks 1–3 are committed and Task 4 is next; all
+  exact preflight source inputs remain present and validated.
 - Terminal integration issue: no remote/upstream for the inherited push rule;
   this does not block local implementation work.
