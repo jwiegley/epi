@@ -1,16 +1,18 @@
 # Epi Implementation Wiggum Handoff
 
-Status: Tasks 1–5 complete; Task 6 is next; productization remains at its approved later integration boundary
+Status: Tasks 1–5 complete; Task 6 Waves 0–2 complete and Wave 3 is next; productization remains at its approved later integration boundary
 
 Last updated: 2026-07-22
 
 ## Current implementation run
 
 The active objective is to implement the approved first slice under the Wiggum
-loop. Tasks 1–5 are complete on the isolated feature branch. The package
-foundation, pinned GPTel seam, canonical ledger codec, semantic loader, and
-private storage/append layer are committed as `89a3437`, `a5b6924`,
-`813ea02`, `7125bfc`, and `e14f9b2`, respectively.
+loop. Tasks 1–5 and Task 6 Waves 0–2 are complete on the isolated feature
+branch. The package foundation, pinned GPTel seam, canonical ledger codec,
+semantic loader, private storage/append layer, tail inspector, recovery
+semantics, and deterministic reseal are committed as `89a3437`, `a5b6924`,
+`813ea02`, `7125bfc`, `e14f9b2`, `0abdfe9`, `a32cad6`, and `bcad789`,
+respectively.
 
 Completed in this run:
 
@@ -89,9 +91,11 @@ cleanup races. All seven red/green waves and every additive review regression
 are green. Three final reviewers approved the exact source/test snapshot; the
 close gates passed 29/29 object tests, 130/130 ledger tests, 342/342 codec
 tests, the full suite, warning-as-error compilation, Checkdoc, artifact and
-process audits, and the Anvil unsaved-buffer check. Task 6, explicit torn-tail
-recovery, is the next frontier. All changes remain in the isolated feature
-worktree; `main` remains outside the implementation path.
+process audits, and the Anvil unsaved-buffer check. Task 6 Waves 0–2 now supply
+exact tail inspection, recovery provenance semantics, and deterministic
+streaming reseal; Wave 3 preflight and durable prepared-manifest work is next.
+All changes remain in the isolated feature worktree; `main` remains outside
+the implementation path.
 
 The user also invoked `command-productize`. Read-only reconnaissance and
 current-tool research are complete. Productization integrates after Task 15
@@ -102,7 +106,8 @@ Task 15's 2.0x elapsed and 1.5x RSS acceptance thresholds.
 
 The user created the public GitHub destination during this run. `origin` is
 `git@github.com:jwiegley/epi.git`; the 18 plan-derived issues carry the
-`phase1` label, completed Tasks 1–5 are closed, and all issues are members of
+`phase1` label, completed Tasks 1–5 are closed, Task 6 remains in progress,
+and all issues are members of
 the public linked project at `https://github.com/users/jwiegley/projects/7`.
 The Wiggum loop still prohibits an intermediate push. The inherited successful
 push requirement will be satisfied only at final landing after every task and
@@ -141,7 +146,8 @@ for Task 5 files.
 The approved Pi-grade Epi architecture now has a detailed, executable,
 test-first implementation plan at
 `docs/superpowers/plans/2026-07-21-epi-first-slice.md`. The planning unit was
-documentation-only; implementation is now complete through Task 4.
+documentation-only; implementation is now complete through Task 5 and Task 6
+Wave 2.
 
 The plan covers the bounded first slice in Section 16 of
 `docs/superpowers/specs/2026-07-21-epi-design.md` and the applicable Section
@@ -322,11 +328,12 @@ intermediate Wiggum work.
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
    install a dependency, enter `nix develop`, or substitute installed Pi.
-4. Begin Task 6 test-first in its exact file scope: modify `epi-ledger.el` and
-   `test/epi-ledger-io-test.el`, and extend only the required
-   `test/fixtures/ledger/torn-*.org` fixtures. Establish focused recovery REDs
-   before adding `epi-ledger-recover-tail`; preserve Task 5's committed
-   storage and locking behavior as the regression baseline.
+4. Resume Task 6 at Wave 3 test-first in its exact file scope: add same-device
+   preflight, deterministic transaction paths, collision refusal, reachable
+   object reference verification, and the durable canonical `prepared`
+   manifest. Preserve the committed Wave 0 inspector, Wave 1 provenance
+   semantics, Wave 2 reseal, and Task 5 storage/locking behavior as the
+   regression baseline.
 5. Continue dependency-ready tasks numerically, one TDD/review/commit unit at
    a time, with architecture checkpoints after Tasks 2, 6, 12, and 15.
 6. Complete the separately approved productization spec and plan before
@@ -381,14 +388,40 @@ Task 5 completion facts:
 - Retain the frozen GPTel, Pi, JCS, Emacs, Transient, and Compat roots for Task
   6 and all later offline gates.
 
+Task 6 progress facts:
+
+- The frozen execution brief is `/var/tmp/epi-wg-task6/execution-brief.md`,
+  SHA-256
+  `c5987f2be636047d21b89aca1627b8706afb6679e9122d87cbe36a14cc9a04c9`.
+  Its eight ordered waves and collision, manifest, quarantine, and publication
+  decisions remain authoritative.
+- Wave 0 is `0abdfe9` (`feat: inspect recoverable Epi ledger tails safely`).
+  Wave 1 is `a32cad6` (`feat: validate Epi recovery provenance semantics`).
+  Wave 2 is `bcad789` (`feat: stream deterministic Epi recovery reseals`).
+- Wave 2 closes caller ownership before cooperative validation, preflights the
+  complete copied proof chain before output, rejects malformed or cyclic
+  private inspection graphs with structured conditions, preserves every
+  source semantic field except the first session identity, and emits one
+  presealed recovery-origin after the verified streaming prefix.
+- The exact Wave 2 close sequence passed 62/62 recovery tests and 192/192 I/O
+  tests. Warning-as-error compilation, Checkdoc, staged and unstaged diff
+  checks, the 10,000-proof constant-stack regression, and independent final
+  correctness and simplicity reviews also passed. GitHub issue
+  `jwiegley/epi#6` records the wave evidence and remains in progress.
+- Wave 3 owns only same-device path resolution, collision and link-count
+  preflight, typed reachable-object discovery, deterministic staging names,
+  and exclusive durable publication of canonical `manifest.jcs` in phase
+  `prepared`. It does not yet transfer objects, publish a destination, move
+  source evidence, or expose the public recovery facade.
+
 ## Stop-and-escalate counters
 
 - Repeated failing gate signature: 0/3.
 - Maximum unusable outputs from any one reviewer: 1/2; each affected reviewer
   recovered after one neutral local-quality prompt.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: none. Tasks 1–5 are committed and Task 6 is next; all
-  exact preflight source inputs remain present and validated.
+- Current stop reason: none. Tasks 1–5 and Task 6 Waves 0–2 are committed;
+  Wave 3 is next and all exact source inputs remain present and validated.
 - Terminal integration issue: none. The public remote, 18 issues, and linked
   Phase 1 project now exist; the feature branch remains intentionally unpushed
   until final landing.

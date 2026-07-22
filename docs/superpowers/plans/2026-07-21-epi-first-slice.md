@@ -1097,6 +1097,17 @@ git commit -m "feat: append Epi ledgers under an explicit lock"
 
 **Interfaces produced:** the closed-ledger `epi-ledger-recover-tail` primitive, fragment object evidence, quarantine layout, recovery-origin records. The registry-aware public facade is added in Task 8 after the runtime registry exists.
 
+**Implementation progress (2026-07-22):** Waves 0–2 of the frozen eight-wave
+execution brief are committed. `0abdfe9` adds exact torn-tail inspection,
+`a32cad6` adds recovery-origin admission and evidence semantics, and `bcad789`
+adds deterministic frame-free planning plus streaming reseal. The Wave 2 close
+gate passed 62/62 recovery tests, 192/192 I/O tests, warning-as-error byte
+compilation, Checkdoc, diff checks, a 10,000-proof constant-stack regression,
+and independent correctness and simplicity review. Wave 3—same-device
+preflight and the durable `prepared` manifest—is the next implementation
+boundary. The remaining Task 6 checkboxes deliberately stay open until their
+transactional publication or resume behavior exists.
+
 - [ ] Write tests for truncation after every byte class in a final record, unchanged source bytes, new session identity, semantic preservation of the valid prefix, fragment hash/object, reachable-object transfer, recovery provenance, destination collision, and refusal of interior corruption.
 
 ```elisp
@@ -1125,11 +1136,11 @@ Expected red: `epi-ledger-recover-tail` is missing.
 
 - [ ] Treat `epi-ledger-recover-tail` as a low-level closed-ledger primitive: its caller must already own the runtime registry reservations when a runtime exists, and direct use is limited to isolated closed-ledger tests. Scan matching manifests before allocating anything. Accept an optional pre-reserved destination session ID; otherwise allocate one for those tests. When `destination` is nil, use `<canonical-source-parent>/<destination-session-id>.org`; an unfinished matching manifest freezes both values on retry. Acquire and revalidate the source filesystem lock, then classify the tail again. Recovery is legal only for one incomplete final frame after a fully valid prefix. Refuse a multiply linked source ledger because moving one name cannot prove the original evidence was quarantined.
 
-- [ ] Because the recovered ledger has a new header and root hash, re-seal the logical valid-prefix records under the new hash chain through the same records/bytes/time-budgeted work cursor. Preserve record IDs, types, timestamps, parents, targets, lifecycle IDs, and payloads except that the first `session-info.payload.session_id` must change to the destination session ID so header and record remain consistent; change chain-dependent hashes and physical offsets. Test semantic equality explicitly with this named identity substitution rather than claiming byte identity for the destination prefix.
+- [x] Because the recovered ledger has a new header and root hash, re-seal the logical valid-prefix records under the new hash chain through the same records/bytes/time-budgeted work cursor. Preserve record IDs, types, timestamps, parents, targets, lifecycle IDs, and payloads except that the first `session-info.payload.session_id` must change to the destination session ID so header and record remain consistent; change chain-dependent hashes and physical offsets. Test semantic equality explicitly with this named identity substitution rather than claiming byte identity for the destination prefix.
 
 - [ ] Store the exact trailing fragment bytes in the destination object store with media type `application/octet-stream` and role `recovery-fragment`. The `recovery-origin` payload records original canonical path, source session ID, source file byte size, source header hash, source valid-prefix head, fragment offset/hash/size/object reference, and destination's corresponding valid-prefix head. `source_evidence_sha256` is SHA-256 over the no-LF UTF-8 JCS bytes of a closed object containing `kind = epi-recovery-source-evidence`, `version = 1`, and every payload field except the digest itself. The at-most-16-MiB fragment hash is one measured nonpreemptible unit bracketed by cursor yields; reading/copying its bytes remains sliced. Do not compute a redundant ordinary digest over the complete ledger: the validated record chain authenticates the prefix and the fragment digest authenticates every remaining byte.
 
-- [ ] Add the semantic `recovery-origin` transition before treating any
+- [x] Add the semantic `recovery-origin` transition before treating any
   recovered destination as openable. Append exactly one new origin per
   transaction; allow payload-identical historical origins only after their
   prior recovery barrier was reconciled, require unique evidence hashes, and
