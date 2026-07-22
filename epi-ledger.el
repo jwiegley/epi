@@ -141,6 +141,45 @@ The capsule deliberately excludes the transient reverse record accumulator."
   (fragment-hash nil :read-only t)
   (fragment-bytes nil :read-only t))
 
+(defconst epi-ledger--inspection-record-size
+  (length (epi-ledger--make-inspection))
+  "Exact private record size of a cold ledger inspection.")
+
+(cl-defstruct (epi-ledger--recovery-record-proof
+               (:constructor epi-ledger--make-recovery-record-proof))
+  "One frame-free proof produced by a recovery reseal dry run."
+  source-previous-hash source-hash destination-hash frame-byte-size)
+
+(cl-defstruct (epi-ledger--recovery-source-proof
+               (:constructor epi-ledger--make-recovery-source-proof))
+  "Owned scalar evidence binding a recovery plan to one source prefix."
+  canonical-path file-identity source-size
+  header-title header-format header-session-id header-created-at
+  header-project-root header-coding-system header-hash
+  validated-end valid-prefix-head next-sequence
+  fragment-offset fragment-size fragment-hash
+  record-count record-proofs)
+
+(cl-defstruct (epi-ledger--recovery-reseal-plan
+               (:constructor epi-ledger--make-recovery-reseal-plan))
+  "Frame-free deterministic plan for one recovery reseal stream."
+  source-proof destination-session-id origin-id origin-at origin-payload
+  source-evidence-sha256 destination-header-sha256
+  destination-header-byte-size destination-prefix-head final-head
+  origin-frame-byte-size source-record-count output-record-count byte-size)
+
+(defconst epi-ledger--recovery-record-proof-record-size
+  (length (epi-ledger--make-recovery-record-proof))
+  "Exact private record size of a recovery record proof.")
+
+(defconst epi-ledger--recovery-source-proof-record-size
+  (length (epi-ledger--make-recovery-source-proof))
+  "Exact private record size of a recovery source proof.")
+
+(defconst epi-ledger--recovery-reseal-plan-record-size
+  (length (epi-ledger--make-recovery-reseal-plan))
+  "Exact private record size of a recovery reseal plan.")
+
 (cl-defstruct (epi-ledger--record-chunk
                (:constructor epi-ledger--make-record-chunk)
                (:conc-name epi-ledger--record-chunk-raw-))
@@ -154,6 +193,30 @@ The capsule deliberately excludes the transient reverse record accumulator."
   "Immutable record order represented by bounded vector chunks."
   (chunks nil :read-only t)
   (count 0 :read-only t))
+
+(defconst epi-ledger--header-record-size
+  (length (epi-ledger--make-header))
+  "Exact private record size of a ledger header.")
+
+(defconst epi-ledger--record-record-size
+  (length (epi-ledger--make-record))
+  "Exact private record size of a sealed ledger record.")
+
+(defconst epi-ledger--semantic-capsule-record-size
+  (length (epi-ledger--make-semantic-capsule))
+  "Exact private record size of a semantic capsule.")
+
+(defconst epi-ledger--record-chunk-record-size
+  (length (epi-ledger--make-record-chunk))
+  "Exact private record size of a record-index chunk.")
+
+(defconst epi-ledger--record-index-record-size
+  (length (epi-ledger--make-record-index))
+  "Exact private record size of a record index.")
+
+(defun epi-ledger--recovery-exact-record-p (value predicate size)
+  "Return non-nil when VALUE satisfies PREDICATE with exact record SIZE."
+  (and (funcall predicate value) (= (length value) size)))
 
 (cl-defstruct (epi-ledger--source-region
                (:constructor epi-ledger--make-source-region)
@@ -8962,26 +9025,42 @@ open-turn intent mismatch can retain its more precise diagnostic."
       (cons field (epi-ledger--object-value payload field)))
     epi-ledger--recovery-evidence-v1-fields)))
 
-(defun epi-ledger--validate-recovery-origin (state record)
-  "Validate recovery-origin RECORD and retain its provenance in STATE."
+(defun epi-ledger--recovery-evidence-v1-sha256 (payload)
+  "Return the version-one source-evidence digest for recovery PAYLOAD."
+  (epi-ledger--hash
+   (epi-ledger--jcs-encode
+    (epi-ledger--recovery-evidence-v1 payload))
+   'recovery-source-evidence))
+
+(defun epi-ledger--require-recovery-origin-admissible
+    (record by-id evidence terminalization-required)
+  "Require RECORD to be a fresh origin after the supplied semantic facts.
+BY-ID and EVIDENCE are the existing identifier and evidence tables.
+TERMINALIZATION-REQUIRED is non-nil when an earlier recovery barrier remains
+unreconciled.  Return RECORD's verified evidence digest without mutation."
+  (when (gethash (epi-record--raw-id record) by-id)
+    (epi-ledger--semantic-fail 'duplicate-id))
   (let* ((payload (epi-record--raw-payload record))
          (expected
           (epi-ledger--object-value payload "source_evidence_sha256"))
-         (actual
-          (epi-ledger--hash
-           (epi-ledger--jcs-encode
-            (epi-ledger--recovery-evidence-v1 payload))
-           'recovery-source-evidence))
-         (evidence
-          (epi-ledger--validation-state-recovery-evidence state)))
+         (actual (epi-ledger--recovery-evidence-v1-sha256 payload)))
     (unless (equal expected actual)
       (epi-ledger--semantic-fail 'source-evidence-mismatch))
     (when (gethash expected evidence)
       (epi-ledger--semantic-fail 'duplicate-recovery-evidence))
-    (when
-        (epi-ledger--validation-state-recovery-terminalization-required
-         state)
+    (when terminalization-required
       (epi-ledger--semantic-fail 'recovery-terminalization-required))
+    expected))
+
+(defun epi-ledger--validate-recovery-origin (state record)
+  "Validate recovery-origin RECORD and retain its provenance in STATE."
+  (let* ((evidence
+          (epi-ledger--validation-state-recovery-evidence state))
+         (expected
+          (epi-ledger--require-recovery-origin-admissible
+           record (epi-ledger--validation-state-by-id state) evidence
+           (epi-ledger--validation-state-recovery-terminalization-required
+            state))))
     (puthash expected t evidence)
     (setf (epi-ledger--validation-state-latest-recovery-origin state) record
           (epi-ledger--validation-state-recovery-terminalization-required
@@ -9740,6 +9819,1360 @@ descriptor cannot exclude adversarial rename-away/read/restore ABA.  No
 repair, recovery, Org evaluation, rendering, or write occurs on this path."
   (epi-ledger--ledger-from-inspection
    (epi-ledger--inspect-path path 'complete)))
+
+(defun epi-ledger--recovery-reseal-source-changed (&rest properties)
+  "Signal that recovery reseal source evidence changed with PROPERTIES."
+  (apply #'epi-ledger--fail
+         'epi-ledger-conflict 'recovery-reseal-source-changed properties))
+
+(defun epi-ledger--recovery-reseal-plan-changed (&rest properties)
+  "Signal that a recovery reseal plan changed with PROPERTIES."
+  (apply #'epi-ledger--fail
+         'epi-ledger-conflict 'recovery-reseal-plan-changed properties))
+
+(defun epi-ledger--recovery-require-truncated-inspection (inspection)
+  "Require INSPECTION to describe one recoverable truncated final frame."
+  (unless (and (epi-ledger--inspection-p inspection)
+               (= (length inspection) epi-ledger--inspection-record-size))
+    (epi-ledger--format-fail 'recovery-inspection-required))
+  (unless (eq (epi-ledger--inspection-raw-state inspection)
+              'truncated-tail)
+    (epi-ledger--format-fail 'recovery-truncated-tail-required)))
+
+(defun epi-ledger--recovery-snapshot-origin-admission (capsule origin-id)
+  "Snapshot CAPSULE facts needed to admit ORIGIN-ID without callbacks."
+  (unless
+      (epi-ledger--recovery-exact-record-p
+       capsule #'epi-ledger--semantic-capsule-p
+       epi-ledger--semantic-capsule-record-size)
+    (epi-ledger--recovery-reseal-source-changed))
+  (let ((source-by-id
+         (epi-ledger--semantic-capsule-raw-by-id capsule))
+        (source-evidence
+         (epi-ledger--semantic-capsule-raw-recovery-evidence capsule))
+        (gc-cons-threshold most-positive-fixnum)
+        (by-id (make-hash-table :test #'equal))
+        (evidence (make-hash-table :test #'equal)))
+    (unless (and (hash-table-p source-by-id)
+                 (hash-table-p source-evidence))
+      (epi-ledger--recovery-reseal-source-changed))
+    (when (gethash origin-id source-by-id)
+      (puthash (epi-ledger--owned-string origin-id) t by-id))
+    (list
+     :by-id by-id :evidence evidence
+     :terminalization-required
+     (and
+      (epi-ledger--semantic-capsule-raw-recovery-terminalization-required
+      capsule)
+      t))))
+
+(defun epi-ledger--recovery-source-proof-equal-p (left right)
+  "Return non-nil when LEFT and RIGHT bind the same recovery source.
+Per-record dry-run proofs are deliberately excluded from this comparison."
+  (and
+   (epi-ledger--recovery-source-proof-p left)
+   (epi-ledger--recovery-source-proof-p right)
+   (equal
+    (list
+     (epi-ledger--recovery-source-proof-canonical-path left)
+     (epi-ledger--recovery-source-proof-file-identity left)
+     (epi-ledger--recovery-source-proof-source-size left)
+     (epi-ledger--recovery-source-proof-header-title left)
+     (epi-ledger--recovery-source-proof-header-format left)
+     (epi-ledger--recovery-source-proof-header-session-id left)
+     (epi-ledger--recovery-source-proof-header-created-at left)
+     (epi-ledger--recovery-source-proof-header-project-root left)
+     (epi-ledger--recovery-source-proof-header-coding-system left)
+     (epi-ledger--recovery-source-proof-header-hash left)
+     (epi-ledger--recovery-source-proof-validated-end left)
+     (epi-ledger--recovery-source-proof-valid-prefix-head left)
+     (epi-ledger--recovery-source-proof-next-sequence left)
+     (epi-ledger--recovery-source-proof-fragment-offset left)
+     (epi-ledger--recovery-source-proof-fragment-size left)
+     (epi-ledger--recovery-source-proof-fragment-hash left)
+     (epi-ledger--recovery-source-proof-record-count left))
+    (list
+     (epi-ledger--recovery-source-proof-canonical-path right)
+     (epi-ledger--recovery-source-proof-file-identity right)
+     (epi-ledger--recovery-source-proof-source-size right)
+     (epi-ledger--recovery-source-proof-header-title right)
+     (epi-ledger--recovery-source-proof-header-format right)
+     (epi-ledger--recovery-source-proof-header-session-id right)
+     (epi-ledger--recovery-source-proof-header-created-at right)
+     (epi-ledger--recovery-source-proof-header-project-root right)
+     (epi-ledger--recovery-source-proof-header-coding-system right)
+     (epi-ledger--recovery-source-proof-header-hash right)
+     (epi-ledger--recovery-source-proof-validated-end right)
+     (epi-ledger--recovery-source-proof-valid-prefix-head right)
+     (epi-ledger--recovery-source-proof-next-sequence right)
+     (epi-ledger--recovery-source-proof-fragment-offset right)
+     (epi-ledger--recovery-source-proof-fragment-size right)
+     (epi-ledger--recovery-source-proof-fragment-hash right)
+     (epi-ledger--recovery-source-proof-record-count right)))))
+
+(defun epi-ledger--recovery-snapshot-source-proof (inspection)
+  "Return owned scalar and fragment evidence for INSPECTION."
+  (let* ((captured
+          (condition-case nil
+              (let* ((gc-cons-threshold most-positive-fixnum)
+                     (header
+                      (epi-ledger--inspection-raw-header inspection))
+                     (index
+                      (epi-ledger--inspection-raw-record-index inspection))
+                     (last-record
+                      (epi-ledger--inspection-raw-last-record inspection))
+                     (fragment
+                      (epi-ledger--inspection-raw-fragment-bytes inspection)))
+                (unless (and
+                             (epi-ledger--recovery-exact-record-p
+                              header #'epi-header-p
+                              epi-ledger--header-record-size)
+                             (epi-ledger--recovery-exact-record-p
+                              index #'epi-ledger--record-index-p
+                              epi-ledger--record-index-record-size)
+                             (epi-ledger--recovery-exact-record-p
+                              last-record #'epi-record-p
+                              epi-ledger--record-record-size)
+                             (stringp fragment))
+                  (epi-ledger--recovery-reseal-source-changed))
+                (list
+                 :canonical-path
+                 (epi-ledger--owned-string
+                  (epi-ledger--inspection-raw-canonical-path inspection))
+                 :file-identity
+                 (epi-ledger--lock-file-object-to-identity
+                  (epi-ledger--lock-file-identity-object
+                   (epi-ledger--inspection-raw-file-identity inspection)))
+                 :source-size
+                 (epi-ledger--inspection-raw-source-size inspection)
+                 :header-title
+                 (epi-ledger--owned-string
+                  (epi-header--raw-title header))
+                 :header-format (epi-header--raw-format header)
+                 :header-session-id
+                 (epi-ledger--owned-string
+                  (epi-header--raw-session-id header))
+                 :header-created-at
+                 (epi-ledger--owned-string
+                  (epi-header--raw-created-at header))
+                 :header-project-root
+                 (epi-ledger--owned-string
+                  (epi-header--raw-project-root header))
+                 :header-coding-system
+                 (epi-ledger--owned-string
+                  (epi-header--raw-coding-system header))
+                 :header-hash
+                 (epi-ledger--owned-string (epi-header--raw-hash header))
+                 :validated-end
+                 (epi-ledger--inspection-raw-validated-end inspection)
+                 :last-record-end (epi-record--raw-end-offset last-record)
+                 :valid-prefix-head
+                 (epi-ledger--owned-string
+                  (epi-ledger--inspection-raw-valid-prefix-head inspection))
+                 :next-sequence
+                 (epi-ledger--inspection-raw-next-sequence inspection)
+                 :fragment-offset
+                 (epi-ledger--inspection-raw-fragment-offset inspection)
+                 :fragment-size
+                 (epi-ledger--inspection-raw-fragment-size inspection)
+                 :fragment-hash
+                 (epi-ledger--owned-string
+                  (epi-ledger--inspection-raw-fragment-hash inspection))
+                 :fragment-bytes fragment
+                 :record-count
+                 (epi-ledger--record-index-raw-count index)))
+            (error (epi-ledger--recovery-reseal-source-changed))))
+         (fragment (plist-get captured :fragment-bytes))
+         (fragment-size (plist-get captured :fragment-size))
+         (source-size (plist-get captured :source-size))
+         (fragment-offset (plist-get captured :fragment-offset))
+         (validated-end (plist-get captured :validated-end))
+         (last-record-end (plist-get captured :last-record-end))
+         (file-identity (plist-get captured :file-identity))
+         (identity-size (and (listp file-identity)
+                             (plist-get file-identity :size)))
+         (record-count (plist-get captured :record-count))
+         (next-sequence (plist-get captured :next-sequence)))
+    (unless (and (stringp fragment)
+                 (not (multibyte-string-p fragment))
+                 (integerp fragment-size)
+                 (> fragment-size 0))
+      (epi-ledger--recovery-reseal-source-changed))
+    (when (> fragment-size epi-recovery-fragment-byte-limit)
+      (epi-ledger--limit-fail
+       'recovery-fragment-byte-limit
+       :limit epi-recovery-fragment-byte-limit))
+    (unless (and (= fragment-size (length fragment))
+                 (integerp fragment-offset)
+                 (integerp validated-end)
+                 (= validated-end fragment-offset)
+                 (integerp last-record-end)
+                 (= last-record-end validated-end)
+                 (integerp source-size)
+                 (= (+ fragment-offset fragment-size) source-size)
+                 (integerp identity-size)
+                 (= identity-size source-size)
+                 (equal (plist-get captured :canonical-path)
+                        (plist-get file-identity :path))
+                 (integerp record-count)
+                 (> record-count 0)
+                 (integerp next-sequence)
+                 (= next-sequence (1+ record-count)))
+      (epi-ledger--recovery-reseal-source-changed))
+    (let* ((computed-fragment-hash
+            (condition-case nil
+                (epi-ledger--hash fragment 'recovery-fragment)
+              ((epi-ledger-error epi-limit-exceeded)
+               (epi-ledger--recovery-reseal-source-changed))))
+           (recomputed-header
+            (condition-case nil
+                (let ((epi-ledger--cold-open-validation t))
+                  (epi-ledger-seal-header
+                   :session-id (plist-get captured :header-session-id)
+                   :created-at (plist-get captured :header-created-at)
+                   :project-root (plist-get captured :header-project-root)))
+              ((epi-ledger-error epi-limit-exceeded)
+               (epi-ledger--recovery-reseal-source-changed)))))
+      (unless
+          (and
+           (equal computed-fragment-hash
+                  (plist-get captured :fragment-hash))
+           (equal (plist-get captured :header-title) "Epi session")
+           (integerp (plist-get captured :header-format))
+           (= (plist-get captured :header-format) 1)
+           (equal (plist-get captured :header-coding-system) "utf-8-unix")
+           (equal (plist-get captured :header-hash)
+                  (epi-header--raw-hash recomputed-header)))
+        (epi-ledger--recovery-reseal-source-changed))
+      (epi-ledger--make-recovery-source-proof
+       :canonical-path (plist-get captured :canonical-path)
+       :file-identity file-identity
+       :source-size source-size
+       :header-title (plist-get captured :header-title)
+       :header-format (plist-get captured :header-format)
+       :header-session-id (plist-get captured :header-session-id)
+       :header-created-at (plist-get captured :header-created-at)
+       :header-project-root (plist-get captured :header-project-root)
+       :header-coding-system (plist-get captured :header-coding-system)
+       :header-hash (plist-get captured :header-hash)
+       :validated-end validated-end
+       :valid-prefix-head (plist-get captured :valid-prefix-head)
+       :next-sequence next-sequence
+       :fragment-offset fragment-offset
+       :fragment-size fragment-size
+       :fragment-hash (plist-get captured :fragment-hash)
+       :record-count record-count
+       :record-proofs nil))))
+
+(defun epi-ledger--recovery-snapshot-record (record)
+  "Return a callback-free owned snapshot of source RECORD."
+  (condition-case nil
+      (let ((gc-cons-threshold most-positive-fixnum))
+        (unless
+            (epi-ledger--recovery-exact-record-p
+             record #'epi-record-p epi-ledger--record-record-size)
+          (epi-ledger--recovery-reseal-source-changed))
+        (list
+         :type (epi-record--raw-type record)
+         :sequence (epi-record--raw-sequence record)
+         :source-hash
+         (epi-ledger--owned-string (epi-record--raw-hash record))
+         :envelope
+         (epi-ledger--snapshot-canonical-value
+          (epi-ledger--envelope record)
+          epi-record-json-byte-limit 'record-json-byte-limit)))
+    (error (epi-ledger--recovery-reseal-source-changed))))
+
+(defun epi-ledger--recovery-verify-source-record
+    (snapshot expected-sequence expected-previous-hash expected-proof)
+  "Verify source SNAPSHOT at EXPECTED-SEQUENCE against its chain.
+EXPECTED-PREVIOUS-HASH anchors the source chain.  When non-nil,
+EXPECTED-PROOF also binds the dry-run result."
+  (let* ((envelope (plist-get snapshot :envelope))
+         (source-previous-hash
+          (epi-ledger--object-value envelope "previous_hash"))
+         (source-hash (plist-get snapshot :source-hash))
+         (sequence (plist-get snapshot :sequence)))
+    (unless (and (integerp sequence)
+                 (= sequence expected-sequence)
+                 (equal source-previous-hash expected-previous-hash)
+                 (or
+                  (null expected-proof)
+                  (and (epi-ledger--recovery-record-proof-p expected-proof)
+                   (equal
+                    source-previous-hash
+                    (epi-ledger--recovery-record-proof-source-previous-hash
+                     expected-proof))
+                   (equal
+                    source-hash
+                    (epi-ledger--recovery-record-proof-source-hash
+                     expected-proof)))))
+      (epi-ledger--recovery-reseal-source-changed
+       :sequence expected-sequence))
+    (let ((actual
+           (condition-case nil
+               (epi-ledger--hash
+                (epi-ledger--jcs-encode
+                 envelope epi-record-json-byte-limit)
+                'record)
+             ((epi-ledger-error epi-limit-exceeded)
+              (epi-ledger--recovery-reseal-source-changed
+               :sequence expected-sequence)))))
+      (unless (equal actual source-hash)
+        (epi-ledger--recovery-reseal-source-changed
+         :sequence expected-sequence)))
+    source-hash))
+
+(defun epi-ledger--recovery-destination-draft
+    (snapshot firstp destination-session-id)
+  "Return SNAPSHOT's owned draft for DESTINATION-SESSION-ID.
+When FIRSTP is non-nil, replace the owned session-info identity."
+  (let* ((type (plist-get snapshot :type))
+         (envelope (plist-get snapshot :envelope))
+         (payload (epi-ledger--object-value envelope "payload")))
+    (if firstp
+        (progn
+          (unless (eq type 'session-info)
+            (epi-ledger--recovery-reseal-source-changed :sequence 1))
+          (let ((session (assoc "session_id" payload)))
+            (unless session
+              (epi-ledger--recovery-reseal-source-changed :sequence 1))
+            (setcdr session destination-session-id)))
+      (when (eq type 'session-info)
+        (epi-ledger--recovery-reseal-source-changed
+         :sequence (plist-get snapshot :sequence))))
+    (make-epi-draft
+     :id (epi-ledger--object-value envelope "id")
+     :type type
+     :at (epi-ledger--object-value envelope "at")
+     :parent (epi-ledger--object-value envelope "parent")
+     :target (epi-ledger--object-value envelope "target")
+     :turn (epi-ledger--object-value envelope "turn")
+     :operation (epi-ledger--object-value envelope "operation")
+     :payload payload)))
+
+(defun epi-ledger--recovery-record-index-each (index function work)
+  "Call FUNCTION for every exact record in recovery INDEX through WORK.
+Reject malformed, cyclic, sparse, or count-incoherent private index graphs
+with the recovery source-conflict taxonomy."
+  (unless
+      (epi-ledger--recovery-exact-record-p
+       index #'epi-ledger--record-index-p
+       epi-ledger--record-index-record-size)
+    (epi-ledger--recovery-reseal-source-changed))
+  (let ((tail (epi-ledger--record-index-raw-chunks index))
+        (expected-count (epi-ledger--record-index-raw-count index))
+        (seen (make-hash-table :test #'eq))
+        (total 0))
+    (unless (and (integerp expected-count)
+                 (<= 0 expected-count 18446744073709551615))
+      (epi-ledger--recovery-reseal-source-changed))
+    (while (consp tail)
+      (when (gethash tail seen)
+        (epi-ledger--recovery-reseal-source-changed))
+      (puthash tail t seen)
+      (epi-ledger--work-charge-count work 1)
+      (let* ((chunk (car tail))
+             (next (cdr tail)))
+        (unless
+            (epi-ledger--recovery-exact-record-p
+             chunk #'epi-ledger--record-chunk-p
+             epi-ledger--record-chunk-record-size)
+          (epi-ledger--recovery-reseal-source-changed))
+        (let ((values (epi-ledger--record-chunk-raw-values chunk))
+              (count (epi-ledger--record-chunk-raw-count chunk)))
+          (unless (and (vectorp values) (integerp count) (> count 0)
+                       (= count (length values))
+                       (<= (+ total count) expected-count))
+            (epi-ledger--recovery-reseal-source-changed))
+          (dotimes (offset count)
+            (epi-ledger--work-charge-count work 1)
+            (let ((record (aref values offset)))
+              (unless
+                  (epi-ledger--recovery-exact-record-p
+                   record #'epi-record-p epi-ledger--record-record-size)
+                (epi-ledger--recovery-reseal-source-changed))
+              (funcall function record)))
+          (setq total (+ total count)
+                tail next))))
+    (unless (and (null tail) (= total expected-count))
+      (epi-ledger--recovery-reseal-source-changed))))
+
+(defun epi-ledger--recovery-reseal-source-pass
+    (inspection source-proof destination-session-id expected-plan emit)
+  "Reseal INSPECTION's prefix and return its frame-free pass summary.
+SOURCE-PROOF is the frozen scalar binding, and DESTINATION-SESSION-ID names
+the new chain.  EXPECTED-PLAN is checked before any corresponding emission.
+EMIT, when non-nil, receives each exact bounded chunk."
+  (let* ((verify-p (and expected-plan t))
+         (work (epi-ledger--make-work-state))
+         (header
+          (let ((epi-ledger--cold-open-validation t))
+            (epi-ledger-seal-header
+             :session-id destination-session-id
+             :created-at
+             (epi-ledger--recovery-source-proof-header-created-at
+              source-proof)
+             :project-root
+             (epi-ledger--recovery-source-proof-header-project-root
+              source-proof))))
+         (header-bytes (and emit (epi-ledger-render-header header)))
+         (header-size
+          (if header-bytes
+              (length header-bytes)
+            (epi-ledger--header-rendered-byte-size
+             (epi-header--raw-session-id header)
+             (epi-header--raw-created-at header)
+             (epi-header--raw-project-root header))))
+         (destination-tail (epi-header--raw-hash header))
+         (source-tail
+          (epi-ledger--recovery-source-proof-header-hash source-proof))
+         (proof-tail
+          (and verify-p
+               (epi-ledger--recovery-source-proof-record-proofs
+                source-proof)))
+         (recovery-evidence
+          (and (not verify-p) (make-hash-table :test #'equal)))
+         proofs-reverse
+         (count 0)
+         (byte-size header-size)
+         (records-since-yield 0))
+    (when
+        (and
+         verify-p
+         (not
+          (and
+           (equal
+            (epi-header--raw-hash header)
+            (epi-ledger--recovery-reseal-plan-destination-header-sha256
+             expected-plan))
+           (=
+            header-size
+            (epi-ledger--recovery-reseal-plan-destination-header-byte-size
+             expected-plan)))))
+      (epi-ledger--recovery-reseal-plan-changed))
+    (when emit
+      (funcall emit header-bytes))
+    (epi-ledger--recovery-record-index-each
+     (epi-ledger--inspection-raw-record-index inspection)
+     (lambda (source-record)
+         (let* ((sequence (1+ count))
+                (expected-proof
+                 (and verify-p
+                      (or (car proof-tail)
+                          (epi-ledger--recovery-reseal-source-changed
+                           :sequence sequence))))
+                (snapshot
+                 (epi-ledger--recovery-snapshot-record source-record))
+                (verified-source-hash
+                 (epi-ledger--recovery-verify-source-record
+                  snapshot sequence source-tail expected-proof))
+                (_authenticated-evidence
+                 (when
+                     (and recovery-evidence
+                          (eq (plist-get snapshot :type) 'recovery-origin))
+                   (let* ((payload
+                           (epi-ledger--object-value
+                            (plist-get snapshot :envelope) "payload"))
+                          (digest
+                           (epi-ledger--object-value
+                            payload "source_evidence_sha256")))
+                     (unless (epi-ledger--hash-p digest)
+                       (epi-ledger--recovery-reseal-source-changed
+                        :sequence sequence))
+                     (puthash
+                      (substring-no-properties digest) t
+                      recovery-evidence))))
+                (draft
+                 (epi-ledger--recovery-destination-draft
+                  snapshot (= sequence 1) destination-session-id))
+                (record
+                 (let ((epi-ledger--cold-open-validation t))
+                   (epi-ledger-seal-record
+                    draft destination-tail sequence)))
+                (frame (and emit (epi-ledger-render-record record)))
+                (frame-size
+                 (if frame
+                     (length frame)
+                   (let* ((json (epi-ledger--record-json record))
+                          (properties
+                           (epi-ledger--record-render-properties record))
+                          (size
+                           (epi-ledger--record-rendered-byte-size
+                            record json properties)))
+                     (when (> size epi-record-frame-byte-limit)
+                       (epi-ledger--limit-fail
+                        'record-frame-byte-limit
+                        :limit epi-record-frame-byte-limit))
+                     size))))
+           (when verify-p
+             (unless
+                 (and
+                  (equal
+                   (epi-ledger--recovery-record-proof-destination-hash
+                    expected-proof)
+                   (epi-record--raw-hash record))
+                  (=
+                   (epi-ledger--recovery-record-proof-frame-byte-size
+                    expected-proof)
+                   frame-size))
+               (epi-ledger--recovery-reseal-source-changed
+                :sequence sequence))
+             (setq proof-tail (cdr proof-tail)))
+           (unless verify-p
+             (setq proofs-reverse
+                   (epi-ledger--work-cons
+                    (epi-ledger--make-recovery-record-proof
+                     :source-previous-hash source-tail
+                     :source-hash verified-source-hash
+                     :destination-hash (epi-record--raw-hash record)
+                     :frame-byte-size frame-size)
+                    proofs-reverse work)))
+           (setq source-tail verified-source-hash
+                 destination-tail (epi-record--raw-hash record)
+                 byte-size (+ byte-size frame-size)
+                 count sequence
+                 records-since-yield (1+ records-since-yield))
+           (when emit
+             (funcall emit frame))
+           (when (>= records-since-yield epi-ledger-work-record-limit)
+             (epi-ledger--work-yield work)
+             (setq records-since-yield 0))))
+     work)
+    (when (and verify-p proof-tail)
+      (epi-ledger--recovery-reseal-source-changed
+       :sequence (1+ count)))
+    (unless (and
+             (= count
+                (epi-ledger--recovery-source-proof-record-count
+                 source-proof))
+             (= (1+ count)
+                (epi-ledger--recovery-source-proof-next-sequence
+                 source-proof))
+             (equal source-tail
+                    (epi-ledger--recovery-source-proof-valid-prefix-head
+                     source-proof)))
+      (epi-ledger--recovery-reseal-source-changed
+       :sequence (1+ count)))
+    (list
+     :header-sha256 (epi-header--raw-hash header)
+     :header-byte-size header-size
+     :destination-prefix-head destination-tail
+     :source-record-count count
+     :byte-size byte-size
+     :recovery-evidence recovery-evidence
+     :record-proofs
+     (and (not verify-p)
+          (epi-ledger--work-nreverse-list proofs-reverse work)))))
+
+(defun epi-ledger--recovery-origin-payload (source-proof destination-head)
+  "Return fresh recovery-origin payload for SOURCE-PROOF and DESTINATION-HEAD."
+  (let* ((payload
+          `(("source_path" .
+             ,(epi-ledger--recovery-source-proof-canonical-path source-proof))
+            ("source_session_id" .
+             ,(epi-ledger--recovery-source-proof-header-session-id
+               source-proof))
+            ("source_file_size" .
+             ,(epi-ledger--recovery-source-proof-source-size source-proof))
+            ("source_header_sha256" .
+             ,(epi-ledger--recovery-source-proof-header-hash source-proof))
+            ("source_valid_prefix_head_sha256" .
+             ,(epi-ledger--recovery-source-proof-valid-prefix-head
+               source-proof))
+            ("fragment_offset" .
+             ,(epi-ledger--recovery-source-proof-fragment-offset
+               source-proof))
+            ("fragment_sha256" .
+             ,(epi-ledger--recovery-source-proof-fragment-hash source-proof))
+            ("fragment_size" .
+             ,(epi-ledger--recovery-source-proof-fragment-size source-proof))
+            ("fragment_object" .
+             (("hash" .
+               ,(epi-ledger--recovery-source-proof-fragment-hash
+                 source-proof))
+              ("size" .
+               ,(epi-ledger--recovery-source-proof-fragment-size
+                 source-proof))
+              ("media_type" . "application/octet-stream")
+              ("role" . "recovery-fragment")))
+            ("destination_valid_prefix_head_sha256" . ,destination-head)))
+         (digest (epi-ledger--recovery-evidence-v1-sha256 payload)))
+    (append payload `(("source_evidence_sha256" . ,digest)))))
+
+(defun epi-ledger--recovery-seal-origin
+    (payload origin-id origin-at previous-hash sequence renderp)
+  "Seal one fresh recovery origin, returning a bounded summary.
+PAYLOAD, ORIGIN-ID, and ORIGIN-AT are its semantic inputs.  PREVIOUS-HASH and
+SEQUENCE place it after the re-sealed destination prefix.  When RENDERP is
+non-nil, include its exact frame bytes; otherwise only preflight their size."
+  (let* ((epi-ledger--cold-open-validation t)
+         (record
+          (epi-ledger-seal-record
+           (make-epi-draft
+            :id origin-id :type 'recovery-origin :at origin-at
+            :payload payload)
+           previous-hash sequence))
+         (frame (and renderp (epi-ledger-render-record record)))
+         (frame-size
+          (if frame
+              (length frame)
+            (let* ((json (epi-ledger--record-json record))
+                   (properties (epi-ledger--record-render-properties record))
+                   (size
+                    (epi-ledger--record-rendered-byte-size
+                     record json properties)))
+              (when (> size epi-record-frame-byte-limit)
+                (epi-ledger--limit-fail
+                 'record-frame-byte-limit :limit epi-record-frame-byte-limit))
+              size))))
+    (list :record record :frame frame :frame-byte-size frame-size)))
+
+(defun epi-ledger--recovery-plan-reseal
+    (inspection destination-session-id origin-id origin-at)
+  "Plan a deterministic frame-free recovery reseal of INSPECTION.
+DESTINATION-SESSION-ID, ORIGIN-ID, and ORIGIN-AT are caller-owned identities
+that are copied before any cooperative yield."
+  (epi-ledger--with-operation-work-state
+    (epi-ledger--recovery-require-truncated-inspection inspection)
+    (let* ((inputs
+            (let ((gc-cons-threshold most-positive-fixnum))
+              (let ((header (epi-ledger--inspection-raw-header inspection)))
+                (unless
+                    (epi-ledger--recovery-exact-record-p
+                     header #'epi-header-p epi-ledger--header-record-size)
+                  (epi-ledger--recovery-reseal-source-changed))
+                (unless (epi-ledger--uuid-p destination-session-id)
+                  (epi-ledger--format-fail
+                   'invalid-id :field "destination_session_id"))
+                (unless (epi-ledger--uuid-p origin-id)
+                  (epi-ledger--format-fail 'invalid-id :field "origin_id"))
+                (unless
+                    (and (stringp origin-at)
+                         (<= (length origin-at) epi-record-json-byte-limit)
+                         (<= (string-bytes origin-at)
+                             epi-record-json-byte-limit))
+                  (epi-ledger--format-fail
+                   'invalid-timestamp :field "origin_at"))
+                (unless
+                    (epi-ledger--uuid-p (epi-header--raw-session-id header))
+                  (epi-ledger--recovery-reseal-source-changed))
+                (list
+                 (substring-no-properties destination-session-id)
+                 (substring-no-properties origin-id)
+                 (substring-no-properties origin-at)
+                 (substring-no-properties
+                  (epi-header--raw-session-id header))))))
+           (destination-session-id (nth 0 inputs))
+           (origin-id (nth 1 inputs))
+           (origin-at (nth 2 inputs))
+           (source-session-id (nth 3 inputs))
+           (capsule
+            (epi-ledger--inspection-raw-semantic-capsule inspection))
+           (admission
+            (epi-ledger--recovery-snapshot-origin-admission
+             capsule origin-id))
+           (source-proof
+            (epi-ledger--recovery-snapshot-source-proof inspection)))
+      (epi-ledger--require-uuid
+       destination-session-id "destination_session_id")
+      (when (equal destination-session-id source-session-id)
+        (epi-ledger--format-fail 'recovery-session-id-reused))
+      (epi-ledger--require-uuid origin-id "origin_id")
+      (when (gethash
+             origin-id (plist-get admission :by-id))
+        (epi-ledger--format-fail 'duplicate-id))
+      (unless (epi-ledger--timestamp-p origin-at)
+        (epi-ledger--format-fail 'invalid-timestamp :field "origin_at"))
+      (let* ((pass
+              (epi-ledger--recovery-reseal-source-pass
+               inspection source-proof destination-session-id nil nil))
+             (after-proof
+              (epi-ledger--recovery-snapshot-source-proof inspection))
+             (_source-stable
+              (unless
+                  (epi-ledger--recovery-source-proof-equal-p
+                   source-proof after-proof)
+                (epi-ledger--recovery-reseal-source-changed)))
+             (proofs (plist-get pass :record-proofs))
+             (_proof-publication
+              (setf
+               (epi-ledger--recovery-source-proof-record-proofs source-proof)
+               proofs))
+             (destination-head
+              (plist-get pass :destination-prefix-head))
+             (origin-payload
+              (epi-ledger--recovery-origin-payload
+               source-proof destination-head))
+             (origin-result
+              (epi-ledger--recovery-seal-origin
+               origin-payload origin-id origin-at destination-head
+               (epi-ledger--recovery-source-proof-next-sequence
+                source-proof)
+               nil))
+             (origin-record (plist-get origin-result :record))
+             (sealed-origin-payload
+              (epi-record--raw-payload origin-record))
+             (canonical-origin-payload
+              (epi-ledger--decode-json
+               (epi-ledger--jcs-encode sealed-origin-payload)))
+             (origin-evidence
+              (epi-ledger--object-value
+               canonical-origin-payload "source_evidence_sha256"))
+             (_evidence-publication
+              (when (gethash
+                     origin-evidence (plist-get pass :recovery-evidence))
+                (puthash
+                 (substring-no-properties origin-evidence) t
+                 (plist-get admission :evidence))))
+             (origin-frame-size
+              (plist-get origin-result :frame-byte-size)))
+        (epi-ledger--require-recovery-origin-admissible
+         origin-record
+         (plist-get admission :by-id)
+         (plist-get admission :evidence)
+         (plist-get admission :terminalization-required))
+        (unless
+            (equal
+             destination-head
+             (epi-ledger--payload-value
+              origin-record "destination_valid_prefix_head_sha256"))
+          (epi-ledger--semantic-fail 'recovery-prefix-head-mismatch))
+        (let ((final-proof
+               (epi-ledger--recovery-snapshot-source-proof inspection)))
+          (unless
+              (epi-ledger--recovery-source-proof-equal-p
+               source-proof final-proof)
+            (epi-ledger--recovery-reseal-source-changed))
+          (epi-ledger--make-recovery-reseal-plan
+           :source-proof source-proof
+           :destination-session-id destination-session-id
+           :origin-id origin-id :origin-at origin-at
+           :origin-payload canonical-origin-payload
+           :source-evidence-sha256 origin-evidence
+           :destination-header-sha256 (plist-get pass :header-sha256)
+           :destination-header-byte-size
+           (plist-get pass :header-byte-size)
+           :destination-prefix-head destination-head
+           :final-head (epi-record--raw-hash origin-record)
+           :origin-frame-byte-size origin-frame-size
+           :source-record-count (plist-get pass :source-record-count)
+           :output-record-count
+           (1+ (plist-get pass :source-record-count))
+           :byte-size
+           (+ (plist-get pass :byte-size) origin-frame-size)))))))
+
+(defun epi-ledger--recovery-copy-plan-string (value maximum-bytes)
+  "Return an owned copy of recovery string VALUE below MAXIMUM-BYTES.
+The bound is checked before allocation and is independent of cooperative work
+slices."
+  (unless (and (stringp value)
+               (<= (length value) maximum-bytes)
+               (<= (string-bytes value) maximum-bytes))
+    (epi-ledger--recovery-reseal-plan-changed))
+  (substring-no-properties value))
+
+(defun epi-ledger--recovery-copy-record-proof (proof work)
+  "Return an ownership-isolated copy of recovery record PROOF.
+Charge its bounded scalar fields through WORK."
+  (let* ((captured
+          (condition-case nil
+              (let ((gc-cons-threshold most-positive-fixnum))
+                (unless
+                    (epi-ledger--recovery-exact-record-p
+                     proof #'epi-ledger--recovery-record-proof-p
+                     epi-ledger--recovery-record-proof-record-size)
+                  (epi-ledger--recovery-reseal-plan-changed))
+                (list
+                 (epi-ledger--recovery-record-proof-frame-byte-size proof)
+                 (epi-ledger--recovery-copy-plan-string
+                  (epi-ledger--recovery-record-proof-source-previous-hash
+                   proof)
+                  64)
+                 (epi-ledger--recovery-copy-plan-string
+                  (epi-ledger--recovery-record-proof-source-hash proof)
+                  64)
+                 (epi-ledger--recovery-copy-plan-string
+                  (epi-ledger--recovery-record-proof-destination-hash proof)
+                  64)))
+            (error (epi-ledger--recovery-reseal-plan-changed))))
+         (frame-size (nth 0 captured))
+         (source-previous-hash (nth 1 captured))
+         (source-hash (nth 2 captured))
+         (destination-hash (nth 3 captured)))
+    (unless (and (epi-ledger--hash-p source-previous-hash)
+                 (epi-ledger--hash-p source-hash)
+                 (epi-ledger--hash-p destination-hash)
+                 (integerp frame-size) (> frame-size 0)
+                 (<= frame-size epi-record-frame-byte-limit))
+      (epi-ledger--recovery-reseal-plan-changed))
+    (epi-ledger--work-charge-count
+     work (+ (string-bytes source-previous-hash)
+             (string-bytes source-hash)
+             (string-bytes destination-hash)
+             1))
+    (epi-ledger--make-recovery-record-proof
+     :source-previous-hash source-previous-hash
+     :source-hash source-hash
+     :destination-hash destination-hash
+     :frame-byte-size frame-size)))
+
+(defun epi-ledger--recovery-copy-record-proofs
+    (proofs expected-count work)
+  "Copy PROOFS iteratively through WORK and require EXPECTED-COUNT entries."
+  (unless (and (integerp expected-count) (> expected-count 0))
+    (epi-ledger--recovery-reseal-plan-changed))
+  (let ((tail proofs)
+        (seen (make-hash-table :test #'eq))
+        reversed
+        (count 0)
+        (records-since-yield 0))
+    (while (consp tail)
+      (when (gethash tail seen)
+        (epi-ledger--recovery-reseal-plan-changed))
+      (puthash tail t seen)
+      (let* ((proof (car tail))
+             (next (cdr tail))
+             (owned-proof
+              (epi-ledger--recovery-copy-record-proof proof work)))
+        (epi-ledger--work-charge-count work 2)
+        (setq reversed
+              (epi-ledger--work-cons
+               owned-proof reversed work)
+              tail next
+              count (1+ count)
+              records-since-yield (1+ records-since-yield)))
+      (when (> count expected-count)
+        (epi-ledger--recovery-reseal-plan-changed))
+      (when (>= records-since-yield epi-ledger-work-record-limit)
+        (epi-ledger--work-yield work)
+        (setq records-since-yield 0)))
+    (unless (and (null tail) (= count expected-count))
+      (epi-ledger--recovery-reseal-plan-changed))
+    (epi-ledger--work-nreverse-list reversed work)))
+
+(defun epi-ledger--recovery-bounded-unsigned-p (value)
+  "Return non-nil when VALUE fits an unsigned 64-bit recovery scalar."
+  (and (integerp value) (<= 0 value 18446744073709551615)))
+
+(defun epi-ledger--recovery-copy-time (value)
+  "Return an owned canonical four-part time VALUE without unbounded walks."
+  (let (parts)
+    (cond
+     ((vectorp value)
+      (unless (= (length value) 4)
+        (epi-ledger--recovery-reseal-plan-changed))
+      (setq parts (list (aref value 0) (aref value 1)
+                        (aref value 2) (aref value 3))))
+     ((listp value)
+      (let ((tail value))
+        (dotimes (_ 4)
+          (unless (consp tail)
+            (epi-ledger--recovery-reseal-plan-changed))
+          (push (car tail) parts)
+          (setq tail (cdr tail)))
+        (unless (null tail)
+          (epi-ledger--recovery-reseal-plan-changed))
+        (setq parts (nreverse parts))))
+     (t (epi-ledger--recovery-reseal-plan-changed)))
+    (unless (seq-every-p #'epi-ledger--safe-integer-p parts)
+      (epi-ledger--recovery-reseal-plan-changed))
+    (condition-case nil
+        (epi-ledger--normalize-time-vector parts)
+      (error (epi-ledger--recovery-reseal-plan-changed)))))
+
+(defun epi-ledger--recovery-copy-file-identity (identity)
+  "Return a closed bounded ownership copy of file IDENTITY."
+  (condition-case nil
+      (let ((tail identity)
+            values)
+        (dolist (key '(:path :device :inode :links :size :modified :changed))
+          (unless (and (consp tail) (eq (car tail) key)
+                       (consp (cdr tail)))
+            (epi-ledger--recovery-reseal-plan-changed))
+          (push (cadr tail) values)
+          (setq tail (cddr tail)))
+        (unless (null tail)
+          (epi-ledger--recovery-reseal-plan-changed))
+        (setq values (nreverse values))
+        (let ((path
+               (epi-ledger--recovery-copy-plan-string
+                (nth 0 values) epi-header-value-byte-limit))
+              (device (nth 1 values))
+              (inode (nth 2 values))
+              (links (nth 3 values))
+              (size (nth 4 values)))
+          (unless (and (epi-ledger--recovery-bounded-unsigned-p device)
+                       (epi-ledger--recovery-bounded-unsigned-p inode)
+                       (epi-ledger--recovery-bounded-unsigned-p links)
+                       (epi-ledger--recovery-bounded-unsigned-p size))
+            (epi-ledger--recovery-reseal-plan-changed))
+          (list :path path :device device :inode inode :links links :size size
+                :modified
+                (append (epi-ledger--recovery-copy-time (nth 5 values)) nil)
+                :changed
+                (append (epi-ledger--recovery-copy-time (nth 6 values)) nil))))
+    (error (epi-ledger--recovery-reseal-plan-changed))))
+
+(defun epi-ledger--recovery-copy-source-proof-scalars (proof)
+  "Return an ownership snapshot of source PROOF without its record proofs."
+  (condition-case nil
+      (let ((gc-cons-threshold most-positive-fixnum))
+        (unless
+            (epi-ledger--recovery-exact-record-p
+             proof #'epi-ledger--recovery-source-proof-p
+             epi-ledger--recovery-source-proof-record-size)
+          (epi-ledger--recovery-reseal-plan-changed))
+        (epi-ledger--make-recovery-source-proof
+         :canonical-path
+         (epi-ledger--recovery-copy-plan-string
+          (epi-ledger--recovery-source-proof-canonical-path proof)
+          epi-header-value-byte-limit)
+         :file-identity
+         (epi-ledger--recovery-copy-file-identity
+          (epi-ledger--recovery-source-proof-file-identity proof))
+         :source-size (epi-ledger--recovery-source-proof-source-size proof)
+         :header-title
+         (epi-ledger--recovery-copy-plan-string
+          (epi-ledger--recovery-source-proof-header-title proof) 11)
+         :header-format (epi-ledger--recovery-source-proof-header-format proof)
+         :header-session-id
+         (epi-ledger--recovery-copy-plan-string
+          (epi-ledger--recovery-source-proof-header-session-id proof) 36)
+         :header-created-at
+         (epi-ledger--recovery-copy-plan-string
+          (epi-ledger--recovery-source-proof-header-created-at proof)
+          epi-header-value-byte-limit)
+         :header-project-root
+         (epi-ledger--recovery-copy-plan-string
+          (epi-ledger--recovery-source-proof-header-project-root proof)
+          epi-header-value-byte-limit)
+         :header-coding-system
+         (epi-ledger--recovery-copy-plan-string
+          (epi-ledger--recovery-source-proof-header-coding-system proof) 10)
+         :header-hash
+         (epi-ledger--recovery-copy-plan-string
+          (epi-ledger--recovery-source-proof-header-hash proof) 64)
+         :validated-end
+         (epi-ledger--recovery-source-proof-validated-end proof)
+         :valid-prefix-head
+         (epi-ledger--recovery-copy-plan-string
+          (epi-ledger--recovery-source-proof-valid-prefix-head proof) 64)
+         :next-sequence
+         (epi-ledger--recovery-source-proof-next-sequence proof)
+         :fragment-offset
+         (epi-ledger--recovery-source-proof-fragment-offset proof)
+         :fragment-size
+         (epi-ledger--recovery-source-proof-fragment-size proof)
+         :fragment-hash
+         (epi-ledger--recovery-copy-plan-string
+          (epi-ledger--recovery-source-proof-fragment-hash proof) 64)
+         :record-count
+         (epi-ledger--recovery-source-proof-record-count proof)
+         :record-proofs nil))
+    (error (epi-ledger--recovery-reseal-plan-changed))))
+
+(defun epi-ledger--recovery-validate-source-proof-scalars (proof)
+  "Validate the already owned scalar fields in source PROOF."
+  (let ((source-size (epi-ledger--recovery-source-proof-source-size proof))
+        (header-format (epi-ledger--recovery-source-proof-header-format proof))
+        (validated-end (epi-ledger--recovery-source-proof-validated-end proof))
+        (next-sequence (epi-ledger--recovery-source-proof-next-sequence proof))
+        (fragment-offset (epi-ledger--recovery-source-proof-fragment-offset proof))
+        (fragment-size (epi-ledger--recovery-source-proof-fragment-size proof))
+        (record-count (epi-ledger--recovery-source-proof-record-count proof))
+        (file-identity (epi-ledger--recovery-source-proof-file-identity proof)))
+    (unless
+        (and
+         (epi-ledger--recovery-bounded-unsigned-p source-size)
+         (> source-size 0)
+         (integerp header-format) (= header-format 1)
+         (epi-ledger--recovery-bounded-unsigned-p validated-end)
+         (epi-ledger--recovery-bounded-unsigned-p fragment-offset)
+         (= validated-end fragment-offset)
+         (epi-ledger--recovery-bounded-unsigned-p fragment-size)
+         (> fragment-size 0)
+         (<= fragment-size epi-recovery-fragment-byte-limit)
+         (= (+ fragment-offset fragment-size) source-size)
+         (= (plist-get file-identity :size) source-size)
+         (equal (epi-ledger--recovery-source-proof-canonical-path proof)
+                (plist-get file-identity :path))
+         (epi-ledger--recovery-bounded-unsigned-p record-count)
+         (> record-count 0)
+         (epi-ledger--recovery-bounded-unsigned-p next-sequence)
+         (= next-sequence (1+ record-count))
+         (epi-ledger--canonical-lock-ledger-path-p
+          (epi-ledger--recovery-source-proof-canonical-path proof))
+         (equal (epi-ledger--recovery-source-proof-header-title proof)
+                "Epi session")
+         (epi-ledger--uuid-p
+          (epi-ledger--recovery-source-proof-header-session-id proof))
+         (epi-ledger--timestamp-p
+          (epi-ledger--recovery-source-proof-header-created-at proof))
+         (stringp
+          (epi-ledger--recovery-source-proof-header-project-root proof))
+         (equal
+          (epi-ledger--recovery-source-proof-header-coding-system proof)
+          "utf-8-unix")
+         (epi-ledger--hash-p
+          (epi-ledger--recovery-source-proof-header-hash proof))
+         (epi-ledger--hash-p
+          (epi-ledger--recovery-source-proof-valid-prefix-head proof))
+         (epi-ledger--hash-p
+          (epi-ledger--recovery-source-proof-fragment-hash proof)))
+      (epi-ledger--recovery-reseal-plan-changed))
+    proof))
+
+(defun epi-ledger--recovery-copy-plan (plan work)
+  "Return an ownership snapshot of recovery PLAN, charging WORK."
+  (unless
+      (epi-ledger--recovery-exact-record-p
+       plan #'epi-ledger--recovery-reseal-plan-p
+       epi-ledger--recovery-reseal-plan-record-size)
+    (epi-ledger--recovery-reseal-plan-changed))
+  (let* ((captured
+          (condition-case nil
+              (let ((gc-cons-threshold most-positive-fixnum))
+                (let* ((original-source-proof
+                        (epi-ledger--recovery-reseal-plan-source-proof plan))
+                       (source-proof
+                        (epi-ledger--recovery-copy-source-proof-scalars
+                         original-source-proof))
+                       (original-record-proofs
+                        (epi-ledger--recovery-source-proof-record-proofs
+                         original-source-proof))
+                   (origin-payload
+                        (epi-ledger--snapshot-canonical-value
+                         (epi-ledger--recovery-reseal-plan-origin-payload plan)
+                         epi-record-json-byte-limit 'record-json-byte-limit))
+                   (copy
+                    (epi-ledger--make-recovery-reseal-plan
+                     :source-proof source-proof
+                     :destination-session-id
+                     (epi-ledger--recovery-copy-plan-string
+                      (epi-ledger--recovery-reseal-plan-destination-session-id
+                       plan)
+                      36)
+                     :origin-id
+                     (epi-ledger--recovery-copy-plan-string
+                      (epi-ledger--recovery-reseal-plan-origin-id plan)
+                      36)
+                     :origin-at
+                     (epi-ledger--recovery-copy-plan-string
+                      (epi-ledger--recovery-reseal-plan-origin-at plan)
+                      epi-record-json-byte-limit)
+                     :origin-payload origin-payload
+                     :source-evidence-sha256
+                     (epi-ledger--recovery-copy-plan-string
+                      (epi-ledger--recovery-reseal-plan-source-evidence-sha256
+                       plan)
+                      64)
+                     :destination-header-sha256
+                     (epi-ledger--recovery-copy-plan-string
+                      (epi-ledger--recovery-reseal-plan-destination-header-sha256
+                       plan)
+                      64)
+                     :destination-header-byte-size
+                     (epi-ledger--recovery-reseal-plan-destination-header-byte-size
+                      plan)
+                     :destination-prefix-head
+                     (epi-ledger--recovery-copy-plan-string
+                      (epi-ledger--recovery-reseal-plan-destination-prefix-head
+                       plan)
+                      64)
+                     :final-head
+                     (epi-ledger--recovery-copy-plan-string
+                      (epi-ledger--recovery-reseal-plan-final-head plan)
+                      64)
+                     :origin-frame-byte-size
+                     (epi-ledger--recovery-reseal-plan-origin-frame-byte-size
+                      plan)
+                     :source-record-count
+                     (epi-ledger--recovery-reseal-plan-source-record-count plan)
+                     :output-record-count
+                     (epi-ledger--recovery-reseal-plan-output-record-count plan)
+                     :byte-size
+                     (epi-ledger--recovery-reseal-plan-byte-size plan)))
+                   (scalar-strings
+                    (list
+                     (epi-ledger--recovery-source-proof-canonical-path
+                      source-proof)
+                     (epi-ledger--recovery-source-proof-header-title
+                      source-proof)
+                     (epi-ledger--recovery-source-proof-header-session-id
+                      source-proof)
+                     (epi-ledger--recovery-source-proof-header-created-at
+                      source-proof)
+                     (epi-ledger--recovery-source-proof-header-project-root
+                      source-proof)
+                     (epi-ledger--recovery-source-proof-header-coding-system
+                      source-proof)
+                     (epi-ledger--recovery-source-proof-header-hash source-proof)
+                     (epi-ledger--recovery-source-proof-valid-prefix-head
+                      source-proof)
+                     (epi-ledger--recovery-source-proof-fragment-hash
+                      source-proof)
+                     (epi-ledger--recovery-reseal-plan-destination-session-id
+                      copy)
+                     (epi-ledger--recovery-reseal-plan-origin-id copy)
+                     (epi-ledger--recovery-reseal-plan-origin-at copy)
+                     (epi-ledger--recovery-reseal-plan-source-evidence-sha256
+                      copy)
+                     (epi-ledger--recovery-reseal-plan-destination-header-sha256
+                      copy)
+                     (epi-ledger--recovery-reseal-plan-destination-prefix-head
+                      copy)
+                     (epi-ledger--recovery-reseal-plan-final-head copy))))
+                  (list copy source-proof original-record-proofs
+                        scalar-strings)))
+            (error (epi-ledger--recovery-reseal-plan-changed))))
+         (copy (nth 0 captured))
+         (source-proof (nth 1 captured))
+         (original-record-proofs (nth 2 captured))
+         (scalar-strings (nth 3 captured)))
+    ;; No cooperative callback runs until every scalar that authenticates the
+    ;; output has been detached from the caller-owned plan.  The linear proof
+    ;; graph can then be copied incrementally because every changed proof is
+    ;; checked against those frozen source and destination bindings.
+    (epi-ledger--recovery-validate-source-proof-scalars source-proof)
+    (let ((header-size
+           (epi-ledger--recovery-reseal-plan-destination-header-byte-size copy))
+          (origin-size
+           (epi-ledger--recovery-reseal-plan-origin-frame-byte-size copy))
+          (source-count
+           (epi-ledger--recovery-reseal-plan-source-record-count copy))
+          (output-count
+           (epi-ledger--recovery-reseal-plan-output-record-count copy))
+          (byte-size (epi-ledger--recovery-reseal-plan-byte-size copy)))
+      (unless
+          (and
+           (epi-ledger--uuid-p
+            (epi-ledger--recovery-reseal-plan-destination-session-id copy))
+           (epi-ledger--uuid-p
+            (epi-ledger--recovery-reseal-plan-origin-id copy))
+           (epi-ledger--timestamp-p
+            (epi-ledger--recovery-reseal-plan-origin-at copy))
+           (epi-ledger--hash-p
+            (epi-ledger--recovery-reseal-plan-source-evidence-sha256 copy))
+           (epi-ledger--hash-p
+            (epi-ledger--recovery-reseal-plan-destination-header-sha256 copy))
+           (epi-ledger--hash-p
+            (epi-ledger--recovery-reseal-plan-destination-prefix-head copy))
+           (epi-ledger--hash-p
+            (epi-ledger--recovery-reseal-plan-final-head copy))
+           (epi-ledger--recovery-bounded-unsigned-p header-size)
+           (> header-size 0) (<= header-size epi-record-frame-byte-limit)
+           (epi-ledger--recovery-bounded-unsigned-p origin-size)
+           (> origin-size 0) (<= origin-size epi-record-frame-byte-limit)
+           (epi-ledger--recovery-bounded-unsigned-p source-count)
+           (> source-count 0)
+           (= source-count
+              (epi-ledger--recovery-source-proof-record-count source-proof))
+           (epi-ledger--recovery-bounded-unsigned-p output-count)
+           (= output-count (1+ source-count))
+           (epi-ledger--recovery-bounded-unsigned-p byte-size)
+           (> byte-size (+ header-size origin-size)))
+        (epi-ledger--recovery-reseal-plan-changed)))
+    (dolist (text scalar-strings)
+      (epi-ledger--work-charge-count work (string-bytes text)))
+    (setf
+     (epi-ledger--recovery-source-proof-record-proofs source-proof)
+     (epi-ledger--recovery-copy-record-proofs
+      original-record-proofs
+      (epi-ledger--recovery-source-proof-record-count source-proof)
+      work))
+    copy))
+
+(defun epi-ledger--recovery-validate-copied-plan (plan work)
+  "Close copied recovery PLAN before output and return its sealed origin.
+WORK charges the iterative proof walk.  The returned frame is private owned
+data and is not published until the source pass has matched the same plan."
+  (condition-case nil
+      (let* ((source-proof
+              (epi-ledger--recovery-reseal-plan-source-proof plan))
+             (destination-header
+              (let ((epi-ledger--cold-open-validation t))
+                (epi-ledger-seal-header
+                 :session-id
+                 (epi-ledger--recovery-reseal-plan-destination-session-id plan)
+                 :created-at
+                 (epi-ledger--recovery-source-proof-header-created-at
+                  source-proof)
+                 :project-root
+                 (epi-ledger--recovery-source-proof-header-project-root
+                  source-proof))))
+             (header-size
+              (epi-ledger--header-rendered-byte-size
+               (epi-header--raw-session-id destination-header)
+               (epi-header--raw-created-at destination-header)
+               (epi-header--raw-project-root destination-header)))
+             (source-tail
+              (epi-ledger--recovery-source-proof-header-hash source-proof))
+             (destination-tail (epi-header--raw-hash destination-header))
+             (proof-tail
+              (epi-ledger--recovery-source-proof-record-proofs source-proof))
+             (prefix-size header-size)
+             (count 0)
+             (records-since-yield 0))
+        (unless
+            (and
+             (equal
+              destination-tail
+              (epi-ledger--recovery-reseal-plan-destination-header-sha256
+               plan))
+             (=
+              header-size
+              (epi-ledger--recovery-reseal-plan-destination-header-byte-size
+               plan)))
+          (epi-ledger--recovery-reseal-plan-changed))
+        (while (consp proof-tail)
+          (let* ((proof (car proof-tail))
+                 (source-previous
+                  (epi-ledger--recovery-record-proof-source-previous-hash
+                   proof))
+                 (source-hash
+                  (epi-ledger--recovery-record-proof-source-hash proof))
+                 (destination-hash
+                  (epi-ledger--recovery-record-proof-destination-hash proof))
+                 (frame-size
+                  (epi-ledger--recovery-record-proof-frame-byte-size proof)))
+            (unless (equal source-previous source-tail)
+              (epi-ledger--recovery-reseal-plan-changed))
+            (setq source-tail source-hash
+                  destination-tail destination-hash
+                  prefix-size (+ prefix-size frame-size)
+                  count (1+ count)
+                  records-since-yield (1+ records-since-yield)
+                  proof-tail (cdr proof-tail))
+            (unless (epi-ledger--recovery-bounded-unsigned-p prefix-size)
+              (epi-ledger--recovery-reseal-plan-changed))
+            (epi-ledger--work-charge-count work 4)
+            (when (>= records-since-yield epi-ledger-work-record-limit)
+              (epi-ledger--work-yield work)
+              (setq records-since-yield 0))))
+        (unless
+            (and
+             (null proof-tail)
+             (= count
+                (epi-ledger--recovery-reseal-plan-source-record-count plan))
+             (equal
+              source-tail
+              (epi-ledger--recovery-source-proof-valid-prefix-head
+               source-proof))
+             (equal
+              destination-tail
+              (epi-ledger--recovery-reseal-plan-destination-prefix-head plan)))
+          (epi-ledger--recovery-reseal-plan-changed))
+        (let* ((origin-payload
+                (epi-ledger--recovery-origin-payload
+                 source-proof destination-tail))
+               (origin-digest
+                (epi-ledger--object-value
+                 origin-payload "source_evidence_sha256")))
+          (unless
+              (and
+               (equal
+                origin-digest
+                (epi-ledger--recovery-reseal-plan-source-evidence-sha256 plan))
+               (equal
+                (epi-ledger--jcs-encode origin-payload)
+                (epi-ledger--jcs-encode
+                 (epi-ledger--recovery-reseal-plan-origin-payload plan))))
+            (epi-ledger--recovery-reseal-plan-changed))
+          (let* ((origin-result
+                  (epi-ledger--recovery-seal-origin
+                   origin-payload
+                   (epi-ledger--recovery-reseal-plan-origin-id plan)
+                   (epi-ledger--recovery-reseal-plan-origin-at plan)
+                   destination-tail
+                   (epi-ledger--recovery-source-proof-next-sequence
+                    source-proof)
+                   t))
+                 (origin-record (plist-get origin-result :record))
+                 (origin-frame (plist-get origin-result :frame))
+                 (origin-size (plist-get origin-result :frame-byte-size)))
+            (unless
+                (and
+                 (equal
+                  (epi-record--raw-previous-hash origin-record)
+                  destination-tail)
+                 (equal
+                  (epi-record--raw-hash origin-record)
+                  (epi-ledger--recovery-reseal-plan-final-head plan))
+                 (=
+                  origin-size
+                  (epi-ledger--recovery-reseal-plan-origin-frame-byte-size
+                   plan))
+                 (=
+                  (1+ count)
+                  (epi-ledger--recovery-reseal-plan-output-record-count plan))
+                 (=
+                  (+ prefix-size origin-size)
+                  (epi-ledger--recovery-reseal-plan-byte-size plan)))
+              (epi-ledger--recovery-reseal-plan-changed))
+            origin-frame)))
+    (error (epi-ledger--recovery-reseal-plan-changed))))
+
+(defun epi-ledger--recovery-stream-reseal (inspection plan emit)
+  "Stream INSPECTION's exact reseal under PLAN to bounded callback EMIT."
+  (unless (epi-ledger--recovery-reseal-plan-p plan)
+    (epi-ledger--format-fail 'recovery-reseal-plan-required))
+  (unless (functionp emit)
+    (epi-ledger--format-fail 'recovery-reseal-emitter-required))
+  (epi-ledger--recovery-require-truncated-inspection inspection)
+  (epi-ledger--with-operation-work-state
+    (let* ((plan
+            (epi-ledger--recovery-copy-plan
+             plan (epi-ledger--make-work-state)))
+           (prepared-origin
+            (epi-ledger--recovery-validate-copied-plan
+             plan (epi-ledger--make-work-state)))
+           (source-proof
+            (epi-ledger--recovery-reseal-plan-source-proof plan))
+           (current-proof
+            (epi-ledger--recovery-snapshot-source-proof inspection)))
+      (unless
+          (epi-ledger--recovery-source-proof-equal-p
+           source-proof current-proof)
+        (epi-ledger--recovery-reseal-source-changed))
+      (let* ((pass
+              (epi-ledger--recovery-reseal-source-pass
+               inspection source-proof
+               (epi-ledger--recovery-reseal-plan-destination-session-id plan)
+               plan emit))
+             (after-proof
+              (epi-ledger--recovery-snapshot-source-proof inspection))
+             (destination-head
+              (plist-get pass :destination-prefix-head)))
+        (unless
+            (epi-ledger--recovery-source-proof-equal-p
+             source-proof after-proof)
+          (epi-ledger--recovery-reseal-source-changed))
+        (unless
+            (and
+             (equal
+              (plist-get pass :header-sha256)
+              (epi-ledger--recovery-reseal-plan-destination-header-sha256
+               plan))
+             (=
+              (plist-get pass :header-byte-size)
+              (epi-ledger--recovery-reseal-plan-destination-header-byte-size
+               plan))
+             (equal
+              destination-head
+              (epi-ledger--recovery-reseal-plan-destination-prefix-head
+               plan))
+             (=
+              (plist-get pass :source-record-count)
+              (epi-ledger--recovery-reseal-plan-source-record-count plan))
+             (=
+              (plist-get pass :byte-size)
+              (- (epi-ledger--recovery-reseal-plan-byte-size plan)
+                 (epi-ledger--recovery-reseal-plan-origin-frame-byte-size
+                  plan))))
+          (epi-ledger--recovery-reseal-plan-changed))
+        (funcall emit prepared-origin)
+        plan))))
 
 (defun epi-ledger--create-validate-draft-shape (drafts session-id)
   "Require owned DRAFTS to lead with session-info for SESSION-ID."

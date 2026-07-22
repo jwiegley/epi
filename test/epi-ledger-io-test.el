@@ -7,9 +7,9 @@
 
 ;;; Commentary:
 
-;; Task 5 storage, locking, append, and object tests.  This initial RED slice
-;; freezes the Wave 0 semantic-capsule, record-index, checkpoint-CAS, and batch
-;; ownership contracts before any filesystem mutation is implemented.
+;; Storage, locking, append, object, torn-tail inspection, and recovery tests.
+;; These freeze semantic-capsule, record-index, checkpoint-CAS, ownership,
+;; recovery provenance, cursor, and fail-closed filesystem contracts.
 
 ;;; Code:
 
@@ -11097,6 +11097,1745 @@ When AFTER-LEAF is non-nil, include its leaf and await only the terminal."
       (epi-test-ledger-io--recovery-open-bytes
        (plist-get recovered :bytes))))))
 
+
+(defconst epi-test-ledger-io--wave2-destination-session-id
+  "22222222-2222-4222-8222-222222222222"
+  "Deterministic destination session ID for recovery reseal tests.")
+
+(defconst epi-test-ledger-io--wave2-origin-id
+  "90000000-0000-4000-8000-000000000099"
+  "Deterministic fresh recovery-origin record ID for Wave 2.")
+
+(defconst epi-test-ledger-io--wave2-origin-at
+  "2026-07-22T11:00:00-07:00"
+  "Deterministic recovery-origin timestamp for Wave 2.")
+
+(define-error 'epi-test-ledger-io-wave2-sink-failure
+  "Injected Wave 2 reseal sink failure")
+
+(defun epi-test-ledger-io--wave2-unexpected-api (&rest arguments)
+  "Fail because Wave 2 reached a forbidden API with ARGUMENTS."
+  (ert-fail (format "Wave 2 reached forbidden API: %S" arguments)))
+
+(defun epi-test-ledger-io--wave2-inspect-fixture (root name)
+  "Copy torn fixture NAME below ROOT and return its recovery inspection."
+  (let* ((bytes (epi-test-ledger-io--recovery-fixture-bytes name))
+         (source
+          (epi-test-ledger-io--recovery-write-source root bytes)))
+    (epi-ledger--inspect-path
+     source 'allow-one-incomplete-final-frame)))
+
+(defun epi-test-ledger-io--wave2-plan
+    (inspection &optional destination-session-id origin-id origin-at)
+  "Plan INSPECTION's deterministic recovery reseal."
+  (epi-ledger--recovery-plan-reseal
+   inspection
+   (or destination-session-id
+       epi-test-ledger-io--wave2-destination-session-id)
+   (or origin-id epi-test-ledger-io--wave2-origin-id)
+   (or origin-at epi-test-ledger-io--wave2-origin-at)))
+
+(defun epi-test-ledger-io--wave2-collect (inspection plan)
+  "Stream INSPECTION under PLAN and return exact callback chunks and bytes."
+  (let (chunks)
+    (epi-ledger--recovery-stream-reseal
+     inspection plan
+     (lambda (bytes)
+       (should (stringp bytes))
+       (should-not (multibyte-string-p bytes))
+       (should-not (epi-ledger--string-has-properties-p bytes))
+       (should (> (length bytes) 0))
+       (push (substring-no-properties bytes) chunks)))
+    (setq chunks (nreverse chunks))
+    (list :chunks chunks :bytes (apply #'concat chunks))))
+
+(defun epi-test-ledger-io--wave2-private-records (inspection)
+  "Return INSPECTION's private records in physical order."
+  (let (records)
+    (epi-ledger--record-source-each
+     (epi-ledger--inspection-raw-record-index inspection)
+     (lambda (record) (push record records)))
+    (nreverse records)))
+
+(defun epi-test-ledger-io--wave2-record-semantics (record &optional payload)
+  "Return RECORD's semantic fields, optionally substituting PAYLOAD."
+  (list
+   :id (epi-record-id record)
+   :type (epi-record-type record)
+   :schema (epi-record-schema record)
+   :at (epi-record-at record)
+   :parent (epi-record-parent record)
+   :target (epi-record-target record)
+   :turn (epi-record-turn record)
+   :operation (epi-record-operation record)
+   :payload (or payload (epi-record-payload record))
+   :sequence (epi-record-sequence record)))
+
+(defun epi-test-ledger-io--wave2-expected-source-semantics
+    (record firstp destination-session-id)
+  "Return RECORD's allowed reseal semantics for DESTINATION-SESSION-ID."
+  (let ((payload (epi-record-payload record)))
+    (when firstp
+      (let ((entry (assoc "session_id" payload)))
+        (should entry)
+        (setcdr entry destination-session-id)))
+    (epi-test-ledger-io--wave2-record-semantics record payload)))
+
+(defun epi-test-ledger-io--wave2-header-semantics (header)
+  "Return HEADER fields that recovery resealing must preserve."
+  (list
+   :title (epi-header-title header)
+   :format (epi-header-format header)
+   :created-at (epi-header-created-at header)
+   :project-root (epi-header-project-root header)
+   :coding-system (epi-header-coding-system header)))
+
+(defun epi-test-ledger-io--wave2-open-output (bytes)
+  "Cold-open exact resealed destination BYTES."
+  (epi-test-ledger-io--recovery-open-bytes bytes))
+
+(defun epi-test-ledger-io--wave2-assert-plan-evidence
+    (inspection plan origin)
+  "Assert PLAN and output ORIGIN bind INSPECTION's complete evidence."
+  (let* ((payload
+          (epi-ledger--recovery-reseal-plan-origin-payload plan))
+         (digest
+          (epi-ledger--recovery-reseal-plan-source-evidence-sha256 plan))
+         (header (epi-ledger--inspection-raw-header inspection))
+         (fragment-hash
+          (epi-ledger--inspection-raw-fragment-hash inspection))
+         (fragment-size
+          (epi-ledger--inspection-raw-fragment-size inspection))
+         (object
+          (epi-test-ledger-io--recovery-field
+           payload "fragment_object")))
+    (should
+     (equal digest
+            (epi-test-ledger-io--recovery-field
+             payload "source_evidence_sha256")))
+    (should
+     (equal digest
+            (epi-test-ledger-io--recovery-evidence-v1-sha256 payload)))
+    (should
+     (equal (epi-ledger--inspection-raw-canonical-path inspection)
+            (epi-test-ledger-io--recovery-field payload "source_path")))
+    (should
+     (equal (epi-header-session-id header)
+            (epi-test-ledger-io--recovery-field
+             payload "source_session_id")))
+    (should
+     (= (epi-ledger--inspection-raw-source-size inspection)
+        (epi-test-ledger-io--recovery-field payload "source_file_size")))
+    (should
+     (equal (epi-header-hash header)
+            (epi-test-ledger-io--recovery-field
+             payload "source_header_sha256")))
+    (should
+     (equal (epi-ledger--inspection-raw-valid-prefix-head inspection)
+            (epi-test-ledger-io--recovery-field
+             payload "source_valid_prefix_head_sha256")))
+    (should
+     (= (epi-ledger--inspection-raw-fragment-offset inspection)
+        (epi-test-ledger-io--recovery-field payload "fragment_offset")))
+    (should
+     (= fragment-size
+        (epi-test-ledger-io--recovery-field payload "fragment_size")))
+    (should
+     (equal fragment-hash
+            (epi-test-ledger-io--recovery-field payload "fragment_sha256")))
+    (should (equal fragment-hash
+                   (epi-test-ledger-io--recovery-field object "hash")))
+    (should (= fragment-size
+               (epi-test-ledger-io--recovery-field object "size")))
+    (should
+     (equal "application/octet-stream"
+            (epi-test-ledger-io--recovery-field object "media_type")))
+    (should
+     (equal "recovery-fragment"
+            (epi-test-ledger-io--recovery-field object "role")))
+    (should
+     (equal
+      (epi-ledger--recovery-reseal-plan-destination-prefix-head plan)
+      (epi-test-ledger-io--recovery-field
+       payload "destination_valid_prefix_head_sha256")))
+    (should (equal payload (epi-record-payload origin)))
+    (should
+     (equal digest
+            (epi-ledger--payload-value
+             origin "source_evidence_sha256")))))
+
+(defun epi-test-ledger-io--wave2-assert-output
+    (inspection plan result)
+  "Assert RESULT is PLAN's exact cold-openable reseal of INSPECTION."
+  (let* ((bytes (plist-get result :bytes))
+         (chunks (plist-get result :chunks))
+         (ledger (epi-test-ledger-io--wave2-open-output bytes))
+         (source-header (epi-ledger--inspection-raw-header inspection))
+         (destination-header (epi-ledger-header ledger))
+         (source-records
+          (epi-test-ledger-io--wave2-private-records inspection))
+         (destination-records (epi-ledger-records ledger))
+         (source-count (length source-records))
+         (output-count (length destination-records))
+         (origin (aref destination-records (1- output-count))))
+    (should
+     (equal
+      (epi-test-ledger-io--wave2-header-semantics source-header)
+      (epi-test-ledger-io--wave2-header-semantics destination-header)))
+    (should
+     (equal epi-test-ledger-io--wave2-destination-session-id
+            (epi-header-session-id destination-header)))
+    (should-not
+     (equal (epi-header-hash source-header)
+            (epi-header-hash destination-header)))
+    (should
+     (= source-count
+        (epi-ledger--recovery-reseal-plan-source-record-count plan)))
+    (should
+     (= (1+ source-count)
+        (epi-ledger--recovery-reseal-plan-output-record-count plan)))
+    (should (= (1+ source-count) output-count))
+    (should (= (1+ output-count) (length chunks)))
+    (should
+     (= (length bytes)
+        (epi-ledger--recovery-reseal-plan-byte-size plan)))
+    (cl-loop
+     for source in source-records
+     for index from 0
+     for destination = (aref destination-records index)
+     do
+     (should
+      (equal
+       (epi-test-ledger-io--wave2-expected-source-semantics
+        source (= index 0)
+        epi-test-ledger-io--wave2-destination-session-id)
+       (epi-test-ledger-io--wave2-record-semantics destination))))
+    (should (eq 'recovery-origin (epi-record-type origin)))
+    (should (equal epi-test-ledger-io--wave2-origin-id
+                   (epi-record-id origin)))
+    (should (equal epi-test-ledger-io--wave2-origin-at
+                   (epi-record-at origin)))
+    (should
+     (equal
+      (epi-ledger--recovery-reseal-plan-destination-prefix-head plan)
+      (epi-record-previous-hash origin)))
+    (should
+     (equal (epi-ledger--recovery-reseal-plan-final-head plan)
+            (epi-record-hash origin)))
+    (should
+     (equal (epi-ledger--recovery-reseal-plan-final-head plan)
+            (epi-ledger-tail-hash ledger)))
+    (epi-test-ledger-io--wave2-assert-plan-evidence
+     inspection plan origin)))
+
+(defun epi-test-ledger-io--wave2-count-retained-frames (plan)
+  "Return the number of complete record frames retained by PLAN."
+  (let ((seen (make-hash-table :test #'eq))
+        (count 0))
+    (cl-labels
+        ((visit
+          (value)
+          (unless (or (null value) (gethash value seen))
+            (when (or (consp value) (vectorp value) (hash-table-p value))
+              (puthash value t seen))
+            (cond
+             ((stringp value)
+              (when (and (string-prefix-p "* " value)
+                         (string-suffix-p "\n#+end_epi-json\n" value))
+                (setq count (1+ count))))
+             ((or (epi-ledger--inspection-p value)
+                  (epi-ledger--record-index-p value)
+                  (epi-ledger--semantic-capsule-p value)
+                  (epi-record-p value))
+              nil)
+             ((consp value)
+              (visit (car value))
+              (visit (cdr value)))
+             ((vectorp value)
+              (dotimes (index (length value))
+                (visit (aref value index))))
+             ((hash-table-p value)
+              (maphash (lambda (key item) (visit key) (visit item)) value))))))
+      (visit plan))
+    count))
+
+(defun epi-test-ledger-io--wave2-condition-code (thunk type)
+  "Run THUNK, require error TYPE, and return its structured code."
+  (epi-test-ledger-io--condition-code
+   (should-error (funcall thunk) :type type)))
+
+(defun epi-test-ledger-io--wave2-mutate-third-record (inspection)
+  "Mutate one nested object in INSPECTION's future third record."
+  (let* ((index (epi-ledger--inspection-raw-record-index inspection))
+         (record (epi-ledger--record-source-elt index 2))
+         (payload (epi-record--raw-payload record))
+         (request-params (assoc "request_params" payload)))
+    (should request-params)
+    (setcdr request-params '(("temperature" . 0)))))
+
+(defun epi-test-ledger-io--wave2-large-drafts (operation-count)
+  "Return a valid settled prefix containing OPERATION-COUNT operations."
+  (let ((drafts (list (epi-test-ledger-io--session-info))))
+    (dotimes (index operation-count)
+      (let* ((ordinal (1+ index))
+             (operation
+              (format "70000000-0000-4000-8000-%012x" ordinal))
+             (start-id
+              (format "71000000-0000-4000-8000-%012x" ordinal))
+             (terminal-id
+              (format "72000000-0000-4000-8000-%012x" ordinal)))
+        (setq drafts
+              (nconc
+               drafts
+               (list
+                (epi-test-ledger-io--draft
+                 start-id 'operation-started
+                 `(("operation_id" . ,operation) ("kind" . "prompt"))
+                 :operation operation)
+                (epi-test-ledger-io--draft
+                 terminal-id 'operation-interrupted
+                 `(("operation_id" . ,operation)
+                   ("reason" . "interrupted"))
+                 :operation operation))))))
+    drafts))
+
+(defun epi-test-ledger-io--wave2-large-inspection (root operation-count)
+  "Return a torn inspection with OPERATION-COUNT settled operations."
+  (let* ((history
+          (epi-test-ledger-io--recovery-history
+           (epi-test-ledger-io--wave2-large-drafts operation-count)))
+         (fixture
+          (epi-test-ledger-io--recovery-fixture-bytes
+           "torn-final-headline.org"))
+         (fragment
+          (substring
+           fixture epi-test-ledger-io--recovery-valid-prefix-end-offset))
+         (source
+          (epi-test-ledger-io--recovery-write-source
+           root (concat (plist-get history :bytes) fragment))))
+    (epi-ledger--inspect-path
+     source 'allow-one-incomplete-final-frame)))
+
+(defun epi-test-ledger-io--wave2-inspection-with-created-at
+    (root created-at)
+  "Return a torn inspection below ROOT whose sealed header uses CREATED-AT."
+  (let* ((header
+          (epi-ledger-seal-header
+           :session-id epi-test-ledger-io--session-id
+           :created-at created-at
+           :project-root "/tmp/epi-project/"))
+         (history
+          (epi-test-ledger-io--recovery-history
+           (epi-test-ledger-io--full-drafts) :header header))
+         (fixture
+          (epi-test-ledger-io--recovery-fixture-bytes
+           "torn-final-headline.org"))
+         (fragment
+          (substring
+           fixture epi-test-ledger-io--recovery-valid-prefix-end-offset))
+         (source
+          (epi-test-ledger-io--recovery-write-source
+           root (concat (plist-get history :bytes) fragment))))
+    (epi-ledger--inspect-path
+     source 'allow-one-incomplete-final-frame)))
+
+(defun epi-test-ledger-io--wave2-historical-inspection (root)
+  "Return a torn inspection whose prefix has one reconciled origin."
+  (let* ((prefix (cl-subseq (epi-test-ledger-io--full-drafts) 0 3))
+         (history
+          (epi-test-ledger-io--recovery-history
+           prefix :origins '(fresh)
+           :suffix
+           (list
+            (epi-test-ledger-io--recovery-turn-interrupted)
+            (epi-test-ledger-io--recovery-operation-interrupted))))
+         (fixture
+          (epi-test-ledger-io--recovery-fixture-bytes
+           "torn-final-headline.org"))
+         (fragment
+          (substring
+           fixture epi-test-ledger-io--recovery-valid-prefix-end-offset))
+         (source
+          (epi-test-ledger-io--recovery-write-source
+           root (concat (plist-get history :bytes) fragment))))
+    (epi-ledger--inspect-path
+     source 'allow-one-incomplete-final-frame)))
+
+(defun epi-test-ledger-io--wave2-unreconciled-historical-inspection (root)
+  "Return a torn inspection whose prefix has one unreconciled origin."
+  (let* ((prefix (cl-subseq (epi-test-ledger-io--full-drafts) 0 3))
+         (history
+          (epi-test-ledger-io--recovery-history
+           prefix :origins '(fresh)))
+         (fixture
+          (epi-test-ledger-io--recovery-fixture-bytes
+           "torn-final-headline.org"))
+         (fragment
+          (substring
+           fixture epi-test-ledger-io--recovery-valid-prefix-end-offset))
+         (source
+          (epi-test-ledger-io--recovery-write-source
+           root (concat (plist-get history :bytes) fragment))))
+    (epi-ledger--inspect-path
+     source 'allow-one-incomplete-final-frame)))
+
+(ert-deftest epi-ledger-recovery-reseal-private-api-is-frozen ()
+  (should (fboundp 'epi-ledger--recovery-reseal-plan-p))
+  (should (fboundp 'epi-ledger--recovery-plan-reseal))
+  (should (fboundp 'epi-ledger--recovery-stream-reseal))
+  (dolist (accessor
+           '(epi-ledger--recovery-reseal-plan-origin-payload
+             epi-ledger--recovery-reseal-plan-source-evidence-sha256
+             epi-ledger--recovery-reseal-plan-destination-header-sha256
+             epi-ledger--recovery-reseal-plan-destination-prefix-head
+             epi-ledger--recovery-reseal-plan-final-head
+             epi-ledger--recovery-reseal-plan-source-record-count
+             epi-ledger--recovery-reseal-plan-output-record-count
+             epi-ledger--recovery-reseal-plan-byte-size))
+    (should (fboundp accessor))))
+
+(ert-deftest epi-ledger-recovery-reseal-covers-five-root-torn-fixtures ()
+  (dolist (case epi-test-ledger-io--recovery-tail-classifier-cases)
+    (epi-test-with-temporary-root (root)
+      (let* ((inspection
+              (epi-test-ledger-io--wave2-inspect-fixture root (car case)))
+             (plan (epi-test-ledger-io--wave2-plan inspection))
+             (result
+              (epi-test-ledger-io--wave2-collect inspection plan)))
+        (should (epi-ledger--recovery-reseal-plan-p plan))
+        (should (= 0
+                   (epi-test-ledger-io--wave2-count-retained-frames plan)))
+        (epi-test-ledger-io--wave2-assert-output
+         inspection plan result)))))
+
+(ert-deftest epi-ledger-recovery-reseal-is-deterministic-across-two-passes ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (plan-a (epi-test-ledger-io--wave2-plan inspection))
+           (plan-b (epi-test-ledger-io--wave2-plan inspection))
+           (first (epi-test-ledger-io--wave2-collect inspection plan-a))
+           (second (epi-test-ledger-io--wave2-collect inspection plan-a))
+           (third (epi-test-ledger-io--wave2-collect inspection plan-b)))
+      (dolist (accessor
+               '(epi-ledger--recovery-reseal-plan-origin-payload
+                 epi-ledger--recovery-reseal-plan-source-evidence-sha256
+                 epi-ledger--recovery-reseal-plan-destination-prefix-head
+                 epi-ledger--recovery-reseal-plan-final-head
+                 epi-ledger--recovery-reseal-plan-source-record-count
+                 epi-ledger--recovery-reseal-plan-output-record-count
+                 epi-ledger--recovery-reseal-plan-byte-size))
+        (should (equal (funcall accessor plan-a)
+                       (funcall accessor plan-b))))
+      (should (equal first second))
+      (should (equal first third))
+      (epi-test-ledger-io--wave2-assert-output inspection plan-a first))))
+
+(ert-deftest epi-ledger-recovery-reseal-owns-all-generated-inputs-before-yield ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-drawer.org"))
+           (destination
+            (copy-sequence epi-test-ledger-io--wave2-destination-session-id))
+           (origin-id (copy-sequence epi-test-ledger-io--wave2-origin-id))
+           (origin-at (copy-sequence epi-test-ledger-io--wave2-origin-at))
+           (expected-destination (copy-sequence destination))
+           (expected-origin-id (copy-sequence origin-id))
+           (expected-origin-at (copy-sequence origin-at))
+           (epi-ledger-work-byte-limit 1)
+           (epi-ledger-work-time-budget 1000.0)
+           (yield-count 0)
+           (epi--yield-function
+            (lambda ()
+              (setq yield-count (1+ yield-count))
+              (aset destination 0 ?3)
+              (aset origin-id 0 ?8)
+              (aset origin-at 0 ?3)))
+           plan result ledger records origin)
+      (setq plan
+            (epi-ledger--recovery-plan-reseal
+             inspection destination origin-id origin-at)
+            result (epi-test-ledger-io--wave2-collect inspection plan)
+            ledger
+            (epi-test-ledger-io--wave2-open-output
+             (plist-get result :bytes))
+            records (epi-ledger-records ledger)
+            origin (aref records (1- (length records))))
+      (should (> yield-count 0))
+      (should (equal expected-destination
+                     (epi-ledger-session-id ledger)))
+      (should (equal expected-origin-id (epi-record-id origin)))
+      (should (equal expected-origin-at (epi-record-at origin))))))
+
+(ert-deftest epi-ledger-recovery-reseal-freezes-plan-scalars-before-yield ()
+  (epi-test-with-temporary-root (root)
+    (let* ((long-created-at
+            (concat "2026-07-22T12:00:00." (make-string 100 ?0) "Z"))
+           (inspection
+            (epi-test-ledger-io--wave2-inspection-with-created-at
+             root long-created-at))
+           (original-id epi-test-ledger-io--wave2-origin-id)
+           (replacement-id "90000000-0000-4000-8000-000000000088")
+           (replacement-at "2026-07-22T12:00:00-07:00")
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (replacement
+            (epi-test-ledger-io--wave2-plan
+             inspection nil replacement-id replacement-at))
+           (epi-ledger-work-byte-limit 1)
+           (epi-ledger-work-time-budget 1000.0)
+           (gc-cons-threshold 12345)
+           mutated
+           (epi--yield-function
+            (lambda ()
+              (should (= gc-cons-threshold 12345))
+              (unless mutated
+                (setq mutated t)
+                (setf
+                 (epi-ledger--recovery-reseal-plan-origin-id plan)
+                 (epi-ledger--recovery-reseal-plan-origin-id replacement)
+                 (epi-ledger--recovery-reseal-plan-origin-at plan)
+                 (epi-ledger--recovery-reseal-plan-origin-at replacement)
+                 (epi-ledger--recovery-reseal-plan-final-head plan)
+                 (epi-ledger--recovery-reseal-plan-final-head replacement)
+                 (epi-ledger--recovery-reseal-plan-origin-frame-byte-size plan)
+                 (epi-ledger--recovery-reseal-plan-origin-frame-byte-size
+                  replacement)
+                 (epi-ledger--recovery-reseal-plan-byte-size plan)
+                 (epi-ledger--recovery-reseal-plan-byte-size replacement)))))
+           (result (epi-test-ledger-io--wave2-collect inspection plan))
+           (ledger
+            (epi-test-ledger-io--wave2-open-output
+             (plist-get result :bytes)))
+           (records (epi-ledger-records ledger))
+           (origin (aref records (1- (length records)))))
+      (should mutated)
+      (should (equal original-id (epi-record-id origin)))
+      (should-not (equal replacement-id (epi-record-id origin))))))
+
+(ert-deftest epi-ledger-recovery-reseal-avoids-default-batch-and-path-apis ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-begin-block.org"))
+           (epi-ledger--batch-record-limit 1)
+           (epi-ledger--batch-byte-limit 1)
+           (epi-ledger--byte-writer
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           (epi-ledger--stat-function
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           (epi-ledger--read-function
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           plan result)
+      (cl-letf
+          (((symbol-function 'epi--new-id)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi--format-timestamp)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger--snapshot-draft-batch)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger--create-document-bytes)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger--prepare-record-batch)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger-records)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger--inspect-path)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger-open)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger-create)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger--acquire-lock)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger--write-bytes)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger--read-bytes)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger--file-identity)
+            #'epi-test-ledger-io--wave2-unexpected-api))
+        (setq plan (epi-test-ledger-io--wave2-plan inspection)
+              result (epi-test-ledger-io--wave2-collect inspection plan)))
+      (should
+       (= (+ 2
+             (epi-ledger--record-index-raw-count
+              (epi-ledger--inspection-raw-record-index inspection)))
+          (length (plist-get result :chunks)))))))
+
+(ert-deftest epi-ledger-recovery-reseal-exceeds-batch-count-with-cadence ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-large-inspection root 130))
+           (source-count
+            (epi-ledger--record-index-raw-count
+             (epi-ledger--inspection-raw-record-index inspection)))
+           (epi-ledger-work-record-limit 7)
+           (epi-ledger-work-byte-limit 4096)
+           (epi-ledger-work-time-budget 1000.0)
+           (yield-count 0)
+           (epi--yield-function
+            (lambda () (setq yield-count (1+ yield-count))))
+           plan result)
+      (should (> source-count epi-ledger--batch-record-limit))
+      (cl-letf
+          (((symbol-function 'epi-ledger--snapshot-draft-batch)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger--create-document-bytes)
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           ((symbol-function 'epi-ledger--prepare-record-batch)
+            #'epi-test-ledger-io--wave2-unexpected-api))
+        (setq plan (epi-test-ledger-io--wave2-plan inspection)
+              result (epi-test-ledger-io--wave2-collect inspection plan)))
+      (should (= (+ source-count 2)
+                 (length (plist-get result :chunks))))
+      (should (> yield-count 10))
+      (should (= 0
+                 (epi-test-ledger-io--wave2-count-retained-frames plan)))
+      (should
+       (epi-ledger-p
+        (epi-test-ledger-io--wave2-open-output
+         (plist-get result :bytes)))))))
+
+(ert-deftest epi-ledger-recovery-reseal-binds-plan-to-exact-inspection ()
+  (epi-test-with-temporary-root (left-root)
+    (epi-test-with-temporary-root (right-root)
+      (let* ((left
+              (epi-test-ledger-io--wave2-inspect-fixture
+               left-root "torn-final-headline.org"))
+             (right
+              (epi-test-ledger-io--wave2-inspect-fixture
+               right-root "torn-final-headline.org"))
+             (plan (epi-test-ledger-io--wave2-plan left))
+             (emissions 0)
+             (code
+              (epi-test-ledger-io--wave2-condition-code
+               (lambda ()
+                 (epi-ledger--recovery-stream-reseal
+                  right plan
+                  (lambda (_bytes)
+                    (setq emissions (1+ emissions)))))
+               'epi-ledger-conflict)))
+        (should (eq 'recovery-reseal-source-changed code))
+        (should (= 0 emissions))))))
+
+(ert-deftest epi-ledger-recovery-reseal-detects-nested-drift-between-passes ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (emissions 0))
+      (epi-test-ledger-io--wave2-mutate-third-record inspection)
+      (let ((code
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-stream-reseal
+                 inspection plan
+                 (lambda (_bytes)
+                   (setq emissions (1+ emissions)))))
+              'epi-ledger-conflict)))
+        (should (eq 'recovery-reseal-source-changed code))
+        (should
+         (< emissions
+            (1+
+             (epi-ledger--recovery-reseal-plan-output-record-count
+              plan))))))))
+
+(ert-deftest epi-ledger-recovery-reseal-detects-future-record-drift ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-end-block.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (emissions 0)
+           (mutated nil)
+           (code
+            (epi-test-ledger-io--wave2-condition-code
+             (lambda ()
+               (epi-ledger--recovery-stream-reseal
+                inspection plan
+                (lambda (_bytes)
+                  (setq emissions (1+ emissions))
+                  (unless mutated
+                    (setq mutated t)
+                    (epi-test-ledger-io--wave2-mutate-third-record
+                     inspection)))))
+             'epi-ledger-conflict)))
+      (should mutated)
+      (should (eq 'recovery-reseal-source-changed code))
+      (should
+       (< emissions
+          (1+
+           (epi-ledger--recovery-reseal-plan-output-record-count plan)))))))
+
+(ert-deftest epi-ledger-recovery-reseal-propagates-sink-failure-once ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-headline.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (calls 0))
+      (should-error
+       (epi-ledger--recovery-stream-reseal
+        inspection plan
+        (lambda (_bytes)
+          (setq calls (1+ calls))
+          (when (= calls 2)
+            (signal 'epi-test-ledger-io-wave2-sink-failure nil))))
+       :type 'epi-test-ledger-io-wave2-sink-failure)
+      (should (= 2 calls)))))
+
+(ert-deftest epi-ledger-recovery-reseal-rejects-invalid-and-reused-ids ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-headline.org"))
+           (source-session-id
+            (epi-header-session-id
+             (epi-ledger--inspection-raw-header inspection)))
+           (first-id
+            (epi-record-id
+             (epi-ledger--record-source-elt
+              (epi-ledger--inspection-raw-record-index inspection) 0))))
+      (should
+       (eq 'invalid-id
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-plan-reseal
+               inspection "not-a-uuid" epi-test-ledger-io--wave2-origin-id
+               epi-test-ledger-io--wave2-origin-at))
+            'epi-ledger-format-error)))
+      (should
+       (eq 'recovery-session-id-reused
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-plan-reseal
+               inspection source-session-id
+               epi-test-ledger-io--wave2-origin-id
+               epi-test-ledger-io--wave2-origin-at))
+            'epi-ledger-format-error)))
+      (should
+       (eq 'invalid-id
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-plan-reseal
+               inspection epi-test-ledger-io--wave2-destination-session-id
+               "not-a-uuid" epi-test-ledger-io--wave2-origin-at))
+            'epi-ledger-format-error)))
+      (should
+       (eq 'duplicate-id
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-plan-reseal
+               inspection epi-test-ledger-io--wave2-destination-session-id
+               first-id epi-test-ledger-io--wave2-origin-at))
+            'epi-ledger-format-error)))
+      (should
+       (eq 'invalid-timestamp
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-plan-reseal
+               inspection epi-test-ledger-io--wave2-destination-session-id
+               epi-test-ledger-io--wave2-origin-id "not-a-time"))
+            'epi-ledger-format-error))))))
+
+(ert-deftest epi-ledger-recovery-reseal-preserves-historical-origin ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-historical-inspection root))
+           (source-records
+            (epi-test-ledger-io--wave2-private-records inspection))
+           (historical
+            (seq-find
+             (lambda (record)
+               (eq 'recovery-origin (epi-record-type record)))
+             source-records))
+           (historical-payload (epi-record-payload historical))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (result (epi-test-ledger-io--wave2-collect inspection plan))
+           (chunks (plist-get result :chunks))
+           (bare-prefix (apply #'concat (butlast chunks)))
+           (bare-condition
+            (should-error
+             (epi-test-ledger-io--wave2-open-output bare-prefix)
+             :type 'epi-ledger-corrupt))
+           (ledger
+            (epi-test-ledger-io--wave2-open-output
+             (plist-get result :bytes)))
+           (records (append (epi-ledger-records ledger) nil))
+           (origins
+            (seq-filter
+             (lambda (record)
+               (eq 'recovery-origin (epi-record-type record)))
+             records))
+           (copied-historical
+            (seq-find
+             (lambda (record)
+               (equal (epi-record-id historical) (epi-record-id record)))
+             records)))
+      (should historical)
+      (should
+       (eq 'recovery-prefix-head-mismatch
+           (epi-test-ledger-io--condition-code bare-condition)))
+      (should (= 2 (length origins)))
+      (should copied-historical)
+      (should
+       (equal (epi-ledger--jcs-encode historical-payload)
+              (epi-ledger--jcs-encode
+               (epi-record-payload copied-historical))))
+      (should
+       (equal
+        (epi-test-ledger-io--recovery-field
+         historical-payload "source_evidence_sha256")
+        (epi-ledger--payload-value
+         copied-historical "source_evidence_sha256")))
+      (epi-test-ledger-io--wave2-assert-output inspection plan result))))
+
+(ert-deftest epi-ledger-recovery-reseal-binds-destination-header-hash ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (result (epi-test-ledger-io--wave2-collect inspection plan))
+           (ledger
+            (epi-test-ledger-io--wave2-open-output
+             (plist-get result :bytes))))
+      (should
+       (equal
+        (epi-header-hash (epi-ledger-header ledger))
+        (epi-ledger--recovery-reseal-plan-destination-header-sha256
+         plan))))))
+
+(ert-deftest epi-ledger-recovery-reseal-requires-truncated-tail-inspection ()
+  (epi-test-with-temporary-root (root)
+    (let* ((fixture
+            (epi-test-ledger-io--recovery-fixture-bytes
+             "torn-final-headline.org"))
+           (clean-prefix
+            (substring
+             fixture 0
+             epi-test-ledger-io--recovery-valid-prefix-end-offset))
+           (source
+            (epi-test-ledger-io--recovery-write-source root clean-prefix))
+           (inspection
+            (epi-ledger--inspect-path
+             source 'allow-one-incomplete-final-frame)))
+      (should
+       (eq 'complete (epi-ledger--inspection-raw-state inspection)))
+      (should
+       (eq 'recovery-truncated-tail-required
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda () (epi-test-ledger-io--wave2-plan inspection))
+            'epi-ledger-format-error))))))
+
+(ert-deftest epi-ledger-recovery-reseal-accepts-identical-reinspection ()
+  (epi-test-with-temporary-root (root)
+    (let* ((planned-inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-drawer.org"))
+           (plan (epi-test-ledger-io--wave2-plan planned-inspection))
+           (streamed-inspection
+            (epi-ledger--inspect-path
+             (epi-ledger--inspection-raw-canonical-path planned-inspection)
+             'allow-one-incomplete-final-frame))
+           (result
+            (epi-test-ledger-io--wave2-collect streamed-inspection plan)))
+      (should-not (eq planned-inspection streamed-inspection))
+      (should-not
+       (eq (epi-ledger--inspection-raw-record-index planned-inspection)
+           (epi-ledger--inspection-raw-record-index streamed-inspection)))
+      (epi-test-ledger-io--wave2-assert-output
+       streamed-inspection plan result))))
+
+(ert-deftest epi-ledger-recovery-reseal-seals-once-per-record-per-pass ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-begin-block.org"))
+           (source-count
+            (epi-ledger--record-index-raw-count
+             (epi-ledger--inspection-raw-record-index inspection)))
+           (original-seal (symbol-function 'epi-ledger-seal-record))
+           (seal-count 0)
+           plan)
+      (cl-letf (((symbol-function 'epi-ledger-seal-record)
+                 (lambda (&rest arguments)
+                   (setq seal-count (1+ seal-count))
+                   (apply original-seal arguments))))
+        (setq plan (epi-test-ledger-io--wave2-plan inspection))
+        (epi-test-ledger-io--wave2-collect inspection plan))
+      (should (= (* 2 (1+ source-count)) seal-count)))))
+
+(ert-deftest epi-ledger-recovery-reseal-appends-one-unrelated-fresh-origin ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-historical-inspection root))
+           (source-records
+            (epi-test-ledger-io--wave2-private-records inspection))
+           (source-count (length source-records))
+           (source-origin-count
+            (cl-count-if
+             (lambda (record)
+               (eq 'recovery-origin (epi-record-type record)))
+             source-records))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (result (epi-test-ledger-io--wave2-collect inspection plan))
+           (ledger
+            (epi-test-ledger-io--wave2-open-output
+             (plist-get result :bytes)))
+           (destination-records (epi-ledger-records ledger))
+           (fresh-origin
+            (aref destination-records (1- (length destination-records))))
+           (destination-origin-count
+            (cl-count-if
+             (lambda (record)
+               (eq 'recovery-origin (epi-record-type record)))
+             destination-records)))
+      (should (= (1+ source-origin-count) destination-origin-count))
+      (should (= (1+ source-count) (epi-record-sequence fresh-origin)))
+      (should (eq 'recovery-origin (epi-record-type fresh-origin)))
+      (should (equal epi-test-ledger-io--wave2-origin-id
+                     (epi-record-id fresh-origin)))
+      (should-not (epi-record-parent fresh-origin))
+      (should-not (epi-record-target fresh-origin))
+      (should-not (epi-record-turn fresh-origin))
+      (should-not (epi-record-operation fresh-origin)))))
+
+(ert-deftest epi-ledger-recovery-reseal-rejects-mutated-source-header ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (header (epi-ledger--inspection-raw-header inspection)))
+      (aset (epi-header--raw-created-at header) 0 ?3)
+      (should
+       (eq 'recovery-reseal-source-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda () (epi-test-ledger-io--wave2-plan inspection))
+            'epi-ledger-conflict))))))
+
+(ert-deftest epi-ledger-recovery-reseal-verifies-header-before-emission ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (emissions 0))
+      (aset
+       (epi-ledger--recovery-reseal-plan-destination-session-id plan) 0 ?3)
+      (should
+       (eq 'recovery-reseal-plan-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-stream-reseal
+               inspection plan
+               (lambda (_bytes)
+                 (setq emissions (1+ emissions)))))
+            'epi-ledger-conflict)))
+      (should (= 0 emissions)))))
+
+(ert-deftest epi-ledger-recovery-reseal-isolates-cold-validation-from-emitter ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-historical-inspection root))
+           (records
+            (epi-test-ledger-io--wave2-private-records inspection))
+           (historical
+            (seq-find
+             (lambda (record)
+               (eq 'recovery-origin (epi-record-type record)))
+             records))
+           (source-path
+            (epi-ledger--payload-value historical "source_path"))
+           (handler-pattern
+            (concat "\\`" (regexp-quote source-path) "\\'"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (emissions 0)
+           (handler-calls 0))
+      (should historical)
+      (cl-letf
+          (((symbol-function
+             'epi-test-ledger-io--wave2-hostile-file-handler)
+            (lambda (operation &rest arguments)
+              (setq handler-calls (1+ handler-calls))
+              (let ((inhibit-file-name-handlers
+                     (cons
+                      'epi-test-ledger-io--wave2-hostile-file-handler
+                      inhibit-file-name-handlers))
+                    (inhibit-file-name-operation operation))
+                (apply operation arguments)))))
+        (let ((file-name-handler-alist
+               (list
+                (cons
+                 handler-pattern
+                 'epi-test-ledger-io--wave2-hostile-file-handler))))
+          (epi-ledger--recovery-stream-reseal
+           inspection plan
+           (lambda (_bytes)
+             (setq emissions (1+ emissions))
+             (when (= emissions 2)
+               (setq epi-ledger--cold-open-validation nil))))))
+      (should (> emissions 2))
+      (should (= 0 handler-calls)))))
+
+(ert-deftest epi-ledger-recovery-reseal-snapshots-origin-barrier-before-yield ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-unreconciled-historical-inspection
+             root))
+           (capsule
+            (epi-ledger--inspection-raw-semantic-capsule inspection))
+           (epi-ledger-work-byte-limit 1)
+           (epi-ledger-work-time-budget 1000.0)
+           (yield-count 0)
+           (epi--yield-function
+            (lambda ()
+              (setq yield-count (1+ yield-count))
+              (setf
+               (cl-struct-slot-value
+                'epi-ledger--semantic-capsule
+                'recovery-terminalization-required capsule)
+               nil))))
+      (should
+       (epi-ledger--semantic-capsule-raw-recovery-terminalization-required
+        capsule))
+      (should
+       (eq 'recovery-terminalization-required
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda () (epi-test-ledger-io--wave2-plan inspection))
+            'epi-ledger-format-error)))
+      (should (> yield-count 0)))))
+
+(ert-deftest epi-ledger-recovery-plan-copy-is-stack-safe-at-ten-thousand-proofs ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-headline.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (source-proof
+            (epi-ledger--recovery-reseal-plan-source-proof plan))
+           (proofs
+            (epi-ledger--recovery-source-proof-record-proofs source-proof))
+           (proof-count 10000))
+      (should proofs)
+      (should (< (length proofs) proof-count))
+      (setf (epi-ledger--recovery-source-proof-record-proofs source-proof)
+            (append
+             proofs
+             (make-list (- proof-count (length proofs)) (car (last proofs))))
+            (epi-ledger--recovery-source-proof-record-count source-proof)
+            proof-count
+            (epi-ledger--recovery-source-proof-next-sequence source-proof)
+            (1+ proof-count)
+            (epi-ledger--recovery-reseal-plan-source-record-count plan)
+            proof-count
+            (epi-ledger--recovery-reseal-plan-output-record-count plan)
+            (1+ proof-count))
+      (cl-labels
+          ((proof-signature
+            (copied-proof)
+            (let ((cursor
+                   (epi-ledger--recovery-source-proof-record-proofs
+                    copied-proof))
+                  (count 0)
+                  material)
+              (while cursor
+                (let ((proof (pop cursor)))
+                  (should (epi-ledger--recovery-record-proof-p proof))
+                  (setq count (1+ count))
+                  (push
+                   (format
+                    "%s:%s:%s:%s"
+                    (epi-ledger--recovery-record-proof-source-previous-hash
+                     proof)
+                    (epi-ledger--recovery-record-proof-source-hash proof)
+                    (epi-ledger--recovery-record-proof-destination-hash proof)
+                    (epi-ledger--recovery-record-proof-frame-byte-size proof))
+                   material)))
+              (list
+               count
+               (secure-hash
+                'sha256 (mapconcat #'identity (nreverse material) "\n")))))
+           (capture-copy
+            ()
+            (let* ((epi-ledger-work-byte-limit 64)
+                   (epi-ledger-work-record-limit 64)
+                   (epi-ledger-work-time-budget 1000.0)
+                   (max-lisp-eval-depth 500)
+                   (yield-count 0)
+                   (epi--yield-function
+                    (lambda () (setq yield-count (1+ yield-count))))
+                   (copied-plan
+                    (epi-ledger--with-operation-work-state
+                      (epi-ledger--recovery-copy-plan
+                       plan (epi-ledger--make-work-state))))
+                   (copied-proof
+                    (epi-ledger--recovery-reseal-plan-source-proof
+                     copied-plan)))
+              (should copied-proof)
+              (should (> yield-count 0))
+              (should-not (eq copied-proof source-proof))
+              (should-not
+               (eq
+                (car
+                 (epi-ledger--recovery-source-proof-record-proofs
+                  copied-proof))
+                (car proofs)))
+              (list (proof-signature copied-proof) yield-count))))
+        (let ((first (capture-copy))
+              (second (capture-copy)))
+          (should (= proof-count (car (car first))))
+          (should (equal first second)))))))
+
+(ert-deftest epi-ledger-recovery-reseal-rejects-validated-end-offset-mismatch ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-headline.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (fragment-offset
+            (epi-ledger--inspection-raw-fragment-offset inspection))
+           (emissions 0))
+      (setf
+       (cl-struct-slot-value
+        'epi-ledger--inspection 'validated-end inspection)
+       (1- fragment-offset))
+      (should
+       (eq 'recovery-reseal-source-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-stream-reseal
+               inspection plan
+               (lambda (_bytes) (setq emissions (1+ emissions)))))
+            'epi-ledger-conflict)))
+      (should (= 0 emissions))
+      (should
+       (eq 'recovery-reseal-source-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda () (epi-test-ledger-io--wave2-plan inspection))
+            'epi-ledger-conflict))))))
+
+(ert-deftest epi-ledger-recovery-reseal-rejects-file-identity-size-mismatch ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-headline.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (identity
+            (epi-ledger--inspection-raw-file-identity inspection))
+           (source-size
+            (epi-ledger--inspection-raw-source-size inspection))
+           (emissions 0))
+      (setf (plist-get identity :size) (1+ source-size))
+      (should
+       (eq 'recovery-reseal-source-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-stream-reseal
+               inspection plan
+               (lambda (_bytes) (setq emissions (1+ emissions)))))
+            'epi-ledger-conflict)))
+      (should (= 0 emissions))
+      (should
+       (eq 'recovery-reseal-source-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda () (epi-test-ledger-io--wave2-plan inspection))
+            'epi-ledger-conflict))))))
+
+(ert-deftest epi-ledger-recovery-reseal-binds-canonical-path-to-identity ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-headline.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (identity
+            (epi-ledger--inspection-raw-file-identity inspection))
+           (emissions 0))
+      (setf (plist-get identity :path) "/different/source.org")
+      (should
+       (eq 'recovery-reseal-source-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-stream-reseal
+               inspection plan
+               (lambda (_bytes) (setq emissions (1+ emissions)))))
+            'epi-ledger-conflict)))
+      (should (= 0 emissions))
+      (should
+       (eq 'recovery-reseal-source-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda () (epi-test-ledger-io--wave2-plan inspection))
+            'epi-ledger-conflict))))))
+
+(ert-deftest epi-ledger-recovery-reseal-checks-fragment-cap-before-hash ()
+  (epi-test-with-temporary-root (root)
+    (let ((inspection
+           (epi-test-ledger-io--wave2-inspect-fixture
+            root "torn-final-headline.org")))
+      (setf
+       (cl-struct-slot-value
+        'epi-ledger--inspection 'fragment-size inspection)
+       (1+ epi-recovery-fragment-byte-limit))
+      (cl-letf (((symbol-function 'epi-ledger--hash)
+                 #'epi-test-ledger-io--wave2-unexpected-api))
+        (should
+         (eq 'recovery-fragment-byte-limit
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda () (epi-test-ledger-io--wave2-plan inspection))
+              'epi-limit-exceeded)))))))
+
+(ert-deftest epi-ledger-recovery-reseal-binds-fragment-to-last-record-end ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-headline.org"))
+           (fragment
+            (epi-ledger--inspection-raw-fragment-bytes inspection))
+           (shifted (substring fragment 1))
+           (offset
+            (1+ (epi-ledger--inspection-raw-fragment-offset inspection))))
+      (setf
+       (cl-struct-slot-value
+        'epi-ledger--inspection 'validated-end inspection)
+       offset
+       (cl-struct-slot-value
+        'epi-ledger--inspection 'fragment-offset inspection)
+       offset
+       (cl-struct-slot-value
+        'epi-ledger--inspection 'fragment-size inspection)
+       (length shifted)
+       (cl-struct-slot-value
+        'epi-ledger--inspection 'fragment-hash inspection)
+       (secure-hash 'sha256 shifted)
+       (cl-struct-slot-value
+        'epi-ledger--inspection 'fragment-bytes inspection)
+       shifted)
+      (should
+       (eq 'recovery-reseal-source-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda () (epi-test-ledger-io--wave2-plan inspection))
+            'epi-ledger-conflict))))))
+
+(ert-deftest epi-ledger-recovery-reseal-rejects-malformed-plan-before-output ()
+  (epi-test-with-temporary-root (root)
+    (let ((inspection
+           (epi-test-ledger-io--wave2-inspect-fixture
+            root "torn-final-json.org")))
+      (dolist (case
+               '((plan destination-session-id)
+                 (plan origin-id)
+                 (plan origin-at)
+                 (plan source-evidence-sha256)
+                 (plan destination-header-sha256)
+                 (plan destination-prefix-head)
+                 (plan final-head)
+                 (plan destination-header-byte-size)
+                 (plan origin-frame-byte-size)
+                 (plan source-record-count)
+                 (plan output-record-count)
+                 (plan byte-size)
+                 (source source-size)
+                 (source header-format)
+                 (source validated-end)
+                 (source next-sequence)
+                 (source fragment-offset)
+                 (source fragment-size)
+                 (source record-count)
+                 (proof source-previous-hash)
+                 (proof source-hash)
+                 (proof destination-hash)
+                 (proof frame-byte-size)))
+        (let* ((plan (epi-test-ledger-io--wave2-plan inspection))
+               (source-proof
+                (epi-ledger--recovery-reseal-plan-source-proof plan))
+               (proof
+                (car
+                 (epi-ledger--recovery-source-proof-record-proofs
+                  source-proof)))
+               (target
+                (pcase (car case)
+                  ('plan plan)
+                  ('source source-proof)
+                  ('proof proof)))
+               (type
+                (pcase (car case)
+                  ('plan 'epi-ledger--recovery-reseal-plan)
+                  ('source 'epi-ledger--recovery-source-proof)
+                  ('proof 'epi-ledger--recovery-record-proof)))
+               (emissions 0))
+          (setf (cl-struct-slot-value type (cadr case) target) "invalid")
+          (should
+           (eq 'recovery-reseal-plan-changed
+               (epi-test-ledger-io--wave2-condition-code
+                (lambda ()
+                  (epi-ledger--recovery-stream-reseal
+                   inspection plan
+                   (lambda (_bytes) (setq emissions (1+ emissions)))))
+                'epi-ledger-conflict)))
+          (should (= 0 emissions)))))))
+
+(ert-deftest epi-ledger-recovery-reseal-rejects-inconsistent-plan-before-output ()
+  (epi-test-with-temporary-root (root)
+    (let ((inspection
+           (epi-test-ledger-io--wave2-inspect-fixture
+            root "torn-final-json.org"))
+          (zero-hash (make-string 64 ?0)))
+      (dolist
+          (mutator
+           (list
+            (lambda (plan)
+              (setf
+               (epi-ledger--recovery-reseal-plan-origin-frame-byte-size plan)
+               1))
+            (lambda (plan)
+              (cl-incf (epi-ledger--recovery-reseal-plan-byte-size plan)))
+            (lambda (plan)
+              (setf
+               (epi-ledger--recovery-reseal-plan-destination-prefix-head plan)
+               zero-hash))
+            (lambda (plan)
+              (setf
+               (epi-ledger--recovery-reseal-plan-source-evidence-sha256 plan)
+               zero-hash))
+            (lambda (plan)
+              (setf
+               (epi-ledger--recovery-reseal-plan-final-head plan)
+               zero-hash))
+            (lambda (plan)
+              (let* ((payload
+                      (epi-ledger--recovery-reseal-plan-origin-payload plan))
+                     (entry (assoc "source_file_size" payload)))
+                (setcdr entry (1- (cdr entry)))))
+            (lambda (plan)
+              (let* ((source-proof
+                      (epi-ledger--recovery-reseal-plan-source-proof plan))
+                     (proof
+                      (car
+                       (epi-ledger--recovery-source-proof-record-proofs
+                        source-proof))))
+                (setf
+                 (epi-ledger--recovery-record-proof-source-previous-hash proof)
+                 zero-hash)))
+            (lambda (plan)
+              (let* ((source-proof
+                      (epi-ledger--recovery-reseal-plan-source-proof plan))
+                     (proofs
+                      (epi-ledger--recovery-source-proof-record-proofs
+                       source-proof)))
+                (setf
+                 (epi-ledger--recovery-record-proof-source-previous-hash
+                  (nth 1 proofs))
+                 zero-hash)))
+            (lambda (plan)
+              (let* ((source-proof
+                      (epi-ledger--recovery-reseal-plan-source-proof plan))
+                     (proof
+                      (car
+                       (last
+                        (epi-ledger--recovery-source-proof-record-proofs
+                         source-proof)))))
+                (setf
+                 (epi-ledger--recovery-record-proof-source-hash proof)
+                 zero-hash)))
+            (lambda (plan)
+              (let* ((source-proof
+                      (epi-ledger--recovery-reseal-plan-source-proof plan))
+                     (proof
+                      (car
+                       (epi-ledger--recovery-source-proof-record-proofs
+                        source-proof))))
+                (cl-incf
+                 (epi-ledger--recovery-record-proof-frame-byte-size proof))))
+            (lambda (plan)
+              (setf
+               (epi-ledger--recovery-reseal-plan-origin-id plan)
+               "90000000-0000-4000-8000-000000000088"
+               (epi-ledger--recovery-reseal-plan-origin-at plan)
+               "2026-07-22T12:00:00-07:00"))))
+        (let ((plan (epi-test-ledger-io--wave2-plan inspection))
+              (emissions 0))
+          (funcall mutator plan)
+          (should
+           (eq 'recovery-reseal-plan-changed
+               (epi-test-ledger-io--wave2-condition-code
+                (lambda ()
+                  (epi-ledger--recovery-stream-reseal
+                   inspection plan
+                   (lambda (_bytes) (setq emissions (1+ emissions)))))
+                'epi-ledger-conflict)))
+          (should (= 0 emissions)))))))
+
+(ert-deftest epi-ledger-recovery-reseal-bounds-plan-scalars-before-copy ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (oversized-project-root
+            (make-string (1+ epi-header-value-byte-limit) ?x))
+           (oversized-uuid (make-string 8388608 ?a))
+           (oversized-integer (ash 1 65)))
+      (dolist (case '(uuid project-root integer))
+        (let* ((plan (epi-test-ledger-io--wave2-plan inspection))
+               (source-proof
+                (epi-ledger--recovery-reseal-plan-source-proof plan))
+               (target
+                (pcase case
+                  ('uuid oversized-uuid)
+                  ('project-root oversized-project-root)
+                  ('integer oversized-integer)))
+               (original-substring
+                (symbol-function 'substring-no-properties))
+               (original-number-to-string
+                (symbol-function 'number-to-string))
+               (emissions 0))
+          (pcase case
+            ('uuid
+             (setf
+              (epi-ledger--recovery-reseal-plan-destination-session-id plan)
+              target))
+            ('project-root
+             (setf
+              (epi-ledger--recovery-source-proof-header-project-root
+               source-proof)
+              target))
+            ('integer
+             (setf
+              (plist-get
+               (epi-ledger--recovery-source-proof-file-identity source-proof)
+               :device)
+              target)))
+          (cl-letf
+              (((symbol-function 'substring-no-properties)
+                (lambda (value &rest arguments)
+                  (when (eq value target)
+                    (ert-fail "Oversized recovery scalar was copied"))
+                  (apply original-substring value arguments)))
+               ((symbol-function 'number-to-string)
+                (lambda (value &rest arguments)
+                  (when (eq value target)
+                    (ert-fail "Oversized recovery integer was rendered"))
+                  (apply original-number-to-string value arguments))))
+            (should
+             (eq 'recovery-reseal-plan-changed
+                 (epi-test-ledger-io--wave2-condition-code
+                  (lambda ()
+                    (epi-ledger--recovery-stream-reseal
+                     inspection plan
+                     (lambda (_bytes) (setq emissions (1+ emissions)))))
+                  'epi-ledger-conflict))))
+          (should (= 0 emissions)))))))
+
+(ert-deftest epi-ledger-recovery-plan-bounds-caller-input-before-copy ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (oversized-id (make-string 8388608 ?a))
+           (original-substring (symbol-function 'substring-no-properties)))
+      (cl-letf
+          (((symbol-function 'substring-no-properties)
+            (lambda (value &rest arguments)
+              (when (eq value oversized-id)
+                (ert-fail "Oversized recovery planning input was copied"))
+              (apply original-substring value arguments))))
+        (should
+         (eq 'invalid-id
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-test-ledger-io--wave2-plan
+                 inspection oversized-id))
+              'epi-ledger-format-error)))))))
+
+(ert-deftest epi-ledger-recovery-reseal-rejects-cyclic-or-oversized-proofs ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (oversized-plan (epi-test-ledger-io--wave2-plan inspection))
+           (oversized-proof
+            (car
+             (epi-ledger--recovery-source-proof-record-proofs
+              (epi-ledger--recovery-reseal-plan-source-proof
+               oversized-plan))))
+           (emissions 0))
+      (setf
+       (epi-ledger--recovery-record-proof-frame-byte-size oversized-proof)
+       (1+ epi-record-frame-byte-limit))
+      (should
+       (eq 'recovery-reseal-plan-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-stream-reseal
+               inspection oversized-plan
+               (lambda (_bytes) (setq emissions (1+ emissions)))))
+            'epi-ledger-conflict)))
+      (should (= 0 emissions)))
+    (let* ((identity-root (expand-file-name "identity-cycle" root))
+           (_created (make-directory identity-root))
+           (inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             identity-root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (source-proof
+            (epi-ledger--recovery-reseal-plan-source-proof plan))
+           (original
+            (epi-ledger--recovery-source-proof-file-identity source-proof))
+           (cycle
+            (list
+             :path
+             (epi-ledger--recovery-source-proof-canonical-path source-proof)))
+           (tail (last cycle))
+           (emissions 0))
+      (setcdr tail cycle)
+      (unwind-protect
+          (progn
+            (setf
+             (epi-ledger--recovery-source-proof-file-identity source-proof)
+             cycle)
+            (should
+             (eq 'recovery-reseal-plan-changed
+                 (epi-test-ledger-io--wave2-condition-code
+                  (lambda ()
+                    (epi-ledger--recovery-stream-reseal
+                     inspection plan
+                     (lambda (_bytes) (setq emissions (1+ emissions)))))
+                  'epi-ledger-conflict))))
+        (setf
+         (epi-ledger--recovery-source-proof-file-identity source-proof)
+         original)
+        (setcdr tail nil))
+      (should (= 0 emissions)))
+    (let* ((payload-root (expand-file-name "payload-cycle" root))
+           (_created (make-directory payload-root))
+           (inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             payload-root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (original
+            (epi-ledger--recovery-reseal-plan-origin-payload plan))
+           (cycle (list (cons "x" 1)))
+           (tail cycle)
+           (emissions 0))
+      (setcdr tail cycle)
+      (unwind-protect
+          (progn
+            (setf
+             (epi-ledger--recovery-reseal-plan-origin-payload plan)
+             cycle)
+            (should
+             (eq 'recovery-reseal-plan-changed
+                 (epi-test-ledger-io--wave2-condition-code
+                  (lambda ()
+                    (epi-ledger--recovery-stream-reseal
+                     inspection plan
+                     (lambda (_bytes) (setq emissions (1+ emissions)))))
+                  'epi-ledger-conflict))))
+        (setf
+         (epi-ledger--recovery-reseal-plan-origin-payload plan)
+         original)
+        (setcdr tail nil))
+      (should (= 0 emissions)))
+    (let* ((cycle-root (expand-file-name "cycle" root))
+           (_created (make-directory cycle-root))
+           (inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             cycle-root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (source-proof
+            (epi-ledger--recovery-reseal-plan-source-proof plan))
+           (proofs
+            (epi-ledger--recovery-source-proof-record-proofs source-proof))
+           (tail (last proofs))
+           (claimed-count 1000000)
+           (epi-ledger-work-record-limit (1+ (length proofs)))
+           (epi-ledger-work-byte-limit 1048576)
+           (epi-ledger-work-time-budget 1000.0)
+           (epi--yield-function
+            #'epi-test-ledger-io--wave2-unexpected-api)
+           (emissions 0))
+      (setf
+       (epi-ledger--recovery-source-proof-record-count source-proof)
+       claimed-count
+       (epi-ledger--recovery-source-proof-next-sequence source-proof)
+       (1+ claimed-count)
+       (epi-ledger--recovery-reseal-plan-source-record-count plan)
+       claimed-count
+       (epi-ledger--recovery-reseal-plan-output-record-count plan)
+       (1+ claimed-count)
+       (cdr tail) proofs)
+      (unwind-protect
+          (should
+           (eq 'recovery-reseal-plan-changed
+               (epi-test-ledger-io--wave2-condition-code
+                (lambda ()
+                  (epi-ledger--recovery-stream-reseal
+                   inspection plan
+                   (lambda (_bytes) (setq emissions (1+ emissions)))))
+                'epi-ledger-conflict)))
+        (setcdr tail nil))
+      (should (= 0 emissions)))))
+
+(ert-deftest epi-ledger-recovery-reseal-rejects-short-tagged-structs ()
+  (epi-test-with-temporary-root (root)
+    (let ((inspection
+           (epi-test-ledger-io--wave2-inspect-fixture
+            root "torn-final-json.org")))
+      (dolist (case '(inspection plan source proof))
+        (let ((stream-inspection inspection)
+              (plan (epi-test-ledger-io--wave2-plan inspection))
+              (expected-code
+               (if (eq case 'inspection)
+                   'recovery-inspection-required
+                 'recovery-reseal-plan-changed))
+              (expected-type
+               (if (eq case 'inspection)
+                   'epi-ledger-format-error
+                 'epi-ledger-conflict))
+              (emissions 0))
+          (pcase case
+            ('inspection
+             (setq stream-inspection (record 'epi-ledger--inspection)))
+            ('plan
+             (setq plan (record 'epi-ledger--recovery-reseal-plan)))
+            ('source
+             (setf
+              (epi-ledger--recovery-reseal-plan-source-proof plan)
+              (record 'epi-ledger--recovery-source-proof)))
+            ('proof
+             (let* ((source-proof
+                     (epi-ledger--recovery-reseal-plan-source-proof plan))
+                    (proofs
+                     (epi-ledger--recovery-source-proof-record-proofs
+                      source-proof)))
+               (setcar proofs (record 'epi-ledger--recovery-record-proof)))))
+          (should
+           (eq expected-code
+               (epi-test-ledger-io--wave2-condition-code
+                (lambda ()
+                  (epi-ledger--recovery-stream-reseal
+                   stream-inspection plan
+                   (lambda (_bytes) (setq emissions (1+ emissions)))))
+                expected-type)))
+          (should (= 0 emissions)))))))
+
+(ert-deftest epi-ledger-recovery-reseal-rejects-malformed-inspection-graph ()
+  (epi-test-with-temporary-root (root)
+    (dolist (case '(capsule header index last-record record chunk
+                           improper-chunks short-values cyclic-chunks))
+      (let* ((case-root (expand-file-name (symbol-name case) root))
+             (_created (make-directory case-root))
+             (inspection
+              (epi-test-ledger-io--wave2-inspect-fixture
+               case-root "torn-final-json.org"))
+             (index (epi-ledger--inspection-raw-record-index inspection))
+             (chunks (epi-ledger--record-index-raw-chunks index))
+             (chunk (car chunks))
+             (values (epi-ledger--record-chunk-raw-values chunk))
+             cycle-tail)
+        (unwind-protect
+            (progn
+              (pcase case
+          ('capsule
+           (setf
+            (cl-struct-slot-value
+             'epi-ledger--inspection 'semantic-capsule inspection)
+            (record 'epi-ledger--semantic-capsule)))
+          ('header
+           (setf
+            (cl-struct-slot-value 'epi-ledger--inspection 'header inspection)
+            (record 'epi-header)))
+          ('index
+           (setf
+            (cl-struct-slot-value
+             'epi-ledger--inspection 'record-index inspection)
+            (record 'epi-ledger--record-index)))
+          ('last-record
+           (setf
+            (cl-struct-slot-value
+             'epi-ledger--inspection 'last-record inspection)
+            (record 'epi-record)))
+          ('record
+           (aset values 0 (record 'epi-record)))
+          ('chunk
+           (setcar chunks (record 'epi-ledger--record-chunk)))
+          ('improper-chunks
+           (setf
+            (cl-struct-slot-value 'epi-ledger--record-index 'chunks index)
+            (cons chunk 'improper)))
+          ('short-values
+           (setf
+            (cl-struct-slot-value 'epi-ledger--record-chunk 'values chunk)
+            []))
+          ('cyclic-chunks
+           (setq cycle-tail (last chunks))
+           (setcdr cycle-tail chunks)))
+              (should
+               (eq 'recovery-reseal-source-changed
+                   (epi-test-ledger-io--wave2-condition-code
+                    (lambda () (epi-test-ledger-io--wave2-plan inspection))
+                    'epi-ledger-conflict))))
+          (when cycle-tail
+            (setcdr cycle-tail nil)))))))
+
+(ert-deftest epi-ledger-recovery-reseal-rejects-fragment-mutation-before-output ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (fragment
+            (epi-ledger--inspection-raw-fragment-bytes inspection))
+           (emissions 0))
+      (aset fragment 0 (logxor 1 (aref fragment 0)))
+      (should
+       (eq 'recovery-reseal-source-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-stream-reseal
+               inspection plan
+               (lambda (_bytes) (setq emissions (1+ emissions)))))
+            'epi-ledger-conflict)))
+      (should (= 0 emissions)))))
+
+(ert-deftest epi-ledger-recovery-evidence-is-frozen-by-authenticated-dry-pass ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-historical-inspection root))
+           (origin
+            (seq-find
+             (lambda (record)
+               (eq 'recovery-origin (epi-record-type record)))
+             (epi-test-ledger-io--wave2-private-records inspection)))
+           (entry
+            (assoc "source_evidence_sha256"
+                   (epi-record--raw-payload origin)))
+           (digest (substring-no-properties (cdr entry)))
+           (fake (make-string 64 ?0))
+           (original-pass
+            (symbol-function 'epi-ledger--recovery-reseal-source-pass))
+           (epi-ledger-work-record-limit 1)
+           (epi-ledger-work-time-budget 1000.0)
+           mutated)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function 'epi-ledger--recovery-reseal-source-pass)
+                (lambda (&rest arguments)
+                  (let ((result (apply original-pass arguments)))
+                    (setq mutated t)
+                    (setcdr entry fake)
+                    result)))
+               ((symbol-function 'epi-ledger--recovery-evidence-v1-sha256)
+                (lambda (_payload) digest)))
+            (should
+             (eq 'duplicate-recovery-evidence
+                 (epi-test-ledger-io--wave2-condition-code
+                  (lambda () (epi-test-ledger-io--wave2-plan inspection))
+                  'epi-ledger-format-error))))
+        (setcdr entry digest))
+      (should mutated)
+      (should (equal digest (cdr entry))))))
 
 (provide 'epi-ledger-io-test)
 
