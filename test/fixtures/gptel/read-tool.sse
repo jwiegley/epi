@@ -1,0 +1,3 @@
+data: {"id":"chatcmpl-read","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_read_17","type":"function","function":{"name":"read_file","arguments":"{\"path\":\"README.md\"}"}}]},"finish_reason":null}]}
+
+data: [DONE]

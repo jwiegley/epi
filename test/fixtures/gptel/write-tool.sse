@@ -1,0 +1,3 @@
+data: {"id":"chatcmpl-write","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"opaque-write-id","type":"function","function":{"name":"replace_text","arguments":"{\"path\":\"README.md\",\"old_text\":\"old\",\"new_text\":\"new\"}"}}]},"finish_reason":null}]}
+
+data: [DONE]
