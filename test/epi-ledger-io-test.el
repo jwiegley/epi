@@ -12837,6 +12837,3491 @@ When AFTER-LEAF is non-nil, include its leaf and await only the terminal."
       (should mutated)
       (should (equal digest (cdr entry))))))
 
+(defconst epi-test-ledger-io--wave3-recovery-id
+  "70000000-0000-4000-8000-000000000003"
+  "Deterministic transaction ID for Wave 3 recovery tests.")
+
+(defconst epi-test-ledger-io--wave3-manifest-keys
+  '("version" "recovery_id" "phase" "fixed_timestamp" "origin_id"
+    "source_path" "source_session_id" "source_identity"
+    "source_header_sha256" "source_valid_prefix_end"
+    "source_valid_prefix_head_sha256" "fragment_offset" "fragment_size"
+    "fragment_sha256" "fragment_object" "source_evidence_sha256"
+    "source_object_tree_state" "reachable_objects" "destination_path"
+    "destination_objects_path" "destination_session_id"
+    "destination_header_sha256" "destination_header_byte_size"
+    "destination_valid_prefix_head_sha256" "destination_final_head_sha256"
+    "origin_frame_byte_size" "source_record_count" "output_record_count"
+    "destination_byte_size" "staged_destination_ledger_path"
+    "staged_destination_objects_path" "quarantine_root"
+    "quarantine_device" "final_quarantine_path" "source_stage_path"
+    "staged_source_ledger_path" "staged_source_objects_path"
+    "absent_source_objects_marker_path" "directory_mode" "file_mode")
+  "Closed structural key order of a prepared recovery manifest.")
+
+(defun epi-test-ledger-io--wave3-preflight
+    (root &optional destination quarantine-directory source-name)
+  "Return a deterministic Wave 3 preflight below ROOT.
+DESTINATION and QUARANTINE-DIRECTORY are forwarded when non-nil.
+SOURCE-NAME defaults to `torn-final-json.org'."
+  (let* ((inspection
+          (epi-test-ledger-io--wave2-inspect-fixture
+           root (or source-name "torn-final-json.org")))
+         (plan (epi-test-ledger-io--wave2-plan inspection)))
+    (epi-ledger--recovery-preflight
+     inspection plan epi-test-ledger-io--wave3-recovery-id
+     :destination destination :quarantine-directory quarantine-directory)))
+
+(defun epi-test-ledger-io--wave3-manifest-value (preflight key)
+  "Return KEY from PREFLIGHT's private prepared manifest object."
+  (epi-test-ledger-io--recovery-field
+   (epi-ledger--recovery-preflight-raw-manifest-object preflight) key))
+
+(ert-deftest epi-ledger-recovery-prepared-resolves-and-freezes-paths ()
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source
+            (epi-ledger--recovery-layout-raw-source-path layout))
+           (canonical-root (file-truename root))
+           (destination
+            (expand-file-name
+             (concat epi-test-ledger-io--wave2-destination-session-id ".org")
+             canonical-root))
+           (quarantine
+            (expand-file-name ".epi-quarantine" canonical-root))
+           (transaction
+            (expand-file-name
+             (concat ".epi-recovery/"
+                     epi-test-ledger-io--wave3-recovery-id)
+             quarantine))
+           (manifest
+            (epi-ledger--recovery-preflight-raw-manifest-object preflight))
+           (bytes
+            (epi-ledger--recovery-preflight-raw-manifest-bytes preflight)))
+      (should
+       (equal source (expand-file-name "session.org" canonical-root)))
+      (should
+       (equal destination
+              (epi-ledger--recovery-layout-raw-destination-path layout)))
+      (should
+       (equal quarantine
+              (epi-ledger--recovery-layout-raw-quarantine-root layout)))
+      (should
+       (equal transaction
+              (epi-ledger--recovery-layout-raw-transaction-directory
+               layout)))
+      (should
+       (equal (expand-file-name "manifest.jcs" transaction)
+              (epi-ledger--recovery-layout-raw-manifest-path layout)))
+      (should
+       (equal epi-test-ledger-io--wave3-manifest-keys
+              (mapcar #'car manifest)))
+      (should (equal bytes (epi-ledger--jcs-encode manifest)))
+      (should-not (string-suffix-p "\n" bytes))
+      (should
+       (equal "prepared"
+              (epi-test-ledger-io--wave3-manifest-value
+               preflight "phase")))
+      (should
+       (equal epi-test-ledger-io--wave2-origin-at
+              (epi-test-ledger-io--wave3-manifest-value
+               preflight "fixed_timestamp")))
+      (should
+       (equal []
+              (epi-test-ledger-io--wave3-manifest-value
+               preflight "reachable_objects")))
+      (should-not (file-exists-p quarantine)))))
+
+(ert-deftest epi-ledger-recovery-prepared-selects-default-and-explicit-paths ()
+  (epi-test-with-temporary-root (root)
+    (let* ((source
+            (expand-file-name
+             (concat epi-test-ledger-io--recovery-source-session-id ".org")
+             root))
+           (bytes
+            (epi-test-ledger-io--recovery-fixture-bytes
+             "torn-final-json.org"))
+           (explicit-destination (expand-file-name "elsewhere.org" root))
+           (explicit-quarantine (expand-file-name "quarantine-override" root))
+           (epi-session-directory root))
+      (epi-ledger--write-bytes source bytes 'exclusive-create t)
+      (let* ((inspection
+              (epi-ledger--inspect-path
+               source 'allow-one-incomplete-final-frame))
+             (plan (epi-test-ledger-io--wave2-plan inspection))
+             (default
+              (epi-ledger--recovery-preflight
+               inspection plan epi-test-ledger-io--wave3-recovery-id))
+             (explicit
+              (epi-ledger--recovery-preflight
+               inspection plan epi-test-ledger-io--wave3-recovery-id
+               :destination explicit-destination
+               :quarantine-directory explicit-quarantine)))
+        (should
+         (equal (expand-file-name "quarantine" (file-truename root))
+                (epi-ledger--recovery-layout-raw-quarantine-root
+                 (epi-ledger--recovery-preflight-raw-layout default))))
+        (should
+         (equal (expand-file-name "elsewhere.org" (file-truename root))
+                (epi-ledger--recovery-layout-raw-destination-path
+                 (epi-ledger--recovery-preflight-raw-layout explicit))))
+        (should
+         (equal
+          (expand-file-name "quarantine-override" (file-truename root))
+                (epi-ledger--recovery-layout-raw-quarantine-root
+                 (epi-ledger--recovery-preflight-raw-layout explicit))))))))
+
+(ert-deftest epi-ledger-recovery-prepared-refuses-links-and-collisions ()
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (source (epi-ledger--inspection-raw-canonical-path inspection))
+           (alias (expand-file-name "source-alias.org" root)))
+      (add-name-to-file source alias nil)
+      (should
+       (eq 'recovery-source-multiply-linked
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-preflight
+               inspection plan epi-test-ledger-io--wave3-recovery-id))
+            'epi-ledger-conflict))))
+    (let* ((case-root (expand-file-name "collision" root))
+           (_created (make-directory case-root))
+           (inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             case-root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (destination
+            (expand-file-name
+             (concat epi-test-ledger-io--wave2-destination-session-id ".org")
+             case-root)))
+      (epi-ledger--write-bytes destination "occupied" 'exclusive-create t)
+      (should
+       (eq 'recovery-destination-exists
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-preflight
+               inspection plan epi-test-ledger-io--wave3-recovery-id))
+            'epi-ledger-conflict))))))
+
+(ert-deftest epi-ledger-recovery-prepared-manifest-is-durable-and-last ()
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (source-bytes
+            (epi-test-ledger-io--literal-file-bytes source))
+           (manifest-path
+            (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (staged-ledger
+            (epi-ledger--recovery-layout-raw-staged-destination-ledger-path
+             layout))
+           (staged-objects
+            (epi-ledger--recovery-layout-raw-staged-destination-objects-path
+             layout))
+           (original-inspect (symbol-function 'epi-ledger--inspect-path))
+           (inspections 0)
+           phases
+           prepared)
+      (let ((epi-ledger--recovery-phase-barrier-function
+             (lambda (phase) (push phase phases))))
+        (cl-letf (((symbol-function 'epi-ledger--inspect-path)
+                   (lambda (&rest arguments)
+                     (setq inspections (1+ inspections))
+                     (apply original-inspect arguments))))
+          (setq prepared
+                (epi-ledger--recovery-prepare-manifest preflight))))
+      (should (epi-ledger--recovery-prepared-p prepared))
+      (should (= 1 inspections))
+      (should (equal '(prepared) phases))
+      (should (file-directory-p transaction))
+      (should (= #o700 (epi-test-ledger-io--permission-bits transaction)))
+      (should (file-regular-p manifest-path))
+      (should (= #o600 (epi-test-ledger-io--permission-bits manifest-path)))
+      (should
+       (equal (epi-ledger--recovery-preflight-raw-manifest-bytes preflight)
+              (epi-test-ledger-io--literal-file-bytes manifest-path)))
+      (should-not (file-exists-p staged-ledger))
+      (should-not (file-exists-p staged-objects))
+      (should-not (file-exists-p (concat source ".epi-lock")))
+      (should
+       (equal source-bytes
+              (epi-test-ledger-io--literal-file-bytes source))))))
+
+(define-error 'epi-test-ledger-io-wave3-second-inspection-failure
+  "Injected Wave 3 second-inspection failure")
+
+(defun epi-test-ledger-io--wave3-extra-write-object (source bytes)
+  "Store exact BYTES below SOURCE.objects and return (HASH . PATH)."
+  (let* ((owned (string-as-unibyte bytes))
+         (hash (secure-hash 'sha256 owned))
+         (path
+          (epi-ledger--object-path-for-ledger-path source hash)))
+    (make-directory (file-name-directory path) t)
+    (unless (file-exists-p path)
+      (epi-ledger--write-bytes path owned 'exclusive-create t))
+    (cons hash path)))
+
+(defun epi-test-ledger-io--wave3-extra-origin-payload
+    (predecessor ordinal source-path bytes)
+  "Return a valid historical origin for BYTES after PREDECESSOR."
+  (let* ((owned (string-as-unibyte bytes))
+         (size (length owned))
+         (hash (secure-hash 'sha256 owned))
+         (offset 1000)
+         (payload
+          (epi-test-ledger-io--recovery-payload
+           predecessor ordinal source-path)))
+    (epi-test-ledger-io--recovery-set-field
+     payload "source_file_size" (+ offset size))
+    (epi-test-ledger-io--recovery-set-field
+     payload "fragment_offset" offset)
+    (epi-test-ledger-io--recovery-set-field payload "fragment_size" size)
+    (epi-test-ledger-io--recovery-set-field payload "fragment_sha256" hash)
+    (epi-test-ledger-io--recovery-set-field
+     payload "fragment_object"
+     `(("hash" . ,hash)
+       ("size" . ,size)
+       ("media_type" . "application/octet-stream")
+       ("role" . "recovery-fragment")))
+    (epi-test-ledger-io--recovery-set-field
+     payload "source_header_sha256"
+     (secure-hash 'sha256 (format "historical-header-%d" ordinal)))
+    (epi-test-ledger-io--recovery-set-field
+     payload "source_valid_prefix_head_sha256"
+     (secure-hash 'sha256 (format "historical-prefix-%d" ordinal)))
+    (epi-test-ledger-io--recovery-refresh-evidence payload)))
+
+(defun epi-test-ledger-io--wave3-extra-historical-case (root object-bytes)
+  "Return a torn case below ROOT whose origins reference OBJECT-BYTES."
+  (let* ((specs (mapcar #'string-as-unibyte object-bytes))
+         (origins
+          (mapcar
+           (lambda (bytes)
+             (lambda (predecessor ordinal)
+               (epi-test-ledger-io--wave3-extra-origin-payload
+                predecessor ordinal
+                (expand-file-name
+                 (format "historical-source-%d.org" ordinal) root)
+                bytes)))
+           specs))
+         (history
+          (epi-test-ledger-io--recovery-history
+           (list (epi-test-ledger-io--session-info)) :origins origins))
+         (fixture
+          (epi-test-ledger-io--recovery-fixture-bytes
+           "torn-final-headline.org"))
+         (fragment
+          (substring
+           fixture epi-test-ledger-io--recovery-valid-prefix-end-offset))
+         (source
+          (epi-test-ledger-io--recovery-write-source
+           root (concat (plist-get history :bytes) fragment)))
+         (seen (make-hash-table :test #'equal))
+         objects)
+    (dolist (bytes specs)
+      (let* ((entry
+              (epi-test-ledger-io--wave3-extra-write-object source bytes))
+             (hash (car entry)))
+        (unless (gethash hash seen)
+          (puthash hash t seen)
+          (push entry objects))))
+    (let* ((inspection
+            (epi-ledger--inspect-path
+             source 'allow-one-incomplete-final-frame))
+           (plan (epi-test-ledger-io--wave2-plan inspection)))
+      (list :source source :inspection inspection :plan plan
+            :objects (nreverse objects)))))
+
+(ert-deftest epi-ledger-recovery-preflight-rejects-cross-device-quarantine-anchor ()
+  (epi-test-with-temporary-root (root)
+    (epi-test-with-temporary-root (quarantine)
+      (let* ((inspection
+              (epi-test-ledger-io--wave2-inspect-fixture
+               root "torn-final-json.org"))
+             (plan (epi-test-ledger-io--wave2-plan inspection))
+             (real-stat epi-ledger--directory-stat-function)
+             (quarantine (directory-file-name (file-truename quarantine)))
+             (before-source
+              (epi-test-ledger-io--recovery-tree-snapshot root))
+             (before-quarantine
+              (epi-test-ledger-io--recovery-tree-snapshot quarantine)))
+        (let ((epi-ledger--directory-stat-function
+               (lambda (path)
+                 (let ((identity (funcall real-stat path)))
+                   (when (and identity (equal path quarantine))
+                     (setq identity
+                           (epi-ledger--copy-tree-and-strings identity))
+                     (setf (plist-get identity :device)
+                           (1+ (plist-get identity :device))))
+                   identity))))
+          (should
+           (eq 'quarantine-cross-device
+               (epi-test-ledger-io--wave2-condition-code
+                (lambda ()
+                  (epi-ledger--recovery-preflight
+                   inspection plan epi-test-ledger-io--wave3-recovery-id
+                   :quarantine-directory quarantine))
+                'epi-ledger-conflict))))
+        (should
+         (equal before-source
+                (epi-test-ledger-io--recovery-tree-snapshot root)))
+        (should
+         (equal before-quarantine
+                (epi-test-ledger-io--recovery-tree-snapshot quarantine)))))))
+
+(ert-deftest epi-ledger-recovery-preflight-rejects-cross-device-source-objects ()
+  (epi-test-with-temporary-root (root)
+    (let* ((case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list "historical-object")))
+           (source-objects
+            (concat (file-truename (plist-get case :source)) ".objects"))
+           (real-stat epi-ledger--directory-stat-function)
+           (before (epi-test-ledger-io--recovery-tree-snapshot root))
+           saw-source-objects)
+      (let ((epi-ledger--directory-stat-function
+             (lambda (path)
+               (let ((identity (funcall real-stat path)))
+                 (when (and identity (equal path source-objects))
+                   (setq saw-source-objects t
+                         identity
+                         (epi-ledger--copy-tree-and-strings identity))
+                   (setf (plist-get identity :device)
+                         (1+ (plist-get identity :device))))
+                 identity))))
+        (should
+         (eq 'quarantine-cross-device
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-preflight
+                 (plist-get case :inspection) (plist-get case :plan)
+                 epi-test-ledger-io--wave3-recovery-id))
+              'epi-ledger-conflict))))
+      (should saw-source-objects)
+      (should
+       (equal before (epi-test-ledger-io--recovery-tree-snapshot root))))))
+
+(ert-deftest epi-ledger-recovery-preflight-verifies-deduped-typed-objects ()
+  (epi-test-with-temporary-root (root)
+    (let* ((alpha (string-as-unibyte "historical-alpha"))
+           (beta (string-as-unibyte "historical-beta"))
+           (case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list beta alpha beta)))
+           (stray
+            (epi-test-ledger-io--wave3-extra-write-object
+             (plist-get case :source) "unreachable-stray"))
+           (object-paths (mapcar #'cdr (plist-get case :objects)))
+           (real-reader epi-ledger--read-function)
+           read-paths
+           preflight)
+      (let ((epi-ledger--read-function
+             (lambda (path begin end)
+               (when (member path object-paths)
+                 (cl-pushnew path read-paths :test #'equal))
+               (funcall real-reader path begin end))))
+        (setq preflight
+              (epi-test-ledger-io--recovery-call-inertly
+               root
+               (lambda ()
+                 (epi-ledger--recovery-preflight
+                  (plist-get case :inspection) (plist-get case :plan)
+                  epi-test-ledger-io--wave3-recovery-id)))))
+      (let* ((reachable
+              (epi-ledger--recovery-preflight-raw-reachable-objects
+               preflight))
+             (hashes
+              (mapcar
+               (lambda (reference)
+                 (epi-test-ledger-io--recovery-field reference "hash"))
+               (append reachable nil)))
+             (expected
+              (sort (list (secure-hash 'sha256 alpha)
+                          (secure-hash 'sha256 beta))
+                    #'string<))
+             (current
+              (epi-test-ledger-io--recovery-field
+               (epi-ledger--recovery-reseal-plan-origin-payload
+                (plist-get case :plan))
+               "fragment_object")))
+        (should (vectorp reachable))
+        (should (equal expected hashes))
+        (should (= 2 (length read-paths)))
+        (should-not (member (car stray) hashes))
+        (should-not
+         (member
+          (epi-test-ledger-io--recovery-field current "hash") hashes))))))
+
+(ert-deftest epi-ledger-recovery-preflight-refuses-missing-typed-object ()
+  (epi-test-with-temporary-root (root)
+    (let* ((case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list "must-remain-reachable")))
+           (missing (cdar (plist-get case :objects))))
+      (delete-file missing)
+      (let ((before (epi-test-ledger-io--recovery-tree-snapshot root)))
+        (should-error
+         (epi-ledger--recovery-preflight
+          (plist-get case :inspection) (plist-get case :plan)
+          epi-test-ledger-io--wave3-recovery-id)
+         :type 'epi-missing-object)
+        (should
+         (equal before
+                (epi-test-ledger-io--recovery-tree-snapshot root)))))))
+
+(ert-deftest epi-ledger-recovery-prepare-manifest-proves-lock-and-publication-order ()
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (inspection
+            (epi-ledger--recovery-preflight-raw-inspection preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (expected
+            (epi-ledger--recovery-preflight-raw-manifest-bytes preflight))
+           (real-acquire (symbol-function 'epi-ledger--acquire-lock))
+           (real-inspect (symbol-function 'epi-ledger--inspect-path))
+           (real-writer epi-ledger--byte-writer)
+           (real-reader epi-ledger--read-function)
+           (real-unlock epi-ledger--unlock-function)
+           lock events prepared)
+      (cl-letf
+          (((symbol-function 'epi-ledger--acquire-lock)
+            (lambda (&rest arguments)
+              (setq lock (apply real-acquire arguments))
+              (push 'acquire events)
+              lock))
+           ((symbol-function 'epi-ledger--inspect-path)
+            (lambda (path policy)
+              (should lock)
+              (should (file-exists-p (epi-ledger--lock-lock-file lock)))
+              (push 'inspect events)
+              (funcall real-inspect path policy))))
+        (let ((epi-ledger--byte-writer
+               (lambda (path bytes mode durablep)
+                 (when (equal path temporary)
+                   (should (equal expected bytes))
+                   (push (list 'write mode durablep) events))
+                 (funcall real-writer path bytes mode durablep)))
+              (epi-ledger--read-function
+               (lambda (path begin end)
+                 (when (member path (list temporary manifest))
+                   (push (list 'read path begin end) events))
+                 (funcall real-reader path begin end)))
+              (epi-ledger--unlock-function
+               (lambda (owned)
+                 (should-not (eq owned lock))
+                 (should (equal owned lock))
+                 (push 'unlock events)
+                 (funcall real-unlock owned)))
+              (epi-ledger--recovery-phase-barrier-function
+               (lambda (phase)
+                 (should (eq phase 'prepared))
+                 (push phase events))))
+          (setq prepared
+                (epi-ledger--recovery-prepare-manifest preflight))))
+      (should (epi-ledger--recovery-prepared-p prepared))
+      (should
+       (equal
+        `((acquire) (inspect) (write replace t)
+          (read ,temporary 0 ,(length expected))
+          (read ,manifest 0 ,(length expected)) (prepared) (unlock))
+        (mapcar (lambda (event)
+                  (if (listp event) event (list event)))
+                (nreverse events))))
+      (should-not (file-exists-p temporary))
+      (should-not (file-exists-p (concat source ".epi-lock")))
+      (should (= #o600 (epi-test-ledger-io--permission-bits manifest)))
+      (should
+       (equal expected
+              (epi-test-ledger-io--literal-file-bytes manifest)))
+      (should
+       (equal (epi-ledger--inspection-raw-file-identity inspection)
+              (epi-ledger--file-identity source))))))
+
+(ert-deftest epi-ledger-recovery-prepare-manifest-unlocks-exactly-on-reinspect-error ()
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (real-acquire (symbol-function 'epi-ledger--acquire-lock))
+           (real-unlock epi-ledger--unlock-function)
+           (before (epi-test-ledger-io--recovery-tree-snapshot root))
+           lock (unlocks 0))
+      (cl-letf
+          (((symbol-function 'epi-ledger--acquire-lock)
+            (lambda (&rest arguments)
+              (setq lock (apply real-acquire arguments))))
+           ((symbol-function 'epi-ledger--inspect-path)
+            (lambda (&rest _arguments)
+              (should lock)
+              (should (file-exists-p (epi-ledger--lock-lock-file lock)))
+              (signal
+               'epi-test-ledger-io-wave3-second-inspection-failure nil))))
+        (let ((epi-ledger--unlock-function
+               (lambda (owned)
+                 (should-not (eq owned lock))
+                 (should (equal owned lock))
+                 (setq unlocks (1+ unlocks))
+                 (funcall real-unlock owned))))
+          (should-error
+           (epi-ledger--recovery-prepare-manifest preflight)
+           :type 'epi-test-ledger-io-wave3-second-inspection-failure)))
+      (should (= 1 unlocks))
+      (should-not (file-exists-p manifest))
+      (should-not (file-exists-p transaction))
+      (should
+       (equal (cdr before)
+              (cdr (epi-test-ledger-io--recovery-tree-snapshot root)))))))
+
+(define-error 'epi-test-ledger-io-wave3-review-write-failure
+  "Injected Wave 3 manifest write failure")
+
+(ert-deftest epi-ledger-recovery-preflight-refuses-contained-path-aliases ()
+  "Reject quarantine, destination, and source-object containment aliases."
+  (dolist (case '(quarantine-is-source-objects
+                  quarantine-is-destination-objects
+                  destination-under-source-objects))
+    (epi-test-with-temporary-root (root)
+      (let* ((case-root (expand-file-name (symbol-name case) root))
+             (_created (make-directory case-root t))
+             (inspection
+              (epi-test-ledger-io--wave2-inspect-fixture
+               case-root "torn-final-json.org"))
+             (plan (epi-test-ledger-io--wave2-plan inspection))
+             (source
+              (epi-ledger--inspection-raw-canonical-path inspection))
+             (source-objects (concat source ".objects"))
+             destination
+             quarantine)
+        (pcase case
+          ('quarantine-is-source-objects
+           (setq quarantine source-objects))
+          ('quarantine-is-destination-objects
+           (setq destination (expand-file-name "destination.org" case-root)
+                 quarantine (concat destination ".objects")))
+          ('destination-under-source-objects
+           (setq destination
+                 (expand-file-name "destination.org" source-objects))))
+        (let ((before
+               (epi-test-ledger-io--recovery-tree-snapshot case-root)))
+          (should
+           (eq 'recovery-path-conflict
+               (epi-test-ledger-io--wave2-condition-code
+                (lambda ()
+                  (epi-ledger--recovery-preflight
+                   inspection plan epi-test-ledger-io--wave3-recovery-id
+                   :destination destination
+                   :quarantine-directory quarantine))
+                'epi-ledger-conflict)))
+          (should
+           (equal before
+                  (epi-test-ledger-io--recovery-tree-snapshot
+                   case-root))))))))
+
+(ert-deftest epi-ledger-recovery-prepare-cleans-write-then-signal-and-retries ()
+  "Clean an orphaned transaction when the writer writes and then signals."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (real-writer epi-ledger--byte-writer)
+           (fail-once t))
+      (let ((epi-ledger--byte-writer
+             (lambda (path bytes mode durablep)
+               (prog1 (funcall real-writer path bytes mode durablep)
+                 (when (and fail-once (equal path temporary))
+                   (setq fail-once nil)
+                   (signal
+                    'epi-test-ledger-io-wave3-review-write-failure nil))))))
+        (should-error
+         (epi-ledger--recovery-prepare-manifest preflight)
+         :type 'epi-test-ledger-io-wave3-review-write-failure))
+      (should-not fail-once)
+      (should-not (file-exists-p temporary))
+      (should-not (file-exists-p manifest))
+      (should-not (file-exists-p transaction))
+      (should-not (file-exists-p (concat source ".epi-lock")))
+      (let ((prepared (epi-ledger--recovery-prepare-manifest preflight)))
+        (should (epi-ledger--recovery-prepared-p prepared))
+        (should (file-regular-p manifest))))))
+
+(ert-deftest epi-ledger-recovery-prepare-reproves-source-after-publication ()
+  "Reject a publisher that changes the recovery source after real publish."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (real-publish epi-ledger--publish-function)
+           phases)
+      (let ((epi-ledger--publish-function
+             (lambda (temporary destination)
+               (funcall real-publish temporary destination)
+               (epi-ledger--write-bytes source "X" 'append t)))
+            (epi-ledger--recovery-phase-barrier-function
+             (lambda (phase) (push phase phases))))
+        (should
+         (eq 'file-identity-changed
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-prepare-manifest preflight))
+              'epi-ledger-conflict))))
+      (should-not phases)
+      (should-not (file-exists-p manifest))
+      (should-not (file-exists-p transaction)))))
+
+(ert-deftest epi-ledger-recovery-prepare-rawly-rejects-seam-hidden-manifest ()
+  "Let raw bytes and identity, not injectable seams, decide readback."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (expected
+            (epi-ledger--recovery-preflight-raw-manifest-bytes preflight))
+           (forged (epi-test-ledger-io--wave5-flip-first-byte expected))
+           (real-publish epi-ledger--publish-function)
+           (real-stat epi-ledger--stat-function)
+           (real-read epi-ledger--read-function)
+           claimed-identity
+           phases)
+      (let ((epi-ledger--publish-function
+             (lambda (temporary destination)
+               (setq claimed-identity
+                     (epi-ledger--stat-local-file temporary))
+               (funcall real-publish temporary destination)
+               (delete-file destination)
+               (epi-ledger--write-bytes
+                destination forged 'exclusive-create t)
+               (set-file-modes destination #o600)))
+            (epi-ledger--stat-function
+             (lambda (path)
+               (if (and claimed-identity (equal path manifest))
+                   (epi-ledger--copy-tree-and-strings claimed-identity)
+                 (funcall real-stat path))))
+            (epi-ledger--read-function
+             (lambda (path begin end)
+               (if (equal path manifest)
+                   (substring-no-properties expected begin end)
+                 (funcall real-read path begin end))))
+            (epi-ledger--recovery-phase-barrier-function
+             (lambda (phase) (push phase phases))))
+        (should
+         (eq 'recovery-manifest-invalid
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-prepare-manifest preflight))
+              'epi-ledger-conflict))))
+      (should-not phases)
+      ;; The forged replacement is not ours to delete.
+      (should (file-regular-p manifest))
+      (should
+       (equal forged
+              (epi-test-ledger-io--literal-file-bytes manifest))))))
+
+(ert-deftest epi-ledger-recovery-prepare-protects-manifest-bytes-from-writer ()
+  "Do not let a storage writer redefine the bytes being verified."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (expected
+            (substring-no-properties
+             (epi-ledger--recovery-preflight-raw-manifest-bytes preflight)))
+           (real-writer epi-ledger--byte-writer)
+           mutated
+           phases)
+      (let ((epi-ledger--byte-writer
+             (lambda (path bytes mode durablep)
+               (when (and (equal path temporary) (not mutated))
+                 (setq mutated t)
+                 (aset bytes 0 ?X))
+               (funcall real-writer path bytes mode durablep)))
+            (epi-ledger--recovery-phase-barrier-function
+             (lambda (phase) (push phase phases))))
+        (should
+         (eq 'recovery-manifest-invalid
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-prepare-manifest preflight))
+              'epi-ledger-conflict))))
+      (should mutated)
+      (should-not phases)
+      (should (equal expected
+                     (epi-ledger--recovery-preflight-raw-manifest-bytes
+                      preflight)))
+      (should-not (file-exists-p manifest))
+      (should-not (file-exists-p transaction)))))
+
+(ert-deftest epi-ledger-recovery-preflight-snapshots-strings-before-yield ()
+  "Own all caller strings before plan copying can cooperatively yield."
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (recovery-id
+            (copy-sequence epi-test-ledger-io--wave3-recovery-id))
+           (other-recovery-id "80000000-0000-4000-8000-000000000003")
+           (destination
+            (expand-file-name "destination-A.org" root))
+           (other-destination
+            (expand-file-name "destination-B.org" root))
+           (quarantine (expand-file-name "quarantine-A" root))
+           (other-quarantine (expand-file-name "quarantine-B" root))
+           (expected-recovery-id (copy-sequence recovery-id))
+           (expected-destination (file-truename destination))
+           (expected-quarantine (file-truename quarantine))
+           yielded
+           preflight)
+      (let ((epi-ledger-work-byte-limit 1)
+            (epi--yield-function
+             (lambda ()
+               (unless yielded
+                 (setq yielded t)
+                 (cl-replace recovery-id other-recovery-id)
+                 (cl-replace destination other-destination)
+                 (cl-replace quarantine other-quarantine)))))
+        (setq preflight
+              (epi-ledger--recovery-preflight
+               inspection plan recovery-id
+               :destination destination
+               :quarantine-directory quarantine)))
+      (should yielded)
+      (let ((layout (epi-ledger--recovery-preflight-raw-layout preflight)))
+        (should
+         (equal expected-recovery-id
+                (epi-ledger--recovery-preflight-raw-recovery-id preflight)))
+        (should
+         (equal expected-destination
+                (epi-ledger--recovery-layout-raw-destination-path layout)))
+        (should
+         (equal expected-quarantine
+                (epi-ledger--recovery-layout-raw-quarantine-root layout)))
+        (should
+         (equal expected-recovery-id
+                (epi-test-ledger-io--wave3-manifest-value
+                 preflight "recovery_id")))
+        (should
+         (equal expected-destination
+                (epi-test-ledger-io--wave3-manifest-value
+                 preflight "destination_path")))
+        (should
+         (equal expected-quarantine
+                (epi-test-ledger-io--wave3-manifest-value
+                 preflight "quarantine_root")))))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-mutated-preflight-graph ()
+  "Reject a returned preflight whose nested manifest graph was changed."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest-object
+            (epi-ledger--recovery-preflight-raw-manifest-object preflight))
+           (phase (assoc "phase" manifest-object))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout)))
+      (should phase)
+      (setcdr phase "forged")
+      (should
+       (eq 'recovery-preflight-changed
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-prepare-manifest preflight))
+            'epi-ledger-conflict)))
+      (should-not (file-exists-p manifest))
+      (should-not (file-exists-p transaction)))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-nonfinal-destination-proof-drift ()
+  "Reject a valid-looking intermediate reseal proof before publication."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (plan
+            (epi-ledger--recovery-preflight-raw-reseal-plan preflight))
+           (source-proof
+            (epi-ledger--recovery-reseal-plan-source-proof plan))
+           (proofs
+            (epi-ledger--recovery-source-proof-record-proofs source-proof))
+           (manifest
+            (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (expected-manifest-bytes
+            (substring-no-properties
+             (epi-ledger--recovery-preflight-raw-manifest-bytes preflight)))
+           phases)
+      (should (consp (cdr proofs)))
+      (let* ((proof (car proofs))
+             (original-hash
+              (epi-ledger--recovery-record-proof-destination-hash proof))
+             (forged-hash (substring-no-properties original-hash)))
+        ;; Preserve a valid SHA-256 shape while changing a non-final proof
+        ;; omitted from the durable manifest.
+        (aset forged-hash 0 (if (= (aref forged-hash 0) ?0) ?1 ?0))
+        (should-not (equal forged-hash original-hash))
+        (setf
+         (epi-ledger--recovery-record-proof-destination-hash proof)
+         forged-hash))
+      (should
+       (equal
+        expected-manifest-bytes
+        (epi-ledger--recovery-preflight-raw-manifest-bytes preflight)))
+      (let ((epi-ledger--recovery-phase-barrier-function
+             (lambda (phase) (push phase phases))))
+        (should
+         (eq 'recovery-preflight-changed
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-prepare-manifest preflight))
+              'epi-ledger-conflict))))
+      (should-not phases)
+      (should-not (file-exists-p manifest))
+      (should-not (file-exists-p transaction)))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-proof-drift-during-copy-yield ()
+  "Reject future proof drift injected while closing caller authority."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (plan
+            (epi-ledger--recovery-preflight-raw-reseal-plan preflight))
+           (source-proof
+            (epi-ledger--recovery-reseal-plan-source-proof plan))
+           (proofs
+            (epi-ledger--recovery-source-proof-record-proofs source-proof))
+           (future-proof (nth 1 proofs))
+           (original-hash
+            (epi-ledger--recovery-record-proof-destination-hash
+             future-proof))
+           (forged-hash (substring-no-properties original-hash))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (lock-path (epi-ledger--lock-path source))
+           (manifest
+            (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (real-copy
+            (symbol-function 'epi-ledger--recovery-copy-record-proof))
+           (copy-state (list nil))
+           (copy-index 0)
+           mutated
+           phases)
+      (should (epi-ledger--recovery-record-proof-p future-proof))
+      (aset forged-hash 0 (if (= (aref forged-hash 0) ?0) ?1 ?0))
+      (should-not (equal forged-hash original-hash))
+      (cl-letf
+          (((symbol-function 'epi-ledger--recovery-copy-record-proof)
+            (lambda (proof work)
+              (setcar copy-state copy-index)
+              (setq copy-index (1+ copy-index))
+              (unwind-protect
+                  (let ((epi-ledger-work-byte-limit 1))
+                    (funcall real-copy proof work))
+                (setcar copy-state nil)))))
+        (let ((epi-ledger-work-time-budget 1000.0)
+              (epi--yield-function
+               (lambda ()
+                 (when (and (eql (car copy-state) 0) (not mutated))
+                   (setq mutated t)
+                   (setf
+                    (epi-ledger--recovery-record-proof-destination-hash
+                     future-proof)
+                    forged-hash))))
+              (epi-ledger--recovery-phase-barrier-function
+               (lambda (phase) (push phase phases))))
+          (should
+           (eq 'recovery-preflight-changed
+               (epi-test-ledger-io--wave2-condition-code
+                (lambda ()
+                  (epi-ledger--recovery-prepare-manifest preflight))
+                'epi-ledger-conflict)))))
+      (should mutated)
+      (should-not phases)
+      (should-not (file-exists-p lock-path))
+      (should-not (file-exists-p manifest))
+      (should-not (file-exists-p transaction)))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-quarantine-parent-symlink-swap ()
+  "Reject a same-device symlink installed as the transaction parent."
+  (epi-test-with-temporary-root (root)
+    (let* ((quarantine (expand-file-name "quarantine" root))
+           (attacker (expand-file-name "attacker" root))
+           (_created (make-directory attacker t))
+           (preflight
+            (epi-test-ledger-io--wave3-preflight
+             root nil quarantine))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (transaction-parent
+            (directory-file-name (file-name-directory transaction)))
+           (attacker-transaction
+            (expand-file-name
+             epi-test-ledger-io--wave3-recovery-id attacker))
+           (real-create
+            (symbol-function 'epi-ledger--recovery-create-private-directory))
+           swapped
+           phases)
+      (should
+       (= (plist-get (epi-ledger--stat-local-directory root) :device)
+          (plist-get (epi-ledger--stat-local-directory attacker) :device)))
+      (cl-letf (((symbol-function 'epi-ledger--recovery-create-private-directory)
+                 (lambda (path device)
+                   (prog1 (funcall real-create path device)
+                     (when (and (equal path transaction-parent) (not swapped))
+                       (delete-directory transaction-parent)
+                       (make-symbolic-link attacker transaction-parent)
+                       (setq swapped t))))))
+        (let ((epi-ledger--recovery-phase-barrier-function
+               (lambda (phase) (push phase phases))))
+          (should
+           (eq 'recovery-path-conflict
+               (epi-test-ledger-io--wave2-condition-code
+                (lambda ()
+                  (epi-ledger--recovery-prepare-manifest preflight))
+                'epi-ledger-conflict)))))
+      (should swapped)
+      (should-not phases)
+      (should-not (file-exists-p attacker-transaction)))))
+
+(ert-deftest epi-ledger-recovery-manifest-encode-rejects-invalid-source-path ()
+  "Reject a prepared manifest whose source path is not a string."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (manifest
+            (epi-ledger--copy-tree-and-strings
+             (epi-ledger--recovery-preflight-raw-manifest-object
+              preflight)))
+           (source-path (assoc "source_path" manifest)))
+      (should source-path)
+      (setcdr source-path 7)
+      (should
+       (eq 'recovery-manifest-invalid
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda ()
+              (epi-ledger--recovery-manifest-encode manifest))
+            'epi-ledger-conflict))))))
+
+(defun epi-test-ledger-io--reaudit-condition (thunk)
+  "Run THUNK and return its condition type and structured code, or `accepted'."
+  (condition-case condition
+      (progn (funcall thunk) 'accepted)
+    (error
+     (let ((properties (cadr condition)))
+       (list (car condition)
+             (and (listp properties)
+                  (plist-get properties :code)))))))
+
+(defun epi-test-ledger-io--reaudit-destination-manifest
+    (preflight destination)
+  "Copy PREFLIGHT's manifest and coherently bind it to DESTINATION."
+  (let* ((manifest
+          (epi-ledger--copy-tree-and-strings
+           (epi-ledger--recovery-preflight-raw-manifest-object preflight)))
+         (recovery-id (epi-ledger--object-value manifest "recovery_id"))
+         (suffix (concat "epi-recovery-" recovery-id))
+         (objects (concat destination ".objects")))
+    (dolist
+        (binding
+         `(("destination_path" . ,destination)
+           ("destination_objects_path" . ,objects)
+           ("staged_destination_ledger_path" .
+            ,(epi-ledger--recovery-manifest-pure-hidden-sibling
+              destination suffix))
+           ("staged_destination_objects_path" .
+            ,(epi-ledger--recovery-manifest-pure-hidden-sibling
+              objects suffix))))
+      (let ((entry (assoc (car binding) manifest)))
+        (should entry)
+        (setcdr entry (cdr binding))))
+    manifest))
+
+(ert-deftest epi-ledger-recovery-reaudit-rejects-handler-and-case-alias-paths ()
+  "Prepared manifests accept neither handler paths nor case-only aliases."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (destinations (list "/ssh:host:/tmp/dest.org")))
+      (when (file-name-case-insensitive-p source)
+        (setq destinations
+              (append destinations
+                      (list
+                       (expand-file-name
+                        (upcase (file-name-nondirectory source))
+                        (file-name-directory source))))))
+      (should
+       (equal
+        (make-list
+         (length destinations)
+         '(epi-ledger-conflict recovery-manifest-invalid))
+        (mapcar
+         (lambda (destination)
+           (epi-test-ledger-io--reaudit-condition
+            (lambda ()
+              (epi-ledger--recovery-manifest-encode
+               (epi-test-ledger-io--reaudit-destination-manifest
+                preflight destination)))))
+         destinations))))))
+
+(ert-deftest epi-ledger-recovery-reaudit-stabilizes-layout-error-mapping ()
+  "Every malformed manifest, including an overlapping layout, maps stably."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (source
+            (epi-ledger--recovery-layout-raw-source-path
+             (epi-ledger--recovery-preflight-raw-layout preflight)))
+           (destination (expand-file-name "nested.org" source)))
+      (should
+       (equal
+        '(epi-ledger-conflict recovery-manifest-invalid)
+        (epi-test-ledger-io--reaudit-condition
+         (lambda ()
+           (epi-ledger--recovery-manifest-encode
+            (epi-test-ledger-io--reaudit-destination-manifest
+             preflight destination)))))))))
+
+(ert-deftest epi-ledger-recovery-reaudit-missing-source-is-source-changed ()
+  "A missing source identity is not reported as a multiply-linked source."
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (epi-ledger--stat-function (lambda (_path) nil)))
+      (should
+       (equal
+        '(epi-ledger-conflict recovery-reseal-source-changed)
+        (epi-test-ledger-io--reaudit-condition
+         (lambda ()
+           (epi-ledger--recovery-preflight
+            inspection plan epi-test-ledger-io--wave3-recovery-id))))))))
+
+(ert-deftest epi-ledger-recovery-reaudit-close-preserves-object-tree-identity ()
+  "Closing a present-tree preflight retains its owned directory identity."
+  (epi-test-with-temporary-root (root)
+    (let* ((inspection
+            (epi-test-ledger-io--wave2-inspect-fixture
+             root "torn-final-json.org"))
+           (source (epi-ledger--inspection-raw-canonical-path inspection))
+           (_objects (make-directory (concat source ".objects")))
+           (plan (epi-test-ledger-io--wave2-plan inspection))
+           (preflight
+            (epi-ledger--recovery-preflight
+             inspection plan epi-test-ledger-io--wave3-recovery-id))
+           (expected
+            (epi-ledger--recovery-preflight-raw-source-objects-identity
+             preflight))
+           (closed (epi-ledger--recovery-close-preflight preflight)))
+      (should (eq 'present
+                  (epi-ledger--recovery-preflight-raw-source-object-tree-state
+                   closed)))
+      (should expected)
+      (should
+       (equal
+        expected
+        (epi-ledger--recovery-preflight-raw-source-objects-identity
+         closed))))))
+
+(ert-deftest epi-ledger-recovery-reaudit-rejects-out-of-range-identity-decimals ()
+  "Manifest file identities are limited to unsigned 64-bit decimal values."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (manifest
+            (epi-ledger--copy-tree-and-strings
+             (epi-ledger--recovery-preflight-raw-manifest-object preflight)))
+           (identity (epi-ledger--object-value manifest "source_identity"))
+           (inode (assoc "inode" identity)))
+      (should inode)
+      (setcdr inode "18446744073709551616")
+      (should
+       (equal
+        '(epi-ledger-conflict recovery-manifest-invalid)
+        (epi-test-ledger-io--reaudit-condition
+         (lambda () (epi-ledger--recovery-manifest-encode manifest))))))))
+
+(ert-deftest epi-ledger-recovery-reaudit-prepare-requires-preflight ()
+  "Prepare distinguishes a non-preflight argument from a changed preflight."
+  (should
+   (equal
+    '(epi-ledger-format-error recovery-preflight-required)
+    (epi-test-ledger-io--reaudit-condition
+     (lambda () (epi-ledger--recovery-prepare-manifest nil))))))
+
+(define-error 'epi-wave3-transaction-reaudit-fault
+  "Injected Wave 3 transaction re-audit fault")
+
+(ert-deftest epi-ledger-recovery-prepare-preserves-uncertain-writer-replacement ()
+  "Do not delete a same-byte replacement after the writer signals uncertainly."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (real-writer epi-ledger--byte-writer)
+           foreign-identity)
+      (let ((epi-ledger--byte-writer
+             (lambda (path bytes mode durablep)
+               (if (equal path temporary)
+                   (progn
+                     (funcall real-writer path bytes mode durablep)
+                     (delete-file path)
+                     (funcall real-writer path bytes 'exclusive-create t)
+                     (setq foreign-identity
+                           (epi-ledger--stat-local-file path))
+                     (signal 'epi-wave3-transaction-reaudit-fault nil))
+                 (funcall real-writer path bytes mode durablep)))))
+        (should-error
+         (epi-ledger--recovery-prepare-manifest preflight)
+         :type 'epi-wave3-transaction-reaudit-fault))
+      (should foreign-identity)
+      (should (file-exists-p temporary))
+      (should (file-directory-p transaction))
+      (should (equal foreign-identity
+                     (epi-ledger--stat-local-file temporary))))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-new-control-directory-swap ()
+  "Reject a same-device control replacement when the control was initially absent."
+  (epi-test-with-temporary-root (root)
+    (let* ((quarantine (expand-file-name "quarantine" root))
+           (attacker (expand-file-name "attacker-control" root))
+           (_created (make-directory attacker t))
+           (_mode (set-file-modes attacker #o700))
+           (preflight
+            (epi-test-ledger-io--wave3-preflight root nil quarantine))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (control
+            (epi-ledger--recovery-layout-raw-control-directory layout))
+           (displaced (expand-file-name "displaced-control" root))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (real-create
+            (symbol-function 'epi-ledger--recovery-create-private-directory))
+           swapped)
+      (cl-letf (((symbol-function 'epi-ledger--recovery-create-private-directory)
+                 (lambda (path device)
+                   (prog1 (funcall real-create path device)
+                     (when (and (equal path control) (not swapped))
+                       (rename-file control displaced nil)
+                       (rename-file attacker control nil)
+                       (setq swapped t))))))
+        (should-error
+         (epi-ledger--recovery-prepare-manifest preflight)
+         :type 'epi-ledger-conflict))
+      (should swapped)
+      (should-not (file-exists-p manifest)))))
+
+(ert-deftest epi-ledger-recovery-prepare-closes-unlock-callback-authority ()
+  "Reject a final unlock callback that corrupts the durable manifest."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (real-unlock epi-ledger--unlock-function))
+      (let ((epi-ledger--unlock-function
+             (lambda (lock)
+               (funcall real-unlock lock)
+               (delete-file manifest)
+               (epi-ledger--write-bytes
+                manifest "foreign" 'exclusive-create t))))
+        (should-error
+         (epi-ledger--recovery-prepare-manifest preflight)
+         :type 'epi-ledger-conflict)))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-no-op-unlock ()
+  "A returned prepared result requires the exact lock name to be absent."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout)))
+      (let ((epi-ledger--unlock-function #'ignore))
+        (should
+         (eq 'lock-token-changed
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-prepare-manifest preflight))
+              'epi-ledger-conflict))))
+      (should (file-regular-p (concat source ".epi-lock")))
+      (should (file-regular-p manifest)))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-intermediate-directory-swap ()
+  "Do not adopt a replacement for a newly created quarantine ancestor."
+  (epi-test-with-temporary-root (root)
+    (let* ((canonical-root (file-truename root))
+           (quarantine (expand-file-name "a/b/quarantine" canonical-root))
+           (intermediate (expand-file-name "a" canonical-root))
+           (displaced (expand-file-name "displaced-a" canonical-root))
+           (attacker (expand-file-name "attacker-a" canonical-root))
+           (_created (make-directory attacker t))
+           (_mode (set-file-modes attacker #o700))
+           (preflight
+            (epi-test-ledger-io--wave3-preflight root nil quarantine))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (real-create
+            (symbol-function 'epi-ledger--recovery-create-private-directory))
+           swapped)
+      (cl-letf (((symbol-function 'epi-ledger--recovery-create-private-directory)
+                 (lambda (path device)
+                   (prog1 (funcall real-create path device)
+                     (when (and (equal path intermediate) (not swapped))
+                       (rename-file intermediate displaced nil)
+                       (rename-file attacker intermediate nil)
+                       (setq swapped t))))))
+        (should
+         (eq 'recovery-path-conflict
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-prepare-manifest preflight))
+              'epi-ledger-conflict))))
+      (should swapped)
+      (should-not (file-exists-p manifest)))))
+
+(defvar epi-test-ledger-io--hostile-handler-calls 0)
+
+(defun epi-test-ledger-io--hostile-handler (&rest _arguments)
+  "Record an unexpected manifest-validation file-handler invocation."
+  (setq epi-test-ledger-io--hostile-handler-calls
+        (1+ epi-test-ledger-io--hostile-handler-calls))
+  (error "Hostile handler must not run"))
+
+(ert-deftest epi-ledger-recovery-manifest-rejects-handler-owned-directory ()
+  "Reject a handler-owned manifest directory before invoking its handler."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (manifest
+            (epi-ledger--copy-tree-and-strings
+             (epi-ledger--recovery-preflight-raw-manifest-object preflight)))
+           (quarantine
+            (epi-test-ledger-io--recovery-field manifest "quarantine_root"))
+           (epi-test-ledger-io--hostile-handler-calls 0)
+           (file-name-handler-alist
+            `((,(concat "\\`" (regexp-quote quarantine))
+               . epi-test-ledger-io--hostile-handler))))
+      (should
+       (eq 'recovery-manifest-invalid
+           (epi-test-ledger-io--wave2-condition-code
+            (lambda () (epi-ledger--recovery-manifest-encode manifest))
+            'epi-ledger-conflict)))
+      (should (= 0 epi-test-ledger-io--hostile-handler-calls)))))
+
+(ert-deftest epi-ledger-recovery-manifest-rejects-case-folded-containment ()
+  "Reject quarantine aliases of source objects on case-insensitive storage."
+  (epi-test-with-temporary-root (root)
+    (when (file-name-case-insensitive-p root)
+      (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+             (manifest
+              (epi-ledger--copy-tree-and-strings
+               (epi-ledger--recovery-preflight-raw-manifest-object preflight)))
+             (source
+              (epi-test-ledger-io--recovery-field manifest "source_path"))
+             (source-objects (concat source ".objects"))
+             (quarantine
+              (concat (substring source-objects 0 -1)
+                      (upcase (substring source-objects -1))))
+             (recovery-id
+              (epi-test-ledger-io--recovery-field manifest "recovery_id"))
+             (transaction
+              (expand-file-name
+               recovery-id
+               (file-name-as-directory
+                (expand-file-name ".epi-recovery"
+                                  (file-name-as-directory quarantine)))))
+             (source-stage
+              (expand-file-name "source-stage"
+                                (file-name-as-directory transaction)))
+             (staged-source-ledger
+              (expand-file-name
+               (file-name-nondirectory source)
+               (file-name-as-directory source-stage)))
+             (source-session-id
+              (epi-test-ledger-io--recovery-field
+               manifest "source_session_id"))
+             (fixed-at
+              (epi-test-ledger-io--recovery-field manifest "fixed_timestamp")))
+        (dolist (binding
+                 `(("quarantine_root" . ,quarantine)
+                   ("final_quarantine_path" .
+                    ,(expand-file-name
+                      (concat source-session-id "-" fixed-at)
+                      (file-name-as-directory quarantine)))
+                   ("source_stage_path" . ,source-stage)
+                   ("staged_source_ledger_path" . ,staged-source-ledger)
+                   ("staged_source_objects_path" .
+                    ,(concat staged-source-ledger ".objects"))
+                   ("absent_source_objects_marker_path" .
+                    ,(expand-file-name
+                      "absent-source-objects.jcs"
+                      (file-name-as-directory source-stage)))))
+          (epi-test-ledger-io--recovery-set-field
+           manifest (car binding) (cdr binding)))
+        (should-error
+         (epi-ledger--recovery-manifest-encode manifest)
+         :type 'epi-ledger-conflict)))))
+
+(define-error 'epi-test-wave3-final-security-barrier-fault
+  "Injected Wave 3 durable barrier fault")
+
+(ert-deftest epi-ledger-recovery-prepare-closes-unlock-after-barrier-signal ()
+  "Reprove durable resume evidence after unlock even when its barrier signals."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (real-unlock epi-ledger--unlock-function))
+      (let ((epi-ledger--recovery-phase-barrier-function
+             (lambda (_phase)
+               (signal 'epi-test-wave3-final-security-barrier-fault nil)))
+            (epi-ledger--unlock-function
+             (lambda (lock)
+               (funcall real-unlock lock)
+               (delete-file manifest)
+               (epi-ledger--write-bytes
+                manifest "foreign" 'exclusive-create t))))
+        (should
+         (eq 'recovery-manifest-invalid
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-prepare-manifest preflight))
+              'epi-ledger-conflict)))))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-extra-manifest-hard-link ()
+  "Reject publication that leaves a writable alias, without deleting the alias."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (expected
+            (epi-ledger--recovery-preflight-raw-manifest-bytes preflight))
+           (alias (expand-file-name "foreign-manifest-alias.jcs" root))
+           (real-publish epi-ledger--publish-function))
+      (let ((epi-ledger--publish-function
+             (lambda (temporary destination)
+               (funcall real-publish temporary destination)
+               (add-name-to-file temporary alias nil))))
+        (should
+         (eq 'recovery-manifest-invalid
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-prepare-manifest preflight))
+              'epi-ledger-conflict))))
+      (should (file-regular-p alias))
+      (should
+       (equal expected
+              (epi-test-ledger-io--literal-file-bytes alias))))))
+
+(ert-deftest epi-ledger-recovery-prepare-final-closure-rejects-barrier-temporary ()
+  "Reject a deterministic manifest temporary recreated by the phase barrier."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           created)
+      (let ((epi-ledger--recovery-phase-barrier-function
+             (lambda (phase)
+               (should (eq phase 'prepared))
+               (should-not (file-exists-p temporary))
+               (epi-ledger--write-bytes
+                temporary "barrier-created-temporary" 'exclusive-create t)
+               (setq created t))))
+        (should-error
+         (epi-ledger--recovery-prepare-manifest preflight)))
+      (should created)
+      (should (file-regular-p temporary)))))
+
+(ert-deftest epi-ledger-recovery-prepare-final-closure-rejects-missing-reachable-object ()
+  "Reject removal of a manifest-reachable historical object by the barrier."
+  (epi-test-with-temporary-root (root)
+    (let* ((case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list "barrier-reachable-object")))
+           (object-path (cdar (plist-get case :objects)))
+           (preflight
+            (epi-ledger--recovery-preflight
+             (plist-get case :inspection)
+             (plist-get case :plan)
+             epi-test-ledger-io--wave3-recovery-id))
+           removed)
+      (should (file-regular-p object-path))
+      (let ((epi-ledger--recovery-phase-barrier-function
+             (lambda (phase)
+               (should (eq phase 'prepared))
+               (delete-file object-path)
+               (setq removed t))))
+        (should-error
+         (epi-ledger--recovery-prepare-manifest preflight)))
+      (should removed)
+      (should-not (file-exists-p object-path)))))
+
+(defun epi-test-ledger-io--overlap-condition (thunk)
+  "Run THUNK and return its condition type and structured code, or `accepted'."
+  (condition-case condition
+      (progn (funcall thunk) 'accepted)
+    (error
+     (let ((properties (cadr condition)))
+       (list (car condition)
+             (and (listp properties)
+                  (plist-get properties :code)))))))
+
+(defun epi-test-ledger-io--overlap-hidden-destination
+    (destination objects-p)
+  "Return DESTINATION's independently derived hidden recovery sibling.
+When OBJECTS-P is non-nil, derive the sibling for its object directory."
+  (let* ((path (if objects-p (concat destination ".objects") destination))
+         (suffix
+          (concat "epi-recovery-"
+                  epi-test-ledger-io--wave3-recovery-id)))
+    (expand-file-name
+     (concat "." (file-name-nondirectory path) "." suffix)
+     (file-name-directory path))))
+
+(defun epi-test-ledger-io--overlap-case-alias (path)
+  "Return an absolute case-only alias of PATH's final component."
+  (let* ((name (file-name-nondirectory path))
+         (alias (upcase name)))
+    (should-not (equal name alias))
+    (should (string-equal-ignore-case name alias))
+    (expand-file-name alias (file-name-directory path))))
+
+(defun epi-test-ledger-io--overlap-quarantine (staged mode)
+  "Return a quarantine path overlapping hidden STAGED according to MODE."
+  (pcase mode
+    ('contained
+     (expand-file-name "nested-quarantine"
+                       (file-name-as-directory staged)))
+    ('case-alias
+     (epi-test-ledger-io--overlap-case-alias staged))
+    (_ (ert-fail (format "Unknown overlap mode: %S" mode)))))
+
+(defun epi-test-ledger-io--overlap-rebind-quarantine
+    (manifest quarantine)
+  "Coherently rebind copied MANIFEST's quarantine subtree to QUARANTINE."
+  (let* ((recovery-id
+          (epi-test-ledger-io--recovery-field manifest "recovery_id"))
+         (source
+          (epi-test-ledger-io--recovery-field manifest "source_path"))
+         (source-session-id
+          (epi-test-ledger-io--recovery-field manifest "source_session_id"))
+         (fixed-at
+          (epi-test-ledger-io--recovery-field manifest "fixed_timestamp"))
+         (transaction
+          (expand-file-name
+           recovery-id
+           (file-name-as-directory
+            (expand-file-name ".epi-recovery"
+                              (file-name-as-directory quarantine)))))
+         (source-stage
+          (expand-file-name "source-stage"
+                            (file-name-as-directory transaction)))
+         (staged-source-ledger
+          (expand-file-name
+           (file-name-nondirectory source)
+           (file-name-as-directory source-stage))))
+    (dolist
+        (binding
+         `(("quarantine_root" . ,quarantine)
+           ("final_quarantine_path" .
+            ,(expand-file-name
+              (concat source-session-id "-" fixed-at)
+              (file-name-as-directory quarantine)))
+           ("source_stage_path" . ,source-stage)
+           ("staged_source_ledger_path" . ,staged-source-ledger)
+           ("staged_source_objects_path" .
+            ,(concat staged-source-ledger ".objects"))
+           ("absent_source_objects_marker_path" .
+            ,(expand-file-name
+              "absent-source-objects.jcs"
+              (file-name-as-directory source-stage)))))
+      (epi-test-ledger-io--recovery-set-field
+       manifest (car binding) (cdr binding)))
+    manifest))
+
+(defun epi-test-ledger-io--overlap-call-with-case-policy (mode thunk)
+  "Call THUNK, forcing a case-folding volume policy for case-alias MODE."
+  (if (eq mode 'case-alias)
+      (cl-letf (((symbol-function 'file-name-case-insensitive-p)
+                 (lambda (&rest _arguments) t)))
+        (funcall thunk))
+    (funcall thunk)))
+
+(ert-deftest epi-ledger-recovery-preflight-rejects-hidden-stage-quarantine-overlap ()
+  "Live preflight rejects quarantine below or aliasing either hidden stage."
+  (let (observed expected)
+    (dolist (objects-p '(nil t))
+      (dolist (mode '(contained case-alias))
+        (epi-test-with-temporary-root (root)
+          (let* ((inspection
+                  (epi-test-ledger-io--wave2-inspect-fixture
+                   root "torn-final-json.org"))
+                 (plan (epi-test-ledger-io--wave2-plan inspection))
+                 (destination
+                  (expand-file-name "destination.org"
+                                    (file-name-as-directory
+                                     (file-truename root))))
+                 (staged
+                  (epi-test-ledger-io--overlap-hidden-destination
+                   destination objects-p))
+                 (quarantine
+                  (epi-test-ledger-io--overlap-quarantine staged mode))
+                 (before
+                  (epi-test-ledger-io--recovery-tree-snapshot root))
+                 (condition
+                  (epi-test-ledger-io--overlap-call-with-case-policy
+                   mode
+                   (lambda ()
+                     (epi-test-ledger-io--overlap-condition
+                      (lambda ()
+                        (epi-ledger--recovery-preflight
+                         inspection plan
+                         epi-test-ledger-io--wave3-recovery-id
+                         :destination destination
+                         :quarantine-directory quarantine)))))))
+            (push (list objects-p mode condition) observed)
+            (push
+             (list objects-p mode
+                   '(epi-ledger-conflict recovery-path-conflict))
+             expected)
+            (should
+             (equal before
+                    (epi-test-ledger-io--recovery-tree-snapshot root)))))))
+    (should (equal (nreverse expected) (nreverse observed)))))
+
+(ert-deftest epi-ledger-recovery-manifest-rejects-hidden-stage-quarantine-overlap ()
+  "Manifest encoding rejects quarantine below or aliasing either hidden stage."
+  (let (observed expected)
+    (dolist (objects-p '(nil t))
+      (dolist (mode '(contained case-alias))
+        (epi-test-with-temporary-root (root)
+          (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+                 (manifest
+                  (epi-ledger--copy-tree-and-strings
+                   (epi-ledger--recovery-preflight-raw-manifest-object
+                    preflight)))
+                 (destination
+                  (epi-test-ledger-io--recovery-field
+                   manifest "destination_path"))
+                 (staged
+                  (epi-test-ledger-io--overlap-hidden-destination
+                   destination objects-p))
+                 (quarantine
+                  (epi-test-ledger-io--overlap-quarantine staged mode))
+                 (_rebound
+                  (epi-test-ledger-io--overlap-rebind-quarantine
+                   manifest quarantine))
+                 (before
+                  (epi-test-ledger-io--recovery-tree-snapshot root))
+                 (condition
+                  (epi-test-ledger-io--overlap-call-with-case-policy
+                   mode
+                   (lambda ()
+                     (epi-test-ledger-io--overlap-condition
+                      (lambda ()
+                        (epi-ledger--recovery-manifest-encode manifest)))))))
+            (push (list objects-p mode condition) observed)
+            (push
+             (list objects-p mode
+                   '(epi-ledger-conflict recovery-manifest-invalid))
+             expected)
+            (should
+             (equal before
+                    (epi-test-ledger-io--recovery-tree-snapshot root)))))))
+    (should (equal (nreverse expected) (nreverse observed)))))
+
+(ert-deftest epi-ledger-recovery-prepare-isolates-unlock-callback-lock-value ()
+  "An unlock callback cannot redirect the final lock absence proof."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (original-lock-path (concat source ".epi-lock"))
+           (absent-sibling (concat original-lock-path ".absent"))
+           callback-lock)
+      (should-not (file-exists-p absent-sibling))
+      (let ((epi-ledger--unlock-function
+             (lambda (lock)
+               (setq callback-lock lock)
+               (setf (epi-ledger--lock-lock-file lock) absent-sibling))))
+        (should
+         (eq 'lock-token-changed
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-prepare-manifest preflight))
+              'epi-ledger-conflict))))
+      (should (epi-ledger--lock-p callback-lock))
+      (should (equal absent-sibling
+                     (epi-ledger--lock-lock-file callback-lock)))
+      (should (file-regular-p original-lock-path))
+      (should-not (file-exists-p absent-sibling)))))
+
+(defun epi-test-ledger-io--wave3-mutate-callback-path (path)
+  "Mutate nonempty callback PATH in place without changing its length."
+  (should (stringp path))
+  (should (> (length path) 0))
+  (let ((last (1- (length path))))
+    (aset path last (if (= (aref path last) ?X) ?Y ?X)))
+  path)
+
+(defun epi-test-ledger-io--wave3-assert-canonical-manifest
+    (prepared manifest expected)
+  "Require PREPARED and exact EXPECTED bytes at canonical MANIFEST."
+  (should (epi-ledger--recovery-prepared-p prepared))
+  (should (file-regular-p manifest))
+  (should
+   (equal expected
+          (epi-test-ledger-io--literal-file-bytes manifest))))
+
+(ert-deftest epi-ledger-recovery-prepare-isolates-writer-path-value ()
+  "A writer may mutate its local pathname without redirecting preparation."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (temporary
+            (substring-no-properties
+             (epi-ledger--recovery-layout-raw-manifest-temporary-path
+              layout)))
+           (manifest
+            (substring-no-properties
+             (epi-ledger--recovery-layout-raw-manifest-path layout)))
+           (expected
+            (substring-no-properties
+             (epi-ledger--recovery-preflight-raw-manifest-bytes preflight)))
+           (real-writer epi-ledger--byte-writer)
+           calls prepared)
+      (let ((epi-ledger--byte-writer
+             (lambda (path bytes mode durablep)
+               (let ((stable-path (substring-no-properties path)))
+                 (prog1
+                     (funcall real-writer stable-path bytes mode durablep)
+                   (when (and (equal stable-path temporary)
+                              (eq mode 'replace))
+                     (setq calls (1+ (or calls 0)))
+                     (epi-test-ledger-io--wave3-mutate-callback-path
+                      path)))))))
+        (setq prepared
+              (epi-ledger--recovery-prepare-manifest preflight)))
+      (should (= 1 calls))
+      (epi-test-ledger-io--wave3-assert-canonical-manifest
+       prepared manifest expected))))
+
+(ert-deftest epi-ledger-recovery-prepare-isolates-reader-path-value ()
+  "A reader may mutate its local pathname without redirecting preparation."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest
+            (substring-no-properties
+             (epi-ledger--recovery-layout-raw-manifest-path layout)))
+           (expected
+            (substring-no-properties
+             (epi-ledger--recovery-preflight-raw-manifest-bytes preflight)))
+           (real-reader epi-ledger--read-function)
+           calls prepared)
+      (let ((epi-ledger--read-function
+             (lambda (path begin end)
+               (let* ((stable-path (substring-no-properties path))
+                      (bytes (funcall real-reader stable-path begin end)))
+                 (when (equal stable-path manifest)
+                   (setq calls (1+ (or calls 0)))
+                   (epi-test-ledger-io--wave3-mutate-callback-path path))
+                 bytes))))
+        (setq prepared
+              (epi-ledger--recovery-prepare-manifest preflight)))
+      (should (= 1 calls))
+      (epi-test-ledger-io--wave3-assert-canonical-manifest
+       prepared manifest expected))))
+
+(ert-deftest epi-ledger-recovery-prepare-isolates-publisher-path-values ()
+  "A publisher may mutate local pathnames without redirecting preparation."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (temporary
+            (substring-no-properties
+             (epi-ledger--recovery-layout-raw-manifest-temporary-path
+              layout)))
+           (manifest
+            (substring-no-properties
+             (epi-ledger--recovery-layout-raw-manifest-path layout)))
+           (expected
+            (substring-no-properties
+             (epi-ledger--recovery-preflight-raw-manifest-bytes preflight)))
+           (real-publisher epi-ledger--publish-function)
+           calls prepared)
+      (let ((epi-ledger--publish-function
+             (lambda (source destination)
+               (let ((stable-source (substring-no-properties source))
+                     (stable-destination
+                      (substring-no-properties destination)))
+                 (prog1
+                     (funcall real-publisher
+                              stable-source stable-destination)
+                   (when (and (equal stable-source temporary)
+                              (equal stable-destination manifest))
+                     (setq calls (1+ (or calls 0)))
+                     (epi-test-ledger-io--wave3-mutate-callback-path
+                      source)
+                     (epi-test-ledger-io--wave3-mutate-callback-path
+                      destination)))))))
+        (setq prepared
+              (epi-ledger--recovery-prepare-manifest preflight)))
+      (should (= 1 calls))
+      (epi-test-ledger-io--wave3-assert-canonical-manifest
+       prepared manifest expected))))
+
+(ert-deftest epi-ledger-recovery-prepare-isolates-publisher-identity-value ()
+  "A publisher may mutate its local source identity without redirecting proof."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest
+            (substring-no-properties
+             (epi-ledger--recovery-layout-raw-manifest-path layout)))
+           (expected
+            (substring-no-properties
+             (epi-ledger--recovery-preflight-raw-manifest-bytes preflight)))
+           (real-publisher epi-ledger--publish-function)
+           mutated prepared)
+      (let ((epi-ledger--publish-function
+             (lambda (source destination)
+               (prog1
+                   (funcall real-publisher source destination)
+                 (should
+                  (listp epi-ledger--publish-expected-source-identity))
+                 (setf
+                  (plist-get
+                   epi-ledger--publish-expected-source-identity :inode)
+                  -1)
+                 (setq mutated t)))))
+        (setq prepared
+              (epi-ledger--recovery-prepare-manifest preflight)))
+      (should mutated)
+      (epi-test-ledger-io--wave3-assert-canonical-manifest
+       prepared manifest expected))))
+
+(ert-deftest epi-ledger-recovery-prewrite-raw-lock-proof-ignores-seams ()
+  "Changed lock bytes cannot be hidden by injectable stat and read seams."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (source-proof
+            (epi-ledger--recovery-preflight-raw-source-proof preflight))
+           (inspection
+            (epi-ledger--recovery-preflight-raw-inspection preflight))
+           (source
+            (epi-ledger--recovery-source-proof-canonical-path source-proof))
+           (expected-identity
+            (epi-ledger--recovery-source-proof-file-identity source-proof))
+           (expected-end
+            (epi-ledger--recovery-source-proof-source-size source-proof))
+           (expected-head
+            (epi-ledger--recovery-source-proof-valid-prefix-head
+             source-proof))
+           (last-record (epi-ledger--inspection-raw-last-record inspection))
+           (lock
+            (epi-ledger--acquire-lock
+             source expected-identity expected-end expected-head))
+           (lock-path
+            (substring-no-properties (epi-ledger--lock-lock-file lock)))
+           (claimed-identity
+            (epi-ledger--copy-tree-and-strings
+             (epi-ledger--lock-file-identity lock)))
+           (claimed-bytes
+            (substring-no-properties (epi-ledger--lock-bytes lock)))
+           (forged-bytes (make-string (length claimed-bytes) ?X))
+           (real-stat epi-ledger--stat-function)
+           (real-reader epi-ledger--read-function))
+      (unwind-protect
+          (progn
+            (delete-file lock-path)
+            (epi-ledger--write-bytes
+             lock-path forged-bytes 'exclusive-create t)
+            (let ((epi-ledger--stat-function
+                   (lambda (path)
+                     (if (equal path lock-path)
+                         (epi-ledger--copy-tree-and-strings
+                          claimed-identity)
+                       (funcall real-stat path))))
+                  (epi-ledger--read-function
+                   (lambda (path begin end)
+                     (if (equal path lock-path)
+                         (substring-no-properties
+                          claimed-bytes begin end)
+                       (funcall real-reader path begin end)))))
+              (should
+               (eq 'lock-token-changed
+                   (epi-test-ledger-io--wave2-condition-code
+                    (lambda ()
+                      (epi-ledger--verify-prewrite-authority-raw
+                       source expected-identity expected-end expected-head
+                       last-record lock))
+                    'epi-ledger-conflict)))))
+        (when (file-exists-p lock-path)
+          (delete-file lock-path))))))
+
+(define-error 'epi-test-wave3-directory-postproof-fault
+  "Injected directory post-create proof fault")
+(define-error 'epi-test-wave3-lock-create-fault
+  "Injected lock creation fault")
+(define-error 'epi-test-wave3-temporary-reservation-fault
+  "Injected temporary reservation fault")
+(define-error 'epi-test-wave3-prebarrier-write-fault
+  "Injected pre-barrier write fault")
+(define-error 'epi-test-wave3-independent-cleanup-fault
+  "Injected independently cleanable write fault")
+(define-error 'epi-test-wave3-ancestor-rollback-fault
+  "Injected ancestor rollback write fault")
+(define-error 'epi-test-wave3-transaction-create-fault
+  "Injected transaction directory creation fault")
+(define-error 'epi-test-wave3-directory-recreation-fault
+  "Injected write fault before unlock directory recreation")
+
+(defun epi-test-wave3-cleanup--condition-summary (thunk)
+  "Call THUNK and return its condition type and structured code."
+  (condition-case condition
+      (progn (funcall thunk) '(returned nil))
+    (error
+     (list (car condition)
+           (and (listp (cadr condition))
+                (plist-get (cadr condition) :code))))))
+
+(ert-deftest epi-ledger-recovery-cleanup-preserves-persistent-replacement ()
+  "A failed post-create proof preserves a replacement seen by cleanup."
+  (epi-test-with-temporary-root (root)
+    (let* ((target (expand-file-name "created" root))
+           (displaced (expand-file-name "created-owned" root))
+           (replacement-home (expand-file-name "independent" root))
+           (_created (make-directory replacement-home))
+           (_mode (set-file-modes replacement-home #o700))
+           (real-stat
+            (symbol-function 'epi-ledger--recovery-raw-directory-stat))
+           (replacement-identity (funcall real-stat replacement-home))
+           (device (plist-get (funcall real-stat root) :device))
+           swapped condition)
+      (cl-letf
+          (((symbol-function 'epi-ledger--recovery-raw-directory-stat)
+            (lambda (path)
+              (if (and (equal path target)
+                       (file-directory-p target)
+                       (not swapped))
+                  (progn
+                    (rename-file target displaced nil)
+                    (rename-file replacement-home target nil)
+                    (setq swapped t)
+                    (signal 'epi-test-wave3-directory-postproof-fault nil))
+                (funcall real-stat path)))))
+        (setq condition
+              (condition-case fault
+                  (progn
+                    (epi-ledger--recovery-create-private-directory
+                     target device)
+                    nil)
+                (error fault))))
+      (should (eq (car condition)
+                  'epi-test-wave3-directory-postproof-fault))
+      (should swapped)
+      (should (file-directory-p target))
+      (should
+       (epi-ledger--same-file-object-p
+        replacement-identity (funcall real-stat target)))
+      (should (file-directory-p displaced)))))
+
+(ert-deftest epi-ledger-recovery-cleanup-preserves-unreceipted-lock ()
+  "A lock creator that signals before returning leaves ambiguous state."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (lock-path (concat source ".epi-lock"))
+           (real-create epi-ledger--lock-create-function)
+           created)
+      (let ((epi-ledger--lock-create-function
+             (lambda (path bytes)
+               (funcall real-create path bytes)
+               (setq created t)
+               (signal 'epi-test-wave3-lock-create-fault nil))))
+        (should
+         (eq 'lock-token-changed
+             (epi-test-ledger-io--wave2-condition-code
+              (lambda ()
+                (epi-ledger--recovery-prepare-manifest preflight))
+              'epi-ledger-conflict))))
+      (should created)
+      (should (file-regular-p lock-path))
+      (delete-file lock-path))))
+
+(ert-deftest epi-ledger-recovery-cleanup-preserves-unreceipted-temporary ()
+  "A temporary reservation that signals before returning stays untouched."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (real-write (symbol-function 'epi-ledger--write-bytes))
+           reserved)
+      (cl-letf
+          (((symbol-function 'epi-ledger--write-bytes)
+            (lambda (path bytes mode durablep)
+              (let ((result
+                     (funcall real-write path bytes mode durablep)))
+                (when (and (equal path temporary)
+                           (eq mode 'exclusive-create)
+                           (equal bytes ""))
+                  (setq reserved t)
+                  (signal
+                   'epi-test-wave3-temporary-reservation-fault nil))
+                result))))
+        (should-error
+         (epi-ledger--recovery-prepare-manifest preflight)
+         :type 'epi-test-wave3-temporary-reservation-fault))
+      (should reserved)
+      (should (file-regular-p temporary))
+      (should (file-directory-p transaction)))))
+
+(ert-deftest epi-ledger-recovery-cleanup-closes-unlock-path-changes-after-prebarrier-fault ()
+  "Post-unlock closure detects destination and staging changes after failure."
+  (let (observed expected)
+    (dolist (kind '(destination destination-objects
+                    staged-destination staged-destination-objects))
+      (epi-test-with-temporary-root (root)
+        (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+               (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+               (temporary
+                (epi-ledger--recovery-layout-raw-manifest-temporary-path
+                 layout))
+               (target
+                (pcase kind
+                  ('destination
+                   (epi-ledger--recovery-layout-raw-destination-path
+                    layout))
+                  ('destination-objects
+                   (epi-ledger--recovery-layout-raw-destination-objects-path
+                    layout))
+                  ('staged-destination
+                   (epi-ledger--recovery-layout-raw-staged-destination-ledger-path
+                    layout))
+                  ('staged-destination-objects
+                   (epi-ledger--recovery-layout-raw-staged-destination-objects-path
+                    layout))))
+               (expected-code
+                (if (memq kind '(destination destination-objects))
+                    'recovery-destination-exists
+                  'recovery-path-conflict))
+               (real-writer epi-ledger--byte-writer)
+               (real-unlock epi-ledger--unlock-function)
+               writer-failed unlock-changed)
+          (let ((epi-ledger--byte-writer
+                 (lambda (path bytes mode durablep)
+                   (if (and (equal path temporary) (eq mode 'replace))
+                       (progn
+                         (setq writer-failed t)
+                         (signal 'epi-test-wave3-prebarrier-write-fault nil))
+                     (funcall real-writer path bytes mode durablep))))
+                (epi-ledger--unlock-function
+                 (lambda (lock)
+                   (funcall real-unlock lock)
+                   (make-directory (file-name-directory target) t)
+                   (epi-ledger--write-bytes
+                    target "unlock-path-change" 'exclusive-create t)
+                   (setq unlock-changed t))))
+            (push
+             (list kind
+                   (epi-test-wave3-cleanup--condition-summary
+                    (lambda ()
+                      (epi-ledger--recovery-prepare-manifest preflight))))
+             observed))
+          (should writer-failed)
+          (should unlock-changed)
+          (should (file-exists-p target))
+          (push (list kind (list 'epi-ledger-conflict expected-code))
+                expected))))
+    (should (equal (nreverse expected) (nreverse observed)))))
+
+(ert-deftest epi-ledger-recovery-cleanup-attempts-independent-removals ()
+  "Temporary and transaction cleanup proceed when canonical cleanup cannot."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (real-writer epi-ledger--byte-writer)
+           canonical-attempts writer-failed)
+      (cl-letf
+          (((symbol-function 'epi-ledger--recovery-rollback-oracle-file)
+            (lambda (&rest _arguments)
+              (setq canonical-attempts (1+ (or canonical-attempts 0)))
+              nil)))
+        (let ((epi-ledger--byte-writer
+               (lambda (path bytes mode durablep)
+                 (if (and (equal path temporary) (eq mode 'replace))
+                     (progn
+                       (setq writer-failed t)
+                       (signal
+                        'epi-test-wave3-independent-cleanup-fault nil))
+                   (funcall real-writer path bytes mode durablep)))))
+          (should-error
+           (epi-ledger--recovery-prepare-manifest preflight)
+           :type 'epi-test-wave3-independent-cleanup-fault)))
+      (should writer-failed)
+      (should (= 1 canonical-attempts))
+      (should-not (file-exists-p temporary))
+      (should-not (file-exists-p transaction)))))
+
+(ert-deftest epi-ledger-recovery-cleanup-restores-new-private-ancestors ()
+  "A pre-barrier failure restores every newly created private ancestor."
+  (epi-test-with-temporary-root (root)
+    (let* ((canonical-root (file-truename root))
+           (top (expand-file-name "new-a" canonical-root))
+           (quarantine
+            (expand-file-name "new-a/new-b/quarantine" canonical-root))
+           (preflight
+            (epi-test-ledger-io--wave3-preflight root nil quarantine))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (control
+            (epi-ledger--recovery-layout-raw-control-directory layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (before (epi-test-ledger-io--recovery-tree-snapshot root))
+           (real-writer epi-ledger--byte-writer)
+           writer-failed)
+      (let ((epi-ledger--byte-writer
+             (lambda (path bytes mode durablep)
+               (if (and (equal path temporary) (eq mode 'replace))
+                   (progn
+                     (setq writer-failed t)
+                     (signal 'epi-test-wave3-ancestor-rollback-fault nil))
+                 (funcall real-writer path bytes mode durablep)))))
+        (should-error
+         (epi-ledger--recovery-prepare-manifest preflight)
+         :type 'epi-test-wave3-ancestor-rollback-fault))
+      (should writer-failed)
+      (should-not (file-exists-p transaction))
+      (should-not (file-exists-p control))
+      (should-not (file-exists-p quarantine))
+      (should-not (file-exists-p top))
+      (should
+       (equal (cdr before)
+              (cdr (epi-test-ledger-io--recovery-tree-snapshot root)))))))
+
+(ert-deftest epi-ledger-recovery-cleanup-restores-parents-before-transaction ()
+  "A transaction-create fault rolls back newly created parent directories."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (quarantine
+            (epi-ledger--recovery-layout-raw-quarantine-root layout))
+           (control
+            (epi-ledger--recovery-layout-raw-control-directory layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (real-create
+            (symbol-function 'epi-ledger--recovery-create-private-directory))
+           attempted)
+      (cl-letf
+          (((symbol-function 'epi-ledger--recovery-create-private-directory)
+            (lambda (path device)
+              (if (equal path transaction)
+                  (progn
+                    (setq attempted t)
+                    (signal 'epi-test-wave3-transaction-create-fault nil))
+                (funcall real-create path device)))))
+        (should-error
+         (epi-ledger--recovery-prepare-manifest preflight)
+         :type 'epi-test-wave3-transaction-create-fault))
+      (should attempted)
+      (should-not (file-exists-p transaction))
+      (should-not (file-exists-p control))
+      (should-not (file-exists-p quarantine)))))
+
+(ert-deftest epi-ledger-recovery-cleanup-closes-unlock-directory-recreation ()
+  "Post-unlock closure detects recreation of a cleaned directory tree."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (quarantine
+            (epi-ledger--recovery-layout-raw-quarantine-root layout))
+           (control
+            (epi-ledger--recovery-layout-raw-control-directory layout))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (real-writer epi-ledger--byte-writer)
+           (real-unlock epi-ledger--unlock-function)
+           writer-failed recreated)
+      (let ((epi-ledger--byte-writer
+             (lambda (path bytes mode durablep)
+               (if (and (equal path temporary) (eq mode 'replace))
+                   (progn
+                     (setq writer-failed t)
+                     (signal
+                      'epi-test-wave3-directory-recreation-fault nil))
+                 (funcall real-writer path bytes mode durablep))))
+            (epi-ledger--unlock-function
+             (lambda (lock)
+               (funcall real-unlock lock)
+               (make-directory control t)
+               (set-file-modes quarantine #o700)
+               (set-file-modes control #o700)
+               (setq recreated t))))
+        (should
+         (equal
+          '(epi-ledger-conflict recovery-path-conflict)
+          (epi-test-wave3-cleanup--condition-summary
+           (lambda ()
+             (epi-ledger--recovery-prepare-manifest preflight))))))
+      (should writer-failed)
+      (should recreated)
+      (should (file-directory-p quarantine))
+      (should (file-directory-p control)))))
+
+(define-error 'epi-test-wave3-lock-creator-postwrite-fault
+  "Injected lock creator fault after exact token publication")
+(define-error 'epi-test-wave3-entry-publisher-fault
+  "Injected Wave 3 publisher fault")
+(define-error 'epi-test-wave3-entry-barrier-fault
+  "Injected Wave 3 barrier fault")
+(define-error 'epi-test-wave3-prebarrier-cleanup-fault
+  "Injected Wave 3 pre-barrier cleanup fault")
+
+(defun epi-test-wave3-entry--capture-any-condition (function)
+  "Call FUNCTION and return its condition, including `quit'."
+  (condition-case condition
+      (list :returned (funcall function))
+    ((error quit) condition)))
+
+(defun epi-test-wave3-entry--condition-code (condition)
+  "Return the structured Epi error code carried by CONDITION, or nil."
+  (let ((properties (and (consp condition) (cadr condition))))
+    (and (listp properties) (plist-get properties :code))))
+
+(ert-deftest epi-ledger-recovery-prebarrier-rollback-attempts-all-after-quit ()
+  "A cleanup quit cannot skip later exact rollback authorities."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           attempts condition)
+      (cl-letf
+          (((symbol-function 'epi-ledger--recovery-rollback-oracle-file)
+            (lambda (&rest _arguments)
+              (push 'manifest attempts)
+              (signal 'quit nil)))
+           ((symbol-function 'epi-ledger--recovery-rollback-exact-temporary)
+            (lambda (&rest _arguments)
+              (push 'temporary attempts)
+              t))
+           ((symbol-function
+             'epi-ledger--recovery-delete-exact-empty-directory)
+            (lambda (&rest _arguments)
+              (push 'transaction attempts)))
+           ((symbol-function 'epi-ledger--recovery-raw-directory-stat)
+            (lambda (&rest _arguments) nil))
+           ((symbol-function
+             'epi-ledger--recovery-rollback-directory-receipts)
+            (lambda (&rest _arguments)
+              (push 'directories attempts)
+              t)))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-clean-prebarrier-transaction
+                  layout nil nil nil (string-as-unibyte "manifest") nil)))))
+      (should (equal '(:returned nil) condition))
+      (should
+       (equal '(manifest temporary transaction directories)
+              (nreverse attempts))))))
+
+(ert-deftest epi-ledger-recovery-prebarrier-rollback-attempts-all-after-throw ()
+  "A cleanup throw cannot skip later exact rollback authorities."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           attempts result)
+      (cl-letf
+          (((symbol-function 'epi-ledger--recovery-rollback-oracle-file)
+            (lambda (&rest _arguments)
+              (push 'manifest attempts)
+              (throw 'epi-wave3-cleanup-escape 'escaped)))
+           ((symbol-function 'epi-ledger--recovery-rollback-exact-temporary)
+            (lambda (&rest _arguments)
+              (push 'temporary attempts)
+              t))
+           ((symbol-function
+             'epi-ledger--recovery-delete-exact-empty-directory)
+            (lambda (&rest _arguments)
+              (push 'transaction attempts)))
+           ((symbol-function 'epi-ledger--recovery-raw-directory-stat)
+            (lambda (&rest _arguments) nil))
+           ((symbol-function
+             'epi-ledger--recovery-rollback-directory-receipts)
+            (lambda (&rest _arguments)
+              (push 'directories attempts)
+              t)))
+        (setq result
+              (catch 'epi-wave3-cleanup-escape
+                (list
+                 :returned
+                 (epi-ledger--recovery-clean-prebarrier-transaction
+                  layout nil nil nil (string-as-unibyte "manifest") nil)))))
+      (should (eq 'escaped result))
+      (should
+       (equal '(manifest temporary transaction directories)
+              (nreverse attempts))))))
+
+(ert-deftest epi-ledger-recovery-directory-rollback-continues-after-quit ()
+  "A receipt cleanup quit cannot skip older owned directories."
+  (let ((receipts '(("first" . first-id) ("second" . second-id)))
+        attempts condition first)
+    (cl-letf
+        (((symbol-function 'epi-ledger--recovery-delete-exact-empty-directory)
+          (lambda (path _identity)
+            (push path attempts)
+            (unless first
+              (setq first t)
+              (signal 'quit nil))))
+         ((symbol-function 'epi-ledger--recovery-raw-directory-stat)
+          (lambda (&rest _arguments) nil)))
+      (setq condition
+            (epi-test-wave3-entry--capture-any-condition
+             (lambda ()
+               (epi-ledger--recovery-rollback-directory-receipts receipts)))))
+    (should (equal '(:returned nil) condition))
+    (should (equal '("second" "first") (nreverse attempts)))))
+
+(ert-deftest epi-ledger-recovery-directory-rollback-continues-after-throw ()
+  "A receipt cleanup throw cannot skip older owned directories."
+  (let ((receipts '(("first" . first-id) ("second" . second-id)))
+        attempts result first)
+    (cl-letf
+        (((symbol-function 'epi-ledger--recovery-delete-exact-empty-directory)
+          (lambda (path _identity)
+            (push path attempts)
+            (unless first
+              (setq first t)
+              (throw 'epi-wave3-receipt-escape 'escaped))))
+         ((symbol-function 'epi-ledger--recovery-raw-directory-stat)
+          (lambda (&rest _arguments) nil)))
+      (setq result
+            (catch 'epi-wave3-receipt-escape
+              (list
+               :returned
+               (epi-ledger--recovery-rollback-directory-receipts receipts)))))
+    (should (eq 'escaped result))
+    (should (equal '("second" "first") (nreverse attempts)))))
+
+(ert-deftest epi-ledger-recovery-private-receiver-values-are-isolated ()
+  "A parent receipt observer cannot mutate retained cleanup authority."
+  (epi-test-with-temporary-root (root)
+    (let* ((quarantine (expand-file-name "nested/a/quarantine" root))
+           (created-top (expand-file-name "nested" root))
+           (preflight
+            (epi-test-ledger-io--wave3-preflight root nil quarantine))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (anchor
+            (epi-ledger--recovery-layout-raw-quarantine-anchor-identity
+             layout))
+           received result)
+      (let ((epi-ledger--recovery-directory-receipt-receiver
+             (lambda (path identity)
+               (setq received t)
+               (aset path (1- (length path)) ?X)
+               (setf (plist-get identity :path) "mutated"))))
+        (setq result
+              (epi-ledger--recovery-prepare-private-directories
+               layout anchor nil nil)))
+      (should received)
+      (should
+       (equal
+        (epi-ledger--recovery-layout-raw-quarantine-root layout)
+        (plist-get (nth 0 result) :path)))
+      (should
+       (equal
+        (epi-ledger--recovery-layout-raw-control-directory layout)
+        (plist-get (nth 1 result) :path)))
+      (should
+       (epi-ledger--recovery-rollback-directory-receipts (nth 2 result)))
+      (should-not (file-exists-p created-top)))))
+
+(ert-deftest epi-ledger-recovery-private-directory-unwind-survives-quit ()
+  "A local cleanup quit cannot replace failure or skip older receipts."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (anchor
+            (epi-ledger--recovery-layout-raw-quarantine-anchor-identity
+             layout))
+           (calls 0)
+           first-cleanup
+           attempts
+           condition)
+      (cl-letf
+          (((symbol-function
+             'epi-ledger--recovery-require-bound-directory-raw)
+            (lambda (_path identity &rest _arguments) identity))
+           ((symbol-function 'epi-ledger--recovery-require-directory-state-raw)
+            (lambda (&rest _arguments) nil))
+           ((symbol-function 'epi-ledger--recovery-directory-chain)
+            (lambda (&rest _arguments) '("first" "second")))
+           ((symbol-function 'epi-ledger--recovery-create-private-directory)
+            (lambda (path _device)
+              (list :path path :device 1 :inode 1 :links 1
+                    :modified '(0 0 0 0) :changed '(0 0 0 0))))
+           ((symbol-function
+             'epi-ledger--recovery-reprove-created-directories-raw)
+            (lambda (&rest _arguments)
+              (setq calls (1+ calls))
+              (when (= calls 4)
+                (signal 'epi-test-wave3-prebarrier-cleanup-fault nil))))
+           ((symbol-function
+             'epi-ledger--recovery-delete-exact-empty-directory)
+            (lambda (path _identity)
+              (push path attempts)
+              (unless first-cleanup
+                (setq first-cleanup t)
+                (signal 'quit nil)))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-private-directories
+                  layout anchor nil nil)))))
+      (should
+       (equal '(epi-test-wave3-prebarrier-cleanup-fault) condition))
+      (should (equal '("second" "first") (nreverse attempts))))))
+
+(ert-deftest epi-ledger-recovery-lock-create-without-receipt-is-preserved ()
+  "Preserve a live token when its creator never returned an identity."
+  (epi-test-with-temporary-root (root)
+    (let* ((path (expand-file-name "session.org" root))
+           (lock-path (epi-ledger--lock-path path))
+           (real-create epi-ledger--lock-create-function)
+           (real-delete (symbol-function 'delete-file))
+           created-identity candidate caught
+           (delete-attempts 0))
+      (unwind-protect
+          (progn
+            (let ((epi-ledger--lock-create-function
+                   (lambda (target bytes)
+                     (setq candidate (substring-no-properties bytes)
+                           created-identity
+                           (funcall real-create target bytes))
+                     (signal
+                      'epi-test-wave3-lock-creator-postwrite-fault nil))))
+              (cl-letf
+                  (((symbol-function 'delete-file)
+                    (lambda (target &optional _trash)
+                      (if (equal target lock-path)
+                          (progn
+                            (setq delete-attempts (1+ delete-attempts))
+                            (signal
+                             'file-error
+                             (list "Injected exact lock delete failure"
+                                   target)))
+                        (funcall real-delete target)))))
+                (setq caught
+                      (condition-case condition
+                          (progn
+                            (epi-ledger--acquire-lock
+                             path "absent" 0 nil)
+                            '(returned nil))
+                        (error condition)))))
+            (should created-identity)
+            (should (= 0 delete-attempts))
+            (should (file-regular-p lock-path))
+            (should
+             (equal candidate
+                    (epi-test-ledger-io--literal-file-bytes lock-path)))
+            (should (eq 'epi-ledger-conflict (car caught)))
+            (should
+             (eq 'lock-token-changed
+                 (epi-test-ledger-io--condition-code caught))))
+        (when (file-exists-p lock-path)
+          (funcall real-delete lock-path))))))
+
+(ert-deftest epi-ledger-recovery-result-construction-quit-cleans-verified-lock ()
+  "A post-verification quit cannot strand the current process's lock."
+  (epi-test-with-temporary-root (root)
+    (let* ((path (expand-file-name "session.org" root))
+           (lock-path (epi-ledger--lock-path path))
+           (real-copy
+            (symbol-function 'epi-ledger--copy-tree-and-strings))
+           (identity-copies 0)
+           construction-faulted
+           condition)
+      (cl-letf
+          (((symbol-function 'epi-ledger--copy-tree-and-strings)
+            (lambda (value)
+              (let ((copy (funcall real-copy value)))
+                (when (and (listp value)
+                           (equal (plist-get value :path) lock-path))
+                  (setq identity-copies (1+ identity-copies))
+                  ;; Copies one and two own the creator/observed identities;
+                  ;; three and four close bounded readback; five constructs
+                  ;; the result after exact verification has succeeded.
+                  (when (= identity-copies 5)
+                    (setq construction-faulted t)
+                    (signal 'quit nil)))
+                copy))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--acquire-lock path "absent" 0 nil)))))
+      (should construction-faulted)
+      (should (>= identity-copies 5))
+      (should-not (file-exists-p lock-path))
+      (should (equal '(quit) condition)))))
+
+(ert-deftest epi-ledger-recovery-result-construction-throw-cleans-verified-lock ()
+  "An arbitrary post-verification throw observes the exact token already gone."
+  (epi-test-with-temporary-root (root)
+    (let* ((path (expand-file-name "session.org" root))
+           (lock-path (epi-ledger--lock-path path))
+           (real-create epi-ledger--lock-create-function)
+           (real-copy
+            (symbol-function 'epi-ledger--copy-tree-and-strings))
+           (real-delete (symbol-function 'delete-file))
+           (identity-copies 0)
+           (delete-attempts 0)
+           candidate construction-faulted created-identity
+           deleted-bytes deleted-identity observed)
+      (unwind-protect
+          (progn
+            (let ((epi-ledger--lock-create-function
+                   (lambda (target bytes)
+                     (setq candidate (substring-no-properties bytes)
+                           created-identity
+                           (funcall real-create target bytes)))))
+              (cl-letf
+                  (((symbol-function 'epi-ledger--copy-tree-and-strings)
+                    (lambda (value)
+                      (let ((copy (funcall real-copy value)))
+                        (when (and (listp value)
+                                   (equal (plist-get value :path) lock-path))
+                          (setq identity-copies (1+ identity-copies))
+                          (when (= identity-copies 5)
+                            (setq construction-faulted t)
+                            (throw
+                             'epi-wave3-lock-result-construction-escape
+                             'escaped)))
+                        copy)))
+                   ((symbol-function 'delete-file)
+                    (lambda (target &optional trash)
+                      (if (equal target lock-path)
+                          (progn
+                            (setq delete-attempts (1+ delete-attempts)
+                                  deleted-identity
+                                  (epi-ledger--stat-local-file target)
+                                  deleted-bytes
+                                  (epi-test-ledger-io--literal-file-bytes
+                                   target))
+                            (funcall real-delete target trash))
+                        (funcall real-delete target trash)))))
+                (setq observed
+                      (catch 'epi-wave3-lock-result-construction-escape
+                        (list
+                         :returned
+                         (epi-ledger--acquire-lock
+                          path "absent" 0 nil))))))
+            (should (eq 'escaped observed))
+            (should construction-faulted)
+            (should (>= identity-copies 5))
+            (should (= 1 delete-attempts))
+            (should
+             (epi-ledger--same-file-object-p
+              created-identity deleted-identity))
+            (should (equal candidate deleted-bytes))
+            (should-not (file-exists-p lock-path)))
+        (when (file-exists-p lock-path)
+          (funcall real-delete lock-path))))))
+
+(ert-deftest
+    epi-ledger-recovery-result-construction-cleanup-failure-preserves-lock ()
+  "Map exact cleanup failure to conflict and preserve the verified token."
+  (epi-test-with-temporary-root (root)
+    (let* ((path (expand-file-name "session.org" root))
+           (lock-path (epi-ledger--lock-path path))
+           (real-create epi-ledger--lock-create-function)
+           (real-copy
+            (symbol-function 'epi-ledger--copy-tree-and-strings))
+           (real-delete (symbol-function 'delete-file))
+           (identity-copies 0)
+           (delete-attempts 0)
+           candidate construction-faulted created-identity
+           delete-attempt-bytes condition)
+      (unwind-protect
+          (progn
+            (let ((epi-ledger--lock-create-function
+                   (lambda (target bytes)
+                     (setq candidate (substring-no-properties bytes)
+                           created-identity
+                           (funcall real-create target bytes)))))
+              (cl-letf
+                  (((symbol-function 'epi-ledger--copy-tree-and-strings)
+                    (lambda (value)
+                      (let ((copy (funcall real-copy value)))
+                        (when (and (listp value)
+                                   (equal (plist-get value :path) lock-path))
+                          (setq identity-copies (1+ identity-copies))
+                          (when (= identity-copies 5)
+                            (setq construction-faulted t)
+                            (throw
+                             'epi-wave3-lock-result-construction-escape
+                             'escaped)))
+                        copy)))
+                   ((symbol-function 'delete-file)
+                    (lambda (target &optional trash)
+                      (if (equal target lock-path)
+                          (progn
+                            (setq delete-attempts (1+ delete-attempts)
+                                  delete-attempt-bytes
+                                  (epi-test-ledger-io--literal-file-bytes
+                                   target))
+                            (signal
+                             'file-error
+                             (list
+                              "Injected exact lock delete failure" target)))
+                        (funcall real-delete target trash)))))
+                (setq condition
+                      (epi-test-wave3-entry--capture-any-condition
+                       (lambda ()
+                         (catch
+                             'epi-wave3-lock-result-construction-escape
+                           (list
+                            :returned
+                            (epi-ledger--acquire-lock
+                             path "absent" 0 nil))))))))
+            (should construction-faulted)
+            (should (>= identity-copies 5))
+            (should (= 1 delete-attempts))
+            (should (equal candidate delete-attempt-bytes))
+            (should (eq 'epi-ledger-conflict (car condition)))
+            (should
+             (eq 'lock-token-changed
+                 (epi-test-ledger-io--condition-code condition)))
+            (should (file-regular-p lock-path))
+            (should
+             (epi-ledger--same-file-object-p
+              created-identity
+              (epi-ledger--stat-local-file lock-path)))
+            (should
+             (equal candidate
+                    (epi-test-ledger-io--literal-file-bytes lock-path))))
+        (when (file-exists-p lock-path)
+          (funcall real-delete lock-path))))))
+
+(ert-deftest epi-ledger-recovery-acquire-return-quit-cleans-exact-lock ()
+  "Propagate acquisition-boundary quit only after exact lock cleanup."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (lock-path (epi-ledger--lock-path source))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (real-acquire (symbol-function 'epi-ledger--acquire-lock))
+           (real-delete (symbol-function 'delete-file))
+           acquired caught)
+      (unwind-protect
+          (progn
+            (cl-letf
+                (((symbol-function 'epi-ledger--acquire-lock)
+                  (lambda (&rest arguments)
+                    (setq acquired (apply real-acquire arguments))
+                    (signal 'quit nil))))
+              (setq caught
+                    (epi-test-wave3-entry--capture-any-condition
+                     (lambda ()
+                       (epi-ledger--recovery-prepare-manifest preflight)))))
+            (should (epi-ledger--lock-p acquired))
+            (should (eq 'quit (car caught)))
+            (should-not (file-exists-p manifest))
+            (should-not (file-exists-p transaction))
+            (should-not (file-exists-p lock-path)))
+        (when (file-exists-p lock-path)
+          (funcall real-delete lock-path))))))
+
+(ert-deftest epi-ledger-recovery-acquire-return-cleanup-quit-keeps-authority ()
+  "A failed acquisition cleanup cannot hide a live exact lock token."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (lock-path (epi-ledger--lock-path source))
+           (real-acquire (symbol-function 'epi-ledger--acquire-lock))
+           (real-delete (symbol-function 'delete-file))
+           acquired condition delete-attempted)
+      (unwind-protect
+          (progn
+            (cl-letf
+                (((symbol-function 'epi-ledger--acquire-lock)
+                  (lambda (&rest arguments)
+                    (setq acquired (apply real-acquire arguments))
+                    (signal 'quit nil)))
+                 ((symbol-function 'delete-file)
+                  (lambda (path &optional trash)
+                    (if (equal path lock-path)
+                        (progn
+                          (setq delete-attempted t)
+                          (signal 'quit nil))
+                      (funcall real-delete path trash)))))
+              (setq condition
+                    (epi-test-wave3-entry--capture-any-condition
+                     (lambda ()
+                       (epi-ledger--recovery-prepare-manifest preflight)))))
+            (should (epi-ledger--lock-p acquired))
+            (should delete-attempted)
+            (should (file-regular-p lock-path))
+            (should (eq 'epi-ledger-conflict (car condition)))
+            (should
+             (eq 'lock-token-changed
+                 (epi-test-wave3-entry--condition-code condition))))
+        (when (file-exists-p lock-path)
+          (funcall real-delete lock-path))))))
+
+(ert-deftest epi-ledger-recovery-entry-quit-yields-manifest-conflict ()
+  "A durable barrier quit cannot mask unlock corruption of its manifest."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (replacement (string-as-unibyte "unlock replacement"))
+           (real-unlock epi-ledger--unlock-function)
+           replaced condition)
+      (let ((epi-ledger--recovery-phase-barrier-function
+             (lambda (_phase) (signal 'quit nil)))
+            (epi-ledger--unlock-function
+             (lambda (lock)
+               (funcall real-unlock lock)
+               (delete-file manifest)
+               (epi-ledger--write-bytes
+                manifest replacement 'exclusive-create t)
+               (setq replaced t))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should replaced)
+      (should
+       (equal replacement
+              (epi-test-ledger-io--literal-file-bytes manifest)))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-manifest-invalid
+           (epi-test-wave3-entry--condition-code condition))))))
+
+(ert-deftest epi-ledger-recovery-entry-barrier-stray-is-conflict ()
+  "Reject and preserve a transaction entry introduced by the barrier."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (stray (expand-file-name "barrier-stray" transaction))
+           (bytes (string-as-unibyte "barrier stray"))
+           condition)
+      (let ((epi-ledger--recovery-phase-barrier-function
+             (lambda (_phase)
+               (epi-ledger--write-bytes stray bytes 'exclusive-create t))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should
+       (equal bytes (epi-test-ledger-io--literal-file-bytes stray)))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-path-conflict
+           (epi-test-wave3-entry--condition-code condition))))))
+
+(ert-deftest epi-ledger-recovery-entry-unlock-stray-is-conflict ()
+  "Reject and preserve a transaction entry introduced during unlock."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (stray (expand-file-name "unlock-stray" transaction))
+           (bytes (string-as-unibyte "unlock stray"))
+           (real-unlock epi-ledger--unlock-function)
+           condition)
+      (let ((epi-ledger--unlock-function
+             (lambda (lock)
+               (funcall real-unlock lock)
+               (epi-ledger--write-bytes
+                stray bytes 'exclusive-create t))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should
+       (equal bytes (epi-test-ledger-io--literal-file-bytes stray)))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-path-conflict
+           (epi-test-wave3-entry--condition-code condition))))))
+
+(ert-deftest epi-ledger-recovery-entry-publisher-signal-rolls-back ()
+  "A postpublish error rolls back exactly and leaves preparation retryable."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (lock-path (concat source ".epi-lock"))
+           (real-publish epi-ledger--publish-function)
+           published condition)
+      (let ((epi-ledger--publish-function
+             (lambda (from to)
+               (funcall real-publish from to)
+               (setq published t)
+               (signal 'epi-test-wave3-entry-publisher-fault nil))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should published)
+      (should (equal '(epi-test-wave3-entry-publisher-fault) condition))
+      (dolist (path (list manifest temporary transaction lock-path))
+        (should-not (file-exists-p path)))
+      (let ((prepared (epi-ledger--recovery-prepare-manifest preflight)))
+        (should (epi-ledger--recovery-prepared-p prepared))
+        (should (file-regular-p manifest))
+        (should (file-directory-p transaction))
+        (should-not (file-exists-p temporary))
+        (should-not (file-exists-p lock-path))))))
+
+(ert-deftest epi-ledger-recovery-entry-ordinary-barrier-error-is-retained ()
+  "An ordinary barrier error propagates after durable state is re-proved."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (expected
+            (epi-ledger--recovery-preflight-raw-manifest-bytes preflight))
+           (lock-path (concat source ".epi-lock"))
+           barrier-called condition)
+      (let ((epi-ledger--recovery-phase-barrier-function
+             (lambda (_phase)
+               (setq barrier-called t)
+               (signal 'epi-test-wave3-entry-barrier-fault nil))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should barrier-called)
+      (should (equal '(epi-test-wave3-entry-barrier-fault) condition))
+      (should (file-directory-p transaction))
+      (should (file-regular-p manifest))
+      (should
+       (equal expected
+              (epi-test-ledger-io--literal-file-bytes manifest)))
+      (should-not (file-exists-p temporary))
+      (should-not (file-exists-p lock-path)))))
+
+(ert-deftest epi-ledger-recovery-unreceipted-lock-preserves-same-byte-replacement ()
+  "Candidate bytes alone never authorize deletion of a replacement inode."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (lock-path (epi-ledger--lock-path source))
+           (displaced (concat lock-path ".displaced"))
+           (real-create epi-ledger--lock-create-function)
+           replacement condition)
+      (let ((epi-ledger--lock-create-function
+             (lambda (path bytes)
+               (funcall real-create path bytes)
+               (rename-file path displaced nil)
+               (epi-ledger--write-bytes path bytes 'exclusive-create t)
+               (setq replacement (epi-ledger--stat-local-file path))
+               (signal 'epi-test-wave3-lock-create-fault nil))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'lock-token-changed
+           (epi-test-wave3-entry--condition-code condition)))
+      (should
+       (epi-ledger--same-file-object-p
+        replacement (epi-ledger--stat-local-file lock-path)))
+      (should (file-regular-p displaced)))))
+
+(ert-deftest epi-ledger-recovery-unreceipted-temp-preserves-empty-replacement ()
+  "Empty bytes alone never authorize deletion of a replacement inode."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (temporary
+            (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+           (displaced (concat temporary ".displaced"))
+           (real-write (symbol-function 'epi-ledger--write-bytes))
+           replacement condition)
+      (cl-letf
+          (((symbol-function 'epi-ledger--write-bytes)
+            (lambda (path bytes mode durablep)
+              (let ((result (funcall real-write path bytes mode durablep)))
+                (when (and (equal path temporary)
+                           (eq mode 'exclusive-create)
+                           (equal bytes ""))
+                  (rename-file path displaced nil)
+                  (funcall real-write path bytes mode durablep)
+                  (setq replacement (epi-ledger--stat-local-file path))
+                  (signal 'epi-test-wave3-temporary-reservation-fault nil))
+                result))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should
+       (equal '(epi-test-wave3-temporary-reservation-fault) condition))
+      (should
+       (epi-ledger--same-file-object-p
+        replacement (epi-ledger--stat-local-file temporary)))
+      (should (file-regular-p displaced)))))
+
+(ert-deftest epi-ledger-recovery-directory-create-cleanup-quit-preserves-fault ()
+  "Directory cleanup quit cannot mask the post-create proof failure."
+  (epi-test-with-temporary-root (root)
+    (let* ((target (expand-file-name "created" root))
+           (device (plist-get (epi-ledger--stat-local-directory root) :device))
+           (real-delete (symbol-function 'delete-directory))
+           cleanup-attempted condition)
+      (unwind-protect
+          (cl-letf
+              (((symbol-function
+                 'epi-ledger--recovery-require-bound-directory-raw)
+                (lambda (&rest _arguments)
+                  (signal 'epi-test-wave3-directory-postproof-fault nil)))
+               ((symbol-function 'delete-directory)
+                (lambda (path &optional recursive trash)
+                  (if (equal path target)
+                      (progn
+                        (setq cleanup-attempted t)
+                        (signal 'quit nil))
+                    (funcall real-delete path recursive trash)))))
+            (setq condition
+                  (epi-test-wave3-entry--capture-any-condition
+                   (lambda ()
+                     (epi-ledger--recovery-create-private-directory
+                      target device)))))
+        (when (file-directory-p target)
+          (funcall real-delete target nil)))
+      (should cleanup-attempted)
+      (should
+       (equal '(epi-test-wave3-directory-postproof-fault) condition)))))
+
+(ert-deftest epi-ledger-recovery-transaction-entry-enumeration-is-bounded ()
+  "Transaction proof asks the filesystem for no more than two names."
+  (let (observed)
+    (cl-letf (((symbol-function 'directory-files)
+               (lambda (path &optional full match nosort count)
+                 (setq observed (list path full match nosort count))
+                 '("manifest.jcs" "stray"))))
+      (should
+       (equal '("manifest.jcs" "stray")
+              (epi-ledger--recovery-raw-directory-entry-names "/bound"))))
+    (should (equal "/bound" (nth 0 observed)))
+    (should-not (nth 1 observed))
+    (should
+     (equal directory-files-no-dot-files-regexp (nth 2 observed)))
+    (should (eq t (nth 3 observed)))
+    (should (= 2 (nth 4 observed)))))
+
+(ert-deftest epi-ledger-recovery-barrier-throw-cannot-bypass-final-closure ()
+  "Final closure overrides a throw when unlock corrupts durable evidence."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (foreign (string-as-unibyte "foreign manifest"))
+           (real-unlock epi-ledger--unlock-function)
+           condition)
+      (let ((epi-ledger--recovery-phase-barrier-function
+             (lambda (_phase) (throw 'epi-wave3-escape 'escaped)))
+            (epi-ledger--unlock-function
+             (lambda (lock)
+               (funcall real-unlock lock)
+               (epi-ledger--write-bytes manifest foreign 'replace t))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (catch 'epi-wave3-escape
+                   (epi-ledger--recovery-prepare-manifest preflight))))))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-manifest-invalid
+           (epi-test-wave3-entry--condition-code condition)))
+      (should
+       (equal foreign (epi-test-ledger-io--literal-file-bytes manifest))))))
+
+(ert-deftest epi-ledger-recovery-unlock-throw-cannot-bypass-final-closure ()
+  "Final closure runs even when the unlock callback throws."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (foreign (string-as-unibyte "unlock foreign manifest"))
+           (real-unlock epi-ledger--unlock-function)
+           condition)
+      (let ((epi-ledger--unlock-function
+             (lambda (lock)
+               (funcall real-unlock lock)
+               (epi-ledger--write-bytes manifest foreign 'replace t)
+               (throw 'epi-wave3-unlock-escape 'escaped))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (catch 'epi-wave3-unlock-escape
+                   (epi-ledger--recovery-prepare-manifest preflight))))))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-manifest-invalid
+           (epi-test-wave3-entry--condition-code condition)))
+      (should
+       (equal foreign (epi-test-ledger-io--literal-file-bytes manifest))))))
+
+(ert-deftest epi-ledger-recovery-forged-acquire-return-cleans-received-lock ()
+  "The receiver proof, not a wrapper's returned value, owns acquisition."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (lock-path (epi-ledger--lock-path source))
+           (redirect (expand-file-name "redirect.epi-lock" root))
+           (real-acquire (symbol-function 'epi-ledger--acquire-lock))
+           received condition)
+      (cl-letf
+          (((symbol-function 'epi-ledger--acquire-lock)
+            (lambda (&rest arguments)
+              (setq received (apply real-acquire arguments))
+              (let ((forged (epi-ledger--recovery-copy-lock received)))
+                (setf (epi-ledger--lock-lock-file forged) redirect)
+                forged))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should (epi-ledger--lock-p received))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'lock-token-changed
+           (epi-test-wave3-entry--condition-code condition)))
+      (should-not (file-exists-p lock-path))
+      (should-not (file-exists-p redirect)))))
+
+(ert-deftest epi-ledger-recovery-prepared-does-not-retain-inspection-callback ()
+  "Prepared authority owns no graph returned by the injectable scanner."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (real-inspect (symbol-function 'epi-ledger--inspect-path))
+           retained prepared mutated)
+      (cl-letf (((symbol-function 'epi-ledger--inspect-path)
+                 (lambda (&rest arguments)
+                   (setq retained (apply real-inspect arguments))
+                   retained)))
+        (let ((epi-ledger--recovery-phase-barrier-function
+               (lambda (_phase)
+                 (let ((bytes
+                        (epi-ledger--inspection-raw-fragment-bytes retained)))
+                   (aset bytes 0 (logxor #xff (aref bytes 0)))
+                   (setq mutated t)))))
+          (setq prepared
+                (epi-ledger--recovery-prepare-manifest preflight))))
+      (should mutated)
+      (should (epi-ledger--recovery-prepared-p prepared))
+      (let ((closed
+             (epi-ledger--recovery-prepared-raw-preflight prepared)))
+        (should-not
+         (epi-ledger--recovery-preflight-raw-inspection closed))
+        (should-not (eq retained closed))))))
+
+(ert-deftest epi-ledger-recovery-default-unlock-preserves-foreign-lock ()
+  "Forged injectable stat/read seams cannot delete a replacement lock."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (lock-path (epi-ledger--lock-path source))
+           (replacement (string-as-unibyte "foreign lock replacement"))
+           (real-stat epi-ledger--stat-function)
+           (real-read epi-ledger--read-function)
+           old-identity old-bytes replaced condition)
+      (let ((epi-ledger--stat-function real-stat)
+            (epi-ledger--read-function real-read)
+            (epi-ledger--recovery-phase-barrier-function
+             (lambda (_phase)
+               (setq old-identity (funcall real-stat lock-path)
+                     old-bytes
+                     (funcall real-read
+                              lock-path 0 (plist-get old-identity :size)))
+               (delete-file lock-path)
+               (epi-ledger--write-bytes
+                lock-path replacement 'exclusive-create t)
+               (setq replaced t
+                     epi-ledger--stat-function
+                     (lambda (path)
+                       (if (equal path lock-path)
+                           old-identity
+                         (funcall real-stat path)))
+                     epi-ledger--read-function
+                     (lambda (path begin end)
+                       (if (equal path lock-path)
+                           (substring old-bytes begin end)
+                         (funcall real-read path begin end)))))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should replaced)
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'lock-token-changed
+           (epi-test-wave3-entry--condition-code condition)))
+      (should
+       (equal replacement
+              (epi-test-ledger-io--literal-file-bytes lock-path))))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-replaced-source-object-tree ()
+  "Locked preparation cannot adopt a byte-identical replacement tree."
+  (epi-test-with-temporary-root (root)
+    (let* ((case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list "historical-object")))
+           (source (file-truename (plist-get case :source)))
+           (source-objects (concat source ".objects"))
+           (displaced (concat source-objects ".displaced"))
+           (preflight
+            (epi-ledger--recovery-preflight
+             (plist-get case :inspection) (plist-get case :plan)
+             epi-test-ledger-io--wave3-recovery-id))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (frozen
+            (epi-ledger--recovery-preflight-raw-source-objects-identity
+             preflight))
+           (real-inspect (symbol-function 'epi-ledger--inspect-path))
+           replacement swapped phases condition)
+      (cl-letf
+          (((symbol-function 'epi-ledger--inspect-path)
+            (lambda (&rest arguments)
+              (unless swapped
+                (rename-file source-objects displaced nil)
+                (copy-directory displaced source-objects t t t)
+                (setq replacement
+                      (epi-ledger--stat-local-directory source-objects)
+                      swapped t))
+              (apply real-inspect arguments))))
+        (let ((epi-ledger--recovery-phase-barrier-function
+               (lambda (phase) (push phase phases))))
+          (setq condition
+                (epi-test-wave3-entry--capture-any-condition
+                 (lambda ()
+                   (epi-ledger--recovery-prepare-manifest preflight))))))
+      (should swapped)
+      (should replacement)
+      (should-not
+       (epi-ledger--recovery-same-directory-object-p
+        source-objects frozen replacement))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-path-conflict
+           (epi-test-wave3-entry--condition-code condition)))
+      (should-not phases)
+      (should-not (file-exists-p manifest))
+      (should-not (file-exists-p (epi-ledger--lock-path source))))))
+
+(ert-deftest epi-ledger-recovery-prepare-verifies-reachable-bytes-once ()
+  "Locked preparation reads and hashes each reachable object exactly once."
+  (epi-test-with-temporary-root (root)
+    (let* ((payload
+            (string-as-unibyte
+             (make-string (+ epi-ledger-work-byte-limit 4096) ?x)))
+           (case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list payload)))
+           (object-path (cdar (plist-get case :objects)))
+           (preflight
+            (epi-ledger--recovery-preflight
+             (plist-get case :inspection) (plist-get case :plan)
+             epi-test-ledger-io--wave3-recovery-id))
+           (real-read (symbol-function 'epi-ledger--read-bytes))
+           (real-hash (symbol-function 'epi-ledger--hash))
+           (read-bytes 0)
+           (hash-count 0)
+           (yield-count 0)
+           prepared)
+      (cl-letf
+          (((symbol-function 'epi-ledger--read-bytes)
+            (lambda (path begin end)
+              (let ((bytes (funcall real-read path begin end)))
+                (when (equal path object-path)
+                  (setq read-bytes (+ read-bytes (length bytes))))
+                bytes)))
+           ((symbol-function 'epi-ledger--hash)
+            (lambda (bytes field)
+              (when (and (eq field 'object-content)
+                         (= (length bytes) (length payload)))
+                (setq hash-count (1+ hash-count)))
+              (funcall real-hash bytes field))))
+        (let ((epi--yield-function
+               (lambda () (setq yield-count (1+ yield-count)))))
+          (setq prepared
+                (epi-ledger--recovery-prepare-manifest preflight))))
+      (should (epi-ledger--recovery-prepared-p prepared))
+      (should (= (length payload) read-bytes))
+      (should (= 1 hash-count))
+      (should (> yield-count 0)))))
+
+(ert-deftest epi-ledger-recovery-atomic-object-limit-is-fixed ()
+  "Atomic authority has a fixed v1 cap independent of slice tuning."
+  (let ((limit epi-ledger--recovery-atomic-object-limit)
+        condition exact one-over)
+    (should (= limit
+               (epi-ledger--recovery-require-atomic-object-count limit)))
+    (setq condition
+          (epi-test-wave3-entry--capture-any-condition
+           (lambda ()
+             (epi-ledger--recovery-require-atomic-object-count
+              (1+ limit)))))
+    (should (eq 'epi-limit-exceeded (car condition)))
+    (should
+     (eq 'recovery-atomic-object-limit
+         (epi-test-wave3-entry--condition-code condition)))
+    (cl-labels
+        ((reference
+          (index)
+          `(("hash" . ,(format "%064x" index))
+            ("size" . 1)
+            ("media_type" . "application/octet-stream")
+            ("role" . "recovery-fragment"))))
+      (setq exact
+            (vconcat
+             (mapcar #'reference (number-sequence 0 (1- limit))))
+            one-over
+            (vconcat
+             (mapcar #'reference (number-sequence 0 limit)))))
+    (should (= limit
+               (length
+                (epi-ledger--recovery-manifest-reachable exact))))
+    (setq condition
+          (epi-test-wave3-entry--capture-any-condition
+           (lambda ()
+             (epi-ledger--recovery-manifest-reachable one-over))))
+    (should (eq 'epi-limit-exceeded (car condition)))
+    (should
+     (eq 'recovery-atomic-object-limit
+         (epi-test-wave3-entry--condition-code condition))))
+  (epi-test-with-temporary-root (root)
+    (let* ((case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list "object-a" "object-b")))
+           preflight)
+      (let ((epi-ledger-work-record-limit 1))
+        (setq preflight
+              (epi-ledger--recovery-preflight
+               (plist-get case :inspection) (plist-get case :plan)
+               epi-test-ledger-io--wave3-recovery-id)))
+      (should
+       (= 2
+          (length
+           (epi-ledger--recovery-preflight-raw-reachable-objects
+            preflight)))))))
+
+(ert-deftest epi-ledger-recovery-one-over-manifest-is-invalid ()
+  "A persisted one-over object set is malformed, not a new limit request."
+  (epi-test-with-temporary-root (root)
+    (let* ((case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list "historical-object")))
+           (preflight
+            (epi-ledger--recovery-preflight
+             (plist-get case :inspection) (plist-get case :plan)
+             epi-test-ledger-io--wave3-recovery-id))
+           (manifest
+            (epi-ledger--copy-tree-and-strings
+             (epi-ledger--recovery-preflight-raw-manifest-object preflight)))
+           (limit epi-ledger--recovery-atomic-object-limit)
+           (reachable
+            (vconcat
+             (mapcar
+              (lambda (index)
+                `(("hash" . ,(format "%064x" index))
+                  ("size" . 1)
+                  ("media_type" . "application/octet-stream")
+                  ("role" . "recovery-fragment")))
+              (number-sequence 0 limit))))
+           condition)
+      (setcdr (assoc "reachable_objects" manifest) reachable)
+      (setq condition
+            (epi-test-wave3-entry--capture-any-condition
+             (lambda ()
+               (epi-ledger--recovery-manifest-encode manifest))))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-manifest-invalid
+           (epi-test-wave3-entry--condition-code condition))))))
+
+(ert-deftest epi-ledger-recovery-mode-races-have-stable-conflicts ()
+  "A vanished mode observation never leaks a primitive type error."
+  (epi-test-with-temporary-root (root)
+    (let* ((path (expand-file-name "manifest.jcs" root))
+           (bytes (string-as-unibyte "manifest"))
+           raw-mode dynamic-readback raw-readback)
+      (epi-ledger--write-bytes path bytes 'exclusive-create t)
+      (cl-letf (((symbol-function 'file-modes)
+                 (lambda (&rest _arguments) nil)))
+        (setq raw-mode
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda () (epi-ledger--recovery-raw-mode path)))
+              dynamic-readback
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-readback-manifest path bytes)))
+              raw-readback
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-readback-manifest-raw path bytes)))))
+      (should (eq 'epi-ledger-conflict (car raw-mode)))
+      (should
+       (eq 'quarantine-device-unknown
+           (epi-test-wave3-entry--condition-code raw-mode)))
+      (dolist (condition (list dynamic-readback raw-readback))
+        (should (eq 'epi-ledger-conflict (car condition)))
+        (should
+         (eq 'recovery-manifest-invalid
+             (epi-test-wave3-entry--condition-code condition)))))))
+
+(ert-deftest epi-ledger-recovery-parent-return-quit-cleans-received-directories ()
+  "A parent-helper return quit cannot orphan its received directories."
+  (epi-test-with-temporary-root (root)
+    (let* ((quarantine
+            (expand-file-name "nested/a/quarantine" root))
+           (created-top (expand-file-name "nested" root))
+           (preflight
+            (epi-test-ledger-io--wave3-preflight root nil quarantine))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (real-prepare
+            (symbol-function
+             'epi-ledger--recovery-prepare-private-directories))
+           condition)
+      (cl-letf
+          (((symbol-function
+             'epi-ledger--recovery-prepare-private-directories)
+            (lambda (&rest arguments)
+              (prog1 (apply real-prepare arguments)
+                (signal 'quit nil)))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should (equal '(quit) condition))
+      (should-not (file-exists-p created-top))
+      (should-not (file-exists-p (epi-ledger--lock-path source))))))
+
+(ert-deftest epi-ledger-recovery-parent-receiver-rejects-foreign-receipt ()
+  "A forged parent receipt cannot authorize deletion of an unrelated name."
+  (epi-test-with-temporary-root (root)
+    (let* ((unrelated (expand-file-name "unrelated-owned" root))
+           (_created (make-directory unrelated))
+           (_mode (set-file-modes unrelated #o700))
+           (preflight (epi-test-ledger-io--wave3-preflight root))
+           (real-prepare
+            (symbol-function
+             'epi-ledger--recovery-prepare-private-directories))
+           condition)
+      (cl-letf
+          (((symbol-function
+             'epi-ledger--recovery-prepare-private-directories)
+            (lambda (&rest arguments)
+              (prog1 (apply real-prepare arguments)
+                (funcall
+                 epi-ledger--recovery-directory-receipt-receiver
+                 unrelated
+                 (epi-ledger--recovery-raw-directory-stat unrelated))
+                (signal 'quit nil)))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-path-conflict
+           (epi-test-wave3-entry--condition-code condition)))
+      (should (file-directory-p unrelated)))))
+
+(ert-deftest epi-ledger-recovery-transaction-return-quit-cleans-received-directory ()
+  "A transaction-helper return quit cannot orphan its received directory."
+  (epi-test-with-temporary-root (root)
+    (let* ((preflight (epi-test-ledger-io--wave3-preflight root))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (transaction
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))
+           (real-create
+            (symbol-function 'epi-ledger--recovery-create-private-directory))
+           condition)
+      (cl-letf
+          (((symbol-function 'epi-ledger--recovery-create-private-directory)
+            (lambda (path device)
+              (if (equal path transaction)
+                  (prog1 (funcall real-create path device)
+                    (signal 'quit nil))
+                (funcall real-create path device)))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should (equal '(quit) condition))
+      (should-not (file-exists-p transaction))
+      (should-not (file-exists-p (epi-ledger--lock-path source))))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-rewritten-reachable-object ()
+  "A callback cannot rewrite reachable bytes in place and retain authority."
+  (epi-test-with-temporary-root (root)
+    (let* ((payload (string-as-unibyte "historical-object"))
+           (case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list payload)))
+           (object-path (cdar (plist-get case :objects)))
+           (preflight
+            (epi-ledger--recovery-preflight
+             (plist-get case :inspection) (plist-get case :plan)
+             epi-test-ledger-io--wave3-recovery-id))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           rewritten condition)
+      (let ((epi-ledger--recovery-phase-barrier-function
+             (lambda (_phase)
+               (epi-ledger--write-bytes object-path payload 'replace t)
+               (set-file-times object-path (time-add (current-time) 10))
+               (setq rewritten t))))
+        (setq condition
+              (epi-test-wave3-entry--capture-any-condition
+               (lambda ()
+                 (epi-ledger--recovery-prepare-manifest preflight)))))
+      (should rewritten)
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-preflight-changed
+           (epi-test-wave3-entry--condition-code condition)))
+      (should (file-regular-p manifest)))))
+
+(ert-deftest epi-ledger-recovery-prepare-rejects-replaced-reachable-object ()
+  "Per-object authority rejects a same-byte new inode independently."
+  (epi-test-with-temporary-root (root)
+    (let* ((payload (string-as-unibyte "historical-object"))
+           (case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list payload)))
+           (source (file-truename (plist-get case :source)))
+           (source-objects (concat source ".objects"))
+           (object-path (cdar (plist-get case :objects)))
+           (displaced (concat object-path ".displaced"))
+           (preflight
+            (epi-ledger--recovery-preflight
+             (plist-get case :inspection) (plist-get case :plan)
+             epi-test-ledger-io--wave3-recovery-id))
+           (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+           (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+           (frozen-directory
+            (epi-ledger--recovery-preflight-raw-source-objects-identity
+             preflight))
+           (frozen-object
+            (aref
+             (epi-ledger--recovery-preflight-raw-reachable-object-identities
+              preflight)
+             0))
+           (real-directory-stat
+            (symbol-function 'epi-ledger--recovery-raw-directory-stat))
+           replacement condition)
+      (cl-letf
+          (((symbol-function 'epi-ledger--recovery-raw-directory-stat)
+            (lambda (path)
+              (if (equal path source-objects)
+                  (epi-ledger--copy-tree-and-strings frozen-directory)
+                (funcall real-directory-stat path)))))
+        (let ((epi-ledger--recovery-phase-barrier-function
+               (lambda (_phase)
+                 (rename-file object-path displaced nil)
+                 (epi-ledger--write-bytes
+                  object-path payload 'exclusive-create t)
+                 (setq replacement
+                       (epi-ledger--raw-object-name-state object-path)))))
+          (setq condition
+                (epi-test-wave3-entry--capture-any-condition
+                 (lambda ()
+                   (epi-ledger--recovery-prepare-manifest preflight))))))
+      (should replacement)
+      (should-not (epi-ledger--same-file-object-p frozen-object replacement))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-preflight-changed
+           (epi-test-wave3-entry--condition-code condition)))
+      (should (file-regular-p manifest)))))
+
+(ert-deftest epi-ledger-recovery-close-rejects-malformed-object-identity ()
+  "Closed preflight authority contains only canonical file identities."
+  (epi-test-with-temporary-root (root)
+    (let* ((case
+            (epi-test-ledger-io--wave3-extra-historical-case
+             root (list "historical-object")))
+           (preflight
+            (epi-ledger--recovery-preflight
+             (plist-get case :inspection) (plist-get case :plan)
+             epi-test-ledger-io--wave3-recovery-id))
+           (identities
+            (epi-ledger--recovery-preflight-raw-reachable-object-identities
+             preflight))
+           condition)
+      (setf (plist-get (aref identities 0) :modified) "not-a-time")
+      (setq condition
+            (epi-test-wave3-entry--capture-any-condition
+             (lambda ()
+               (epi-ledger--recovery-close-preflight preflight))))
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'recovery-manifest-invalid
+           (epi-test-wave3-entry--condition-code condition))))))
+
 (provide 'epi-ledger-io-test)
 
 ;;; epi-ledger-io-test.el ends here
