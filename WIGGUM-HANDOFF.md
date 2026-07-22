@@ -1,6 +1,6 @@
 # Epi Implementation Wiggum Handoff
 
-Status: Task 1 complete; Tasks 2 and 3 ready to start in parallel
+Status: Tasks 1 and 2 complete; Task 3 review hardening in progress
 
 Last updated: 2026-07-21
 
@@ -46,7 +46,17 @@ Completed in this run:
 - Committed Task 1 as `89a3437` (`build: establish the Epi package test
   foundation`). The branch was clean immediately after the commit.
 
-Tasks 2 and 3 are now the parallel frontier. All implementation changes belong
+Task 2 is committed as `a5b6924` (`test: prove the pinned GPTel adapter
+contract`). Its 79 offline contract tests prove the exact pinned GPTel
+delegation seam, including sequential multi-leg tools, raw attestation,
+fail-stop behavior, private request ownership, exact outer-envelope
+consumption, and continuation-exception terminality. An independent final
+semantic review reran the complete suite and isolated adversarial probes and
+reported no remaining blocker.
+
+Task 3 remains the active frontier. Its codec implementation is undergoing
+regression-first hardening against independent framing, canonicalization,
+resource, ownership, and provenance review. All implementation changes belong
 in the isolated feature worktree; `main` remains outside the implementation
 path.
 
@@ -152,6 +162,21 @@ file remains under `doc/observations/`.
 
 ## Verification evidence
 
+The Task 2 implementation gate requires and has passed:
+
+- The complete offline adapter contract passes 79/79 tests against the pinned
+  source-only GPTel checkout.
+- Exact-EOF, exact choice-index, deep snapshot/dry-run ownership, two-leg
+  mutation isolation, and throwing-continuation regressions pass both together
+  and as five isolated adversarial tests.
+- Direct probes observed zero stock parser or TOOL calls for rejected outer
+  envelopes, unchanged `Hello` prompts in both transport legs after caller
+  mutation, and exactly one redacted abort after a continuation exception.
+- Warning-as-error compilation, Checkdoc over all three production files, and
+  the 26/26 frozen-root preflight passed before final review.
+- The final independent semantic reviewer reported clean at source SHA-256
+  `987a69e8ddab5e9ecc871e929c498641048ab0edb39b64d406f484b928183f90`.
+
 The Task 1 implementation gate requires and has passed:
 
 - `make test`: 30/30 package tests and 26/26 preflight tests, each test file in
@@ -177,10 +202,10 @@ The earlier documentation gate also passed:
   repository before the final edit/commit checkpoints. This does not certify
   a separate interactive Emacs process.
 
-The pinned GPTel semantic adapter contract is not yet implemented; Task 2 is
-the fail-closed seam proof. Read-only reconnaissance has already recorded the
-exact pinned FSM, WAIT/TOOL/post, Curl filter/parser, abort, dry-run, typed
-history, and form-hash boundaries needed to begin it.
+The pinned GPTel semantic adapter contract is implemented and committed. Its
+source/runtime identity checks, WAIT/TOOL/post delegation, guarded Curl filter
+and parser, abort/watchdog behavior, dry-run ownership, typed history, and
+form-hash boundaries all pass the frozen offline contract.
 
 ## Repository boundary
 
@@ -198,9 +223,8 @@ silently downgraded to a local integration boundary.
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
    install a dependency, enter `nix develop`, or substitute installed Pi.
-4. Start Tasks 2 and 3 in parallel from `89a3437`. Keep their file ownership
-   disjoint except for Task 3's explicit Makefile additions; preserve Task 2's
-   fail-closed GPTel seam gate.
+4. Finish Task 3's independent review, full gates, reproducible goldens, and
+   atomic codec commit without modifying the committed Task 2 seam.
 5. Continue dependency-ready tasks numerically, one TDD/review/commit unit at
    a time, with architecture checkpoints after Tasks 2, 6, 12, and 15.
 6. Do not implement a later-slice roadmap capability without its own reviewed
@@ -211,7 +235,7 @@ silently downgraded to a local integration boundary.
 - Repeated failing gate signature: 0/3.
 - Unusable output from any one reviewer: 0/2.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: none. Task 1 is committed and the Tasks 2/3 frontier is
-  active; all exact preflight source inputs remain present and validated.
+- Current stop reason: none. Tasks 1 and 2 are committed and Task 3 is active;
+  all exact preflight source inputs remain present and validated.
 - Terminal integration issue: no remote/upstream for the inherited push rule;
-  this does not block local Task 1 work.
+  this does not block local implementation work.
