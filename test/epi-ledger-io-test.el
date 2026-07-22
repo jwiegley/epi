@@ -9560,6 +9560,560 @@ INODE defaults to 606."
                       destination))))))
 
 
+;;;; Task 6 Wave 0: one authoritative torn-tail inspection path
+
+(defconst epi-test-ledger-io--recovery-tail-classifier-cases
+  '(("torn-final-headline.org"
+     :source-file-size 3224
+     :fragment-size 7
+     :fragment-sha256
+     "2552cbc9d9c6ed8d5f7ee3ced75f4f8b16ab9ae510275c8a18d084ffcb250e48")
+    ("torn-final-drawer.org"
+     :source-file-size 3283
+     :fragment-size 66
+     :fragment-sha256
+     "16fe51b17132860f919e24b1acfee70afb22605d60986705bbecc8cd4ab6cb2e")
+    ("torn-final-begin-block.org"
+     :source-file-size 3623
+     :fragment-size 406
+     :fragment-sha256
+     "593bf468d0dc738d5d637b2de9e6048ee2184a3853fe9f313fc6fc2217a4b91e")
+    ("torn-final-json.org"
+     :source-file-size 3783
+     :fragment-size 566
+     :fragment-sha256
+     "bfb64d7875aba41281e2822ad18629dc633a6694f22ffd4c87aefc1db3e47b8d")
+    ("torn-final-end-block.org"
+     :source-file-size 3945
+     :fragment-size 728
+     :fragment-sha256
+     "86606829c9b143d9d7979a326d53e823a12ad52ac10a084bfda5ed9708e98b21"))
+  "Exact evidence expected from each checked-in torn-tail fixture.")
+
+(defconst epi-test-ledger-io--recovery-source-session-id
+  "11111111-1111-4111-8111-111111111111")
+
+(defconst epi-test-ledger-io--recovery-source-header-sha256
+  "42a532655547cb5af87ee33d3df6fd60944b3d5f44411063d73f4ade5dc661b1")
+
+(defconst epi-test-ledger-io--recovery-valid-prefix-head-sha256
+  "439935d3d41f7c495e5cef651b2d29b63569ee3d4fae8d115519c8f72944ef61")
+
+(defconst epi-test-ledger-io--recovery-valid-prefix-end-offset 3217)
+
+(defun epi-test-ledger-io--recovery-fixture-bytes (name)
+  "Return an exact fresh unibyte copy of torn-tail fixture NAME."
+  (epi-test-ledger-io--literal-file-bytes
+   (expand-file-name (concat "test/fixtures/ledger/" name)
+                     epi-test-repository-root)))
+
+(defun epi-test-ledger-io--recovery-write-source (root bytes)
+  "Write exact BYTES to ROOT/session.org and return its absolute path."
+  (let ((path (expand-file-name "session.org" root)))
+    (epi-ledger--write-bytes path bytes 'exclusive-create t)
+    path))
+
+(defun epi-test-ledger-io--recovery-snapshot-entry (root path)
+  "Return byte, mode, identity, and stable-time state for PATH below ROOT."
+  (let* ((attributes (file-attributes path 'integer))
+         (relative
+          (if (equal (file-name-as-directory path)
+                     (file-name-as-directory root))
+              "."
+            (file-relative-name path root)))
+         (link (file-symlink-p path))
+         (kind
+          (cond (link 'symlink)
+                ((file-directory-p path) 'directory)
+                ((file-regular-p path) 'file)
+                (t 'other))))
+    (list relative kind
+          :link-target link
+          :modes (file-modes path)
+          :identity
+          (cons (file-attribute-device-number attributes)
+                (file-attribute-inode-number attributes))
+          :links (file-attribute-link-number attributes)
+          :size (file-attribute-size attributes)
+          :modified (file-attribute-modification-time attributes)
+          :changed (file-attribute-status-change-time attributes)
+          :bytes
+          (and (eq kind 'file)
+               (epi-test-ledger-io--literal-file-bytes path)))))
+
+(defun epi-test-ledger-io--recovery-tree-snapshot (root)
+  "Return a byte-, mode-, and identity-exact recursive snapshot of ROOT."
+  (let ((pending (list (file-name-as-directory root)))
+        (entries
+         (list
+          (epi-test-ledger-io--recovery-snapshot-entry
+           root (file-name-as-directory root)))))
+    (while pending
+      (let ((directory (pop pending)))
+        (dolist (path
+                 (directory-files
+                  directory t directory-files-no-dot-files-regexp t))
+          (push (epi-test-ledger-io--recovery-snapshot-entry root path)
+                entries)
+          (when (and (not (file-symlink-p path))
+                     (file-directory-p path))
+            (push (file-name-as-directory path) pending)))))
+    (sort entries (lambda (left right) (string< (car left) (car right))))))
+
+(defun epi-test-ledger-io--recovery-call-inertly (root function)
+  "Call FUNCTION and prove the exact durable ROOT tree remains unchanged."
+  (let ((tree-before (epi-test-ledger-io--recovery-tree-snapshot root))
+        value)
+    (setq value (funcall function))
+    (should (equal tree-before
+                   (epi-test-ledger-io--recovery-tree-snapshot root)))
+    value))
+
+(defun epi-test-ledger-io--recovery-capture-condition (function)
+  "Call FUNCTION and return its structured ledger error, or nil."
+  (condition-case condition
+      (progn (funcall function) nil)
+    ((epi-ledger-error epi-limit-exceeded) condition)))
+
+(ert-deftest epi-ledger-recovery-open-is-a-thin-complete-inspection ()
+  (let ((inspection (list 'opaque-inspection))
+        calls)
+    (cl-letf (((symbol-function 'epi-ledger--inspect-path)
+               (lambda (path policy)
+                 (push (list 'inspect path policy) calls)
+                 inspection))
+              ((symbol-function 'epi-ledger--ledger-from-inspection)
+               (lambda (value)
+                 (push (list 'construct value) calls)
+                 'opaque-ledger)))
+      (should (eq 'opaque-ledger (epi-ledger-open "relative-session.org"))))
+    (should
+     (equal `((inspect "relative-session.org" complete)
+              (construct ,inspection))
+            (nreverse calls)))))
+
+(ert-deftest epi-ledger-recovery-tail-inspection-freezes-five-fixtures ()
+  (dolist (case epi-test-ledger-io--recovery-tail-classifier-cases)
+    (epi-test-with-temporary-root (root)
+      (let* ((name (car case))
+             (expected (cdr case))
+             (fixture (epi-test-ledger-io--recovery-fixture-bytes name))
+             (expected-fragment
+              (substring fixture
+                         epi-test-ledger-io--recovery-valid-prefix-end-offset))
+             (source
+              (epi-test-ledger-io--recovery-write-source root fixture))
+             (expected-identity
+              (epi-ledger--file-identity (file-truename source)))
+             (inspection
+              (epi-test-ledger-io--recovery-call-inertly
+               root
+               (lambda ()
+                 (epi-ledger--inspect-path
+                  source 'allow-one-incomplete-final-frame))))
+             (header (epi-ledger--inspection-raw-header inspection))
+             (record-index
+              (epi-ledger--inspection-raw-record-index inspection))
+             (last-record
+              (epi-ledger--inspection-raw-last-record inspection)))
+        (should (epi-ledger--inspection-p inspection))
+        (should
+         (eq 'truncated-tail
+             (epi-ledger--inspection-raw-state inspection)))
+        (should (equal (file-truename source)
+                       (epi-ledger--inspection-raw-canonical-path
+                        inspection)))
+        (should
+         (equal expected-identity
+                (epi-ledger--inspection-raw-file-identity inspection)))
+        (should
+         (equal epi-test-ledger-io--recovery-source-session-id
+                (epi-header-session-id header)))
+        (should
+         (equal epi-test-ledger-io--recovery-source-header-sha256
+                (epi-header-hash header)))
+        (should
+         (= (plist-get expected :source-file-size)
+            (epi-ledger--inspection-raw-source-size inspection)))
+        (should
+         (= epi-test-ledger-io--recovery-valid-prefix-end-offset
+            (epi-ledger--inspection-raw-validated-end inspection)))
+        (should (= 3 (epi-ledger--record-index-raw-count record-index)))
+        (should (epi-ledger--semantic-capsule-p
+                 (epi-ledger--inspection-raw-semantic-capsule inspection)))
+        (should (= 4 (epi-ledger--inspection-raw-next-sequence inspection)))
+        (should
+         (equal epi-test-ledger-io--recovery-valid-prefix-head-sha256
+                (epi-record-hash last-record)))
+        (should
+         (equal epi-test-ledger-io--recovery-valid-prefix-head-sha256
+                (epi-ledger--inspection-raw-valid-prefix-head inspection)))
+        (should
+         (= epi-test-ledger-io--recovery-valid-prefix-end-offset
+            (epi-ledger--inspection-raw-fragment-offset inspection)))
+        (should
+         (= (plist-get expected :fragment-size)
+            (epi-ledger--inspection-raw-fragment-size inspection)))
+        (should
+         (= (epi-ledger--inspection-raw-source-size inspection)
+            (+ (epi-ledger--inspection-raw-fragment-offset inspection)
+               (epi-ledger--inspection-raw-fragment-size inspection))))
+        (should
+         (equal expected-fragment
+                (epi-ledger--inspection-raw-fragment-bytes inspection)))
+        (should-not
+         (multibyte-string-p
+          (epi-ledger--inspection-raw-fragment-bytes inspection)))
+        (should
+         (equal (plist-get expected :fragment-sha256)
+                (epi-ledger--inspection-raw-fragment-hash inspection)))
+        (should
+         (equal (secure-hash 'sha256 expected-fragment)
+                (epi-ledger--inspection-raw-fragment-hash inspection)))))))
+
+(ert-deftest epi-ledger-recovery-tail-inspection-leaves-clean-eof-ineligible ()
+  (epi-test-with-temporary-root (root)
+    (let* ((fixture
+            (epi-test-ledger-io--recovery-fixture-bytes
+             "torn-final-headline.org"))
+           (clean-prefix
+            (substring fixture 0
+                       epi-test-ledger-io--recovery-valid-prefix-end-offset))
+           (source
+            (epi-test-ledger-io--recovery-write-source root clean-prefix))
+           (inspection
+            (epi-test-ledger-io--recovery-call-inertly
+             root
+             (lambda ()
+               (epi-ledger--inspect-path
+                source 'allow-one-incomplete-final-frame)))))
+      (should (epi-ledger--inspection-p inspection))
+      (should
+       (eq 'complete (epi-ledger--inspection-raw-state inspection)))
+      (should (= (length clean-prefix)
+                 (epi-ledger--inspection-raw-validated-end inspection)))
+      (should-not (epi-ledger--inspection-raw-fragment-offset inspection))
+      (should-not (epi-ledger--inspection-raw-fragment-size inspection))
+      (should-not (epi-ledger--inspection-raw-fragment-hash inspection))
+      (should-not (epi-ledger--inspection-raw-fragment-bytes inspection))
+      (should
+       (epi-ledger-p
+        (epi-ledger--ledger-from-inspection inspection))))))
+
+(ert-deftest epi-ledger-recovery-tail-inspection-preserves-corrupt-errors ()
+  (let* ((directory
+          (expand-file-name "test/fixtures/ledger/"
+                            epi-test-repository-root))
+         (names (directory-files directory nil "\\`corrupt-.*\\.org\\'")))
+    (should names)
+    (dolist (name names)
+      (epi-test-with-temporary-root (root)
+        (let* ((bytes
+                (epi-test-ledger-io--literal-file-bytes
+                 (expand-file-name name directory)))
+               (source
+                (epi-test-ledger-io--recovery-write-source root bytes))
+               (expected
+                (epi-test-ledger-io--recovery-capture-condition
+                 (lambda () (epi-ledger-open source))))
+               (actual
+                (epi-test-ledger-io--recovery-call-inertly
+                 root
+                 (lambda ()
+                   (epi-test-ledger-io--recovery-capture-condition
+                    (lambda ()
+                      (epi-ledger--inspect-path
+                       source 'allow-one-incomplete-final-frame)))))))
+          (should expected)
+          (should actual)
+          (should (eq (car expected) (car actual)))
+          (should (equal (cdr expected) (cdr actual))))))))
+
+(ert-deftest epi-ledger-recovery-tail-inspection-rejects-masked-interior-defect ()
+  (epi-test-with-temporary-root (root)
+    (let* ((bytes
+            (epi-test-ledger-io--recovery-fixture-bytes
+             "torn-final-json.org"))
+           (needle "working_directory")
+           (position (string-match-p needle bytes)))
+      (should position)
+      ;; Keep the interior frame syntactically complete while invalidating its
+      ;; authenticated JSON.  The later incomplete frame must not mask it.
+      (aset bytes position ?W)
+      (let* ((source (epi-test-ledger-io--recovery-write-source root bytes))
+             (condition
+              (epi-test-ledger-io--recovery-call-inertly
+               root
+               (lambda ()
+                 (epi-test-ledger-io--recovery-capture-condition
+                  (lambda ()
+                    (epi-ledger--inspect-path
+                     source 'allow-one-incomplete-final-frame)))))))
+        (should (eq 'epi-ledger-corrupt (car condition)))
+        (should
+         (eq 'record-hash-mismatch
+             (epi-test-ledger-io--condition-code condition)))))))
+
+;;;; Task 6 Wave 0 hardening: fragment authority and bounded work
+
+(ert-deftest epi-ledger-recovery-tail-inspection-rereads-fragment-from-file ()
+  (epi-test-with-temporary-root (root)
+    (let* ((source-bytes
+            (epi-test-ledger-io--recovery-fixture-bytes
+             "torn-final-json.org"))
+           (alternate-bytes (copy-sequence source-bytes))
+           (text-position
+            (string-match
+             "\"hello\"" alternate-bytes
+             epi-test-ledger-io--recovery-valid-prefix-end-offset))
+           (source
+            (epi-test-ledger-io--recovery-write-source root source-bytes))
+           (alternate (expand-file-name "alternate.org" root))
+           (original-inserter epi-ledger--open-source-inserter)
+           condition)
+      (should text-position)
+      ;; Preserve the exact byte length and incomplete-frame class while
+      ;; making only the injected carry disagree with the real file.
+      (aset alternate-bytes (1+ text-position) ?j)
+      (should (= (length source-bytes) (length alternate-bytes)))
+      (epi-ledger--write-bytes alternate alternate-bytes 'exclusive-create t)
+      (let ((epi-ledger--open-source-inserter
+             (lambda (_path &optional visit begin end replace)
+               (funcall original-inserter
+                        alternate visit begin end replace))))
+        (setq condition
+              (epi-test-ledger-io--recovery-call-inertly
+               root
+               (lambda ()
+                 (epi-test-ledger-io--recovery-capture-condition
+                  (lambda ()
+                    (epi-ledger--inspect-path
+                     source 'allow-one-incomplete-final-frame)))))))
+      (should condition)
+      (should (eq 'epi-ledger-conflict (car condition)))
+      (should
+       (eq 'file-fragment-changed
+           (epi-test-ledger-io--condition-code condition))))))
+
+(defconst epi-test-ledger-io--recovery-reread-record-id
+  "10000000-0000-4000-8000-000000000099")
+
+(defun epi-test-ledger-io--recovery-reread-fragment
+    (source fragment &optional inserter)
+  "Reread SOURCE's torn FRAGMENT through optional head INSERTER."
+  (let* ((path (file-truename source))
+         (begin epi-test-ledger-io--recovery-valid-prefix-end-offset)
+         (end (+ begin (length fragment)))
+         (identity (epi-ledger--file-identity path))
+         (epi-ledger--open-head-inserter
+          (or inserter epi-ledger--open-head-inserter)))
+    (epi-ledger--with-operation-work-state
+      (epi-ledger--open-reread-recovery-fragment
+       path begin end fragment identity (epi-ledger--make-work-state) 4
+       epi-test-ledger-io--recovery-reread-record-id))))
+
+(defun epi-test-ledger-io--recovery-fragment-change-condition (source)
+  "Return the exact fragment-change condition expected for SOURCE."
+  `(epi-ledger-conflict
+    (:code file-fragment-changed
+     :path ,(file-truename source)
+     :sequence 4
+     :record-id ,epi-test-ledger-io--recovery-reread-record-id
+     :offset ,epi-test-ledger-io--recovery-valid-prefix-end-offset
+     :cause (:code file-fragment-changed))))
+
+(ert-deftest epi-ledger-recovery-fragment-short-reread-is-a-conflict ()
+  (epi-test-with-temporary-root (root)
+    (let* ((bytes
+            (epi-test-ledger-io--recovery-fixture-bytes
+             "torn-final-headline.org"))
+           (fragment
+            (substring
+             bytes epi-test-ledger-io--recovery-valid-prefix-end-offset))
+           (source
+            (epi-test-ledger-io--recovery-write-source root bytes))
+           (real-inserter epi-ledger--open-head-inserter)
+           (condition
+            (epi-test-ledger-io--recovery-call-inertly
+             root
+             (lambda ()
+               (epi-test-ledger-io--recovery-capture-condition
+                (lambda ()
+                  (epi-test-ledger-io--recovery-reread-fragment
+                   source fragment
+                   (lambda (path &optional visit begin end replace)
+                     (funcall real-inserter
+                              path visit begin (1- end) replace)))))))))
+      (should
+       (equal (epi-test-ledger-io--recovery-fragment-change-condition source)
+              condition)))))
+
+(ert-deftest epi-ledger-recovery-fragment-file-error-is-a-conflict ()
+  (epi-test-with-temporary-root (root)
+    (let* ((bytes
+            (epi-test-ledger-io--recovery-fixture-bytes
+             "torn-final-headline.org"))
+           (fragment
+            (substring
+             bytes epi-test-ledger-io--recovery-valid-prefix-end-offset))
+           (source
+            (epi-test-ledger-io--recovery-write-source root bytes))
+           (condition
+            (epi-test-ledger-io--recovery-call-inertly
+             root
+             (lambda ()
+               (epi-test-ledger-io--recovery-capture-condition
+                (lambda ()
+                  (epi-test-ledger-io--recovery-reread-fragment
+                   source fragment
+                   (lambda (&rest _arguments)
+                     (signal 'file-error
+                             '("injected fragment reread failure"))))))))))
+      (should
+       (equal (epi-test-ledger-io--recovery-fragment-change-condition source)
+              condition)))))
+
+(ert-deftest epi-ledger-recovery-fragment-honors-hash-input-limit ()
+  (epi-test-with-temporary-root (root)
+    (let* ((bytes
+            (epi-test-ledger-io--recovery-fixture-bytes
+             "torn-final-headline.org"))
+           (fragment
+            (substring
+             bytes epi-test-ledger-io--recovery-valid-prefix-end-offset))
+           (source
+            (epi-test-ledger-io--recovery-write-source root bytes))
+           (limit (1- (length fragment)))
+           (epi-hash-input-byte-limit limit)
+           (condition
+            (epi-test-ledger-io--recovery-call-inertly
+             root
+             (lambda ()
+               (epi-test-ledger-io--recovery-capture-condition
+                (lambda ()
+                  (epi-test-ledger-io--recovery-reread-fragment
+                   source fragment)))))))
+      (should (> (length fragment) epi-hash-input-byte-limit))
+      (should
+       (equal
+        `(epi-limit-exceeded
+          (:code hash-input-byte-limit
+           :field recovery-fragment
+           :limit ,limit))
+        condition)))))
+
+(ert-deftest epi-ledger-recovery-tail-inspection-measures-max-fragment-allocation ()
+  (epi-test-with-temporary-root (root)
+    (let* ((bytes
+            (epi-test-ledger-io--recovery-fixture-bytes
+             "torn-final-end-block.org"))
+           (fragment-size
+            (- (length bytes)
+               epi-test-ledger-io--recovery-valid-prefix-end-offset))
+           (source (epi-test-ledger-io--recovery-write-source root bytes))
+           (epi-ledger-work-byte-limit 8)
+           (epi-ledger-work-time-budget 1000.0)
+           (epi-recovery-fragment-byte-limit fragment-size)
+           (original-charge (symbol-function 'epi-ledger--work-charge))
+           ordinary-charges
+           nonpreemptible-events
+           inspection)
+      (cl-letf (((symbol-function 'epi-ledger--work-charge)
+                 (lambda (state amount)
+                   (push amount ordinary-charges)
+                   (funcall original-charge state amount))))
+        (let ((epi-ledger--nonpreemptible-observer
+               (lambda (event) (push event nonpreemptible-events))))
+          (setq inspection
+                (epi-test-ledger-io--recovery-call-inertly
+                 root
+                 (lambda ()
+                   (epi-ledger--inspect-path
+                    source 'allow-one-incomplete-final-frame))))))
+      (should
+       (eq 'truncated-tail
+           (epi-ledger--inspection-raw-state inspection)))
+      (should (= fragment-size
+                 (epi-ledger--inspection-raw-fragment-size inspection)))
+      (let ((allocations
+             (seq-filter
+              (lambda (event)
+                (and (eq 'allocate (plist-get event :kind))
+                     (eq 'recovery-fragment (plist-get event :field))))
+              nonpreemptible-events))
+            (hashes
+             (seq-filter
+              (lambda (event)
+                (and (eq 'hash (plist-get event :kind))
+                     (eq 'recovery-fragment (plist-get event :field))))
+              nonpreemptible-events)))
+        (should (= 1 (length allocations)))
+        (should (= fragment-size
+                   (plist-get (car allocations) :bytes)))
+        (should (eq 'success (plist-get (car allocations) :outcome)))
+        (should (= 1 (length hashes)))
+        (should (= fragment-size (plist-get (car hashes) :bytes)))
+        (should (eq 'success (plist-get (car hashes) :outcome)))
+        (should-not (plist-get (car hashes) :exceptional)))
+      (should ordinary-charges)
+      (dolist (amount ordinary-charges)
+        (should (<= 0 amount epi-ledger-work-byte-limit))))))
+
+(ert-deftest epi-ledger-recovery-tail-inspection-prefers-prefix-semantics-to-fragment-cap ()
+  (epi-test-with-temporary-root (root)
+    (let* ((fixture
+            (epi-test-ledger-io--recovery-fixture-bytes
+             "torn-final-headline.org"))
+           (header (epi-ledger-parse-header fixture))
+           (header-bytes
+            (substring fixture 0 (epi-header-end-offset header)))
+           (fragment
+            (substring
+             fixture epi-test-ledger-io--recovery-valid-prefix-end-offset))
+           (source
+            (epi-test-ledger-io--recovery-write-source
+             root (concat header-bytes fragment)))
+           (epi-recovery-fragment-byte-limit 1)
+           (condition
+            (epi-test-ledger-io--recovery-call-inertly
+             root
+             (lambda ()
+               (epi-test-ledger-io--recovery-capture-condition
+                (lambda ()
+                  (epi-ledger--inspect-path
+                   source 'allow-one-incomplete-final-frame)))))))
+      (should (> (length fragment) epi-recovery-fragment-byte-limit))
+      (should condition)
+      (should (eq 'epi-ledger-corrupt (car condition)))
+      (should
+       (eq 'missing-session-info
+           (epi-test-ledger-io--condition-code condition))))))
+
+(ert-deftest epi-ledger-recovery-inspection-rejects-invalid-private-contracts ()
+  (let ((condition
+         (should-error
+          (epi-ledger--inspect-path "unused.org" 'invalid-policy)
+          :type 'epi-ledger-format-error)))
+    (should
+     (eq 'invalid-inspection-policy
+         (epi-test-ledger-io--condition-code condition))))
+  (epi-test-with-temporary-root (root)
+    (let* ((source
+            (epi-test-ledger-io--recovery-write-source
+             root
+             (epi-test-ledger-io--recovery-fixture-bytes
+              "torn-final-headline.org")))
+           (inspection
+            (epi-ledger--inspect-path
+             source 'allow-one-incomplete-final-frame))
+           (condition
+            (should-error
+             (epi-ledger--ledger-from-inspection inspection)
+             :type 'epi-ledger-format-error)))
+      (should
+       (eq 'invalid-complete-inspection
+           (epi-test-ledger-io--condition-code condition))))))
+
 (provide 'epi-ledger-io-test)
 
 ;;; epi-ledger-io-test.el ends here

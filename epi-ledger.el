@@ -118,6 +118,26 @@ The capsule deliberately excludes the transient reverse record accumulator."
   (semantic-capsule nil :read-only t)
   (uncertain nil :read-only t))
 
+(cl-defstruct (epi-ledger--inspection
+               (:constructor epi-ledger--make-inspection)
+               (:conc-name epi-ledger--inspection-raw-))
+  "One identity-bound result of the authoritative cold ledger scanner."
+  (state nil :read-only t)
+  (canonical-path nil :read-only t)
+  (file-identity nil :read-only t)
+  (source-size 0 :read-only t)
+  (header nil :read-only t)
+  (record-index nil :read-only t)
+  (semantic-capsule nil :read-only t)
+  (last-record nil :read-only t)
+  (next-sequence 1 :read-only t)
+  (validated-end 0 :read-only t)
+  (valid-prefix-head nil :read-only t)
+  (fragment-offset nil :read-only t)
+  (fragment-size nil :read-only t)
+  (fragment-hash nil :read-only t)
+  (fragment-bytes nil :read-only t))
+
 (cl-defstruct (epi-ledger--record-chunk
                (:constructor epi-ledger--make-record-chunk)
                (:conc-name epi-ledger--record-chunk-raw-))
@@ -1348,6 +1368,10 @@ Every source-byte comparison is reserved through WORK before inspection."
   (if (not (epi-ledger--source-region-p source))
       (epi-ledger--hash source field)
     (let ((bytes (epi-ledger--source-length source)))
+      (when (> bytes epi-hash-input-byte-limit)
+        (epi-ledger--limit-fail
+         'hash-input-byte-limit :field field
+         :limit epi-hash-input-byte-limit))
       (epi-ledger--source-assert-current source)
       (epi-ledger--run-nonpreemptible
        'hash field bytes
@@ -9108,6 +9132,70 @@ Advance HEADER's validation STATE and return the frame's record hash."
    :buffer (current-buffer) :start start :end end
    :tick (buffer-modified-tick)))
 
+(defun epi-ledger--copy-recovery-fragment (source work)
+  "Return an owned unibyte copy of bounded recovery fragment SOURCE.
+Copy and store each slice through WORK; the later digest remains one measured
+nonpreemptible unit."
+  (let* ((size (epi-ledger--source-length source))
+         (result
+          (epi-ledger--run-bounded-unit
+           'allocate 'recovery-fragment size work
+           (lambda () (make-string size 0))))
+         (chunk-size (max 1 (min 1048576 epi-ledger-work-byte-limit)))
+         (offset 0))
+    (while (< offset size)
+      (let* ((end (min size (+ offset chunk-size)))
+             (chunk
+              (epi-ledger--source-copy-range
+               source offset end 'recovery-fragment-read work)))
+        (epi-ledger--work-charge work (- end offset))
+        (store-substring result offset chunk)
+        (setq offset end)))
+    result))
+
+(defun epi-ledger--open-reread-recovery-fragment
+    (path begin end expected identity work sequence record-id)
+  "Reread PATH's recovery fragment BEGIN..END and return its digest.
+EXPECTED contains the independently captured inspection bytes.  Require the
+current PATH under IDENTITY to contain exactly those bytes, using WORK and
+RECORD-ID for bounded reads and stable diagnostics at SEQUENCE."
+  (let ((chunk-size (max 1 (min 1048576 epi-ledger-work-byte-limit))))
+    (with-temp-buffer
+      (set-buffer-multibyte nil)
+      (let ((offset begin)
+            (epi-ledger--work-protected-buffer (current-buffer))
+            (epi-ledger--work-protected-change-handler
+             (lambda ()
+               (epi-ledger--open-signal
+                'epi-ledger-conflict 'loader-buffer-modified path sequence
+                record-id begin 'loader-buffer-modified))))
+        (while (< offset end)
+          (let ((next (min end (+ offset chunk-size))))
+            (goto-char (point-max))
+            (condition-case condition
+                (epi-ledger--open-insert-source-range
+                 path offset next work identity sequence
+                 epi-ledger--open-head-inserter
+                 'recovery-fragment-source-read)
+              (epi-ledger-conflict
+               (signal (car condition) (cdr condition)))
+              ((epi-ledger-format-error file-error)
+               (epi-ledger--open-signal
+                'epi-ledger-conflict 'file-fragment-changed path sequence
+                record-id offset 'file-fragment-changed)))
+            (setq offset next)))
+        (setq buffer-read-only t)
+        (let ((source
+               (epi-ledger--open-buffer-source
+                (point-min) (point-max))))
+          (unless
+              (epi-ledger--source-range-equal-string-p
+               source 0 (- end begin) expected work)
+            (epi-ledger--open-signal
+             'epi-ledger-conflict 'file-fragment-changed path sequence
+             record-id begin 'file-fragment-changed))
+          (epi-ledger--source-hash source 'recovery-fragment))))))
+
 (defun epi-ledger--open-verify-current-head
     (path record identity work sequence)
   "Require PATH's chain head to equal RECORD's hash under IDENTITY.
@@ -9171,14 +9259,13 @@ Use WORK for bounded rereads and report failures at SEQUENCE."
              (epi-record--raw-id record) begin
              'file-chain-head-changed)))))))
 
-(defun epi-ledger-open (path)
-  "Open PATH as a validated read-only append-only Epi ledger.
-Validation uses one forward scan in monotonically increasing bounded ranges.
-Before publication, a bounded reread of the final record prefix binds the
-result to the current chain head.  Per-range identity sandwiches detect
-persistent replacement, but portable filename reads without a stable file
-descriptor cannot exclude adversarial rename-away/read/restore ABA.  No
-repair, recovery, Org evaluation, rendering, or write occurs on this path."
+(defun epi-ledger--inspect-path (path policy)
+  "Inspect PATH once under closed tail POLICY.
+POLICY is `complete' or `allow-one-incomplete-final-frame'.  The latter
+returns the same identity-bound complete-prefix state plus exact owned bytes
+for one structurally completable final frame.  No write or recovery occurs."
+  (unless (memq policy '(complete allow-one-incomplete-final-frame))
+    (epi-ledger--format-fail 'invalid-inspection-policy))
   (epi-ledger--with-operation-work-state
    (let* ((epi-ledger--cold-open-validation t)
           (canonical-path
@@ -9206,6 +9293,13 @@ repair, recovery, Org evaluation, rendering, or write occurs on this path."
           (sequence 1)
           (tail nil)
           (validated-end 0)
+          (inspection-state 'complete)
+          fragment-offset
+          fragment-size
+          fragment-hash
+          fragment-bytes
+          fragment-record-id
+          prefix-finalized
           (records-since-yield 0)
           (state (epi-ledger--make-empty-validation-state)))
      (with-temp-buffer
@@ -9360,25 +9454,62 @@ repair, recovery, Org evaluation, rendering, or write occurs on this path."
                     frame 0 sequence buffer-origin))
                   (scan-state (plist-get scan :state))
                   (cause-code (plist-get scan :code)))
-             (if (eq scan-state 'invalid)
-                 (let ((code (epi-ledger--loader-frame-code cause-code)))
-                   (epi-ledger--open-signal
-                    'epi-ledger-corrupt code canonical-path sequence record-id
-                    (plist-get scan :offset) cause-code))
-               (epi-ledger--open-signal
-		'epi-ledger-truncated-tail 'truncated-frame
-		canonical-path sequence record-id
-		(+ buffer-origin (buffer-size))
-		(or cause-code 'truncated-frame)))))))
-     (unless (= validated-end size)
+             (pcase scan-state
+               ('invalid
+                (let ((code (epi-ledger--loader-frame-code cause-code)))
+                  (epi-ledger--open-signal
+                   'epi-ledger-corrupt code canonical-path sequence record-id
+                   (plist-get scan :offset) cause-code)))
+               ('incomplete
+                (if (eq policy 'complete)
+                    (epi-ledger--open-signal
+                     'epi-ledger-truncated-tail 'truncated-frame
+                     canonical-path sequence record-id
+                     (+ buffer-origin (buffer-size))
+                     (or cause-code 'truncated-frame))
+                  (let ((scan-offset
+                         (plist-get scan :fragment-start-offset))
+                        (scan-size
+                         (plist-get scan :fragment-byte-size)))
+                    (unless (and (= buffer-origin validated-end)
+                                 (= scan-offset buffer-origin)
+                                 (= scan-size (buffer-size))
+                                 (> scan-size 0))
+                      (epi-ledger--open-signal
+                       'epi-ledger-conflict 'incomplete-ledger-scan
+                       canonical-path sequence record-id validated-end
+                       'incomplete-ledger-scan))
+                    (epi-ledger--open-finalize-state
+                     state canonical-path sequence validated-end)
+                    (setq prefix-finalized t)
+                    (when (> scan-size epi-recovery-fragment-byte-limit)
+                      (epi-ledger--limit-fail
+                       'recovery-fragment-byte-limit
+                       :limit epi-recovery-fragment-byte-limit))
+                    (setq inspection-state 'truncated-tail
+                          fragment-offset buffer-origin
+                          fragment-size scan-size
+                          fragment-bytes
+                          (epi-ledger--copy-recovery-fragment frame work)
+                          fragment-record-id record-id))))
+               (_
+                (epi-ledger--open-signal
+                 'epi-ledger-conflict 'incomplete-ledger-scan
+                 canonical-path sequence record-id validated-end
+                 'incomplete-ledger-scan)))))))
+     (unless (= (if (eq inspection-state 'truncated-tail)
+                    (+ validated-end fragment-size)
+                  validated-end)
+                size)
        (let ((record
               (car (epi-ledger--validation-state-records-reverse state))))
          (epi-ledger--open-signal
           'epi-ledger-conflict 'incomplete-ledger-scan canonical-path
           sequence (and record (epi-record--raw-id record))
           validated-end 'incomplete-ledger-scan)))
-     (epi-ledger--open-finalize-state
-      state canonical-path sequence validated-end)
+     (unless prefix-finalized
+       (epi-ledger--open-finalize-state
+        state canonical-path sequence validated-end))
      (let* ((last-record
              (car (epi-ledger--validation-state-records-reverse state)))
             (ordered-records
@@ -9389,6 +9520,12 @@ repair, recovery, Org evaluation, rendering, or write occurs on this path."
             (capsule (epi-ledger--semantic-capsule-from-state state)))
        (epi-ledger--open-verify-current-head
         canonical-path last-record initial-identity work sequence)
+       (when (eq inspection-state 'truncated-tail)
+         (setq fragment-hash
+               (epi-ledger--open-reread-recovery-fragment
+                canonical-path fragment-offset
+                (+ fragment-offset fragment-size) fragment-bytes
+                initial-identity work sequence fragment-record-id)))
        ;; This is the final cooperative boundary.  Only raw constructors and
        ;; field stores occur after the publication identity succeeds.
        (epi-ledger--work-yield work)
@@ -9401,25 +9538,63 @@ repair, recovery, Org evaluation, rendering, or write occurs on this path."
            (epi-ledger--open-signal
             'epi-ledger-conflict 'file-identity-changed canonical-path
             sequence nil validated-end 'file-identity-changed)))
-       (let* (
-              (checkpoint
-               (epi-ledger--make-checkpoint
-		:file-identity initial-identity
-		:validated-end-offset validated-end
-		:tail-hash tail
-		:records records
-		:by-id (epi-ledger--semantic-capsule-raw-by-id capsule)
-		:turn-operation-index
-		(epi-ledger--semantic-capsule-raw-turn-operation-index capsule)
-		:tool-facts (epi-ledger--semantic-capsule-raw-calls capsule)
-		:semantic-capsule capsule
-		:uncertain (epi-ledger--semantic-capsule-raw-uncertain capsule))))
-         (epi-ledger--make-ledger
-          :path canonical-path :header header
-          :session-id (epi-header--raw-session-id header)
-          :project-root (epi-header--raw-project-root header)
-         :checkpoint-cell (epi-ledger--make-checkpoint-cell
-                            :value checkpoint)))))))
+       (epi-ledger--make-inspection
+        :state inspection-state
+        :canonical-path canonical-path
+        :file-identity initial-identity
+        :source-size size
+        :header header
+        :record-index records
+        :semantic-capsule capsule
+        :last-record last-record
+        :next-sequence sequence
+        :validated-end validated-end
+        :valid-prefix-head tail
+        :fragment-offset fragment-offset
+        :fragment-size fragment-size
+        :fragment-hash fragment-hash
+        :fragment-bytes fragment-bytes)))))
+
+(defun epi-ledger--ledger-from-inspection (inspection)
+  "Return a complete ledger handle from identity-bound INSPECTION."
+  (unless (and (epi-ledger--inspection-p inspection)
+               (eq (epi-ledger--inspection-raw-state inspection) 'complete))
+    (epi-ledger--format-fail 'invalid-complete-inspection))
+  (let* ((capsule
+          (epi-ledger--inspection-raw-semantic-capsule inspection))
+         (header (epi-ledger--inspection-raw-header inspection))
+         (checkpoint
+          (epi-ledger--make-checkpoint
+           :file-identity
+           (epi-ledger--inspection-raw-file-identity inspection)
+           :validated-end-offset
+           (epi-ledger--inspection-raw-validated-end inspection)
+           :tail-hash
+           (epi-ledger--inspection-raw-valid-prefix-head inspection)
+           :records (epi-ledger--inspection-raw-record-index inspection)
+           :by-id (epi-ledger--semantic-capsule-raw-by-id capsule)
+           :turn-operation-index
+           (epi-ledger--semantic-capsule-raw-turn-operation-index capsule)
+           :tool-facts (epi-ledger--semantic-capsule-raw-calls capsule)
+           :semantic-capsule capsule
+           :uncertain (epi-ledger--semantic-capsule-raw-uncertain capsule))))
+    (epi-ledger--make-ledger
+     :path (epi-ledger--inspection-raw-canonical-path inspection)
+     :header header
+     :session-id (epi-header--raw-session-id header)
+     :project-root (epi-header--raw-project-root header)
+     :checkpoint-cell (epi-ledger--make-checkpoint-cell :value checkpoint))))
+
+(defun epi-ledger-open (path)
+  "Open PATH as a validated read-only append-only Epi ledger.
+Validation uses one forward scan in monotonically increasing bounded ranges.
+Before publication, a bounded reread of the final record prefix binds the
+result to the current chain head.  Per-range identity sandwiches detect
+persistent replacement, but portable filename reads without a stable file
+descriptor cannot exclude adversarial rename-away/read/restore ABA.  No
+repair, recovery, Org evaluation, rendering, or write occurs on this path."
+  (epi-ledger--ledger-from-inspection
+   (epi-ledger--inspect-path path 'complete)))
 
 (defun epi-ledger--create-validate-draft-shape (drafts session-id)
   "Require owned DRAFTS to lead with session-info for SESSION-ID."
