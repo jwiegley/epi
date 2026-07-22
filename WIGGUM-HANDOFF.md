@@ -1,6 +1,6 @@
 # Epi Implementation Wiggum Handoff
 
-Status: stopped at required implementation-worktree consent
+Status: active on Task 1, Wave A contract drafting
 
 Last updated: 2026-07-21
 
@@ -24,15 +24,16 @@ Completed in this run:
   counts, the 51-option inventory, focused consistency checks, and two
   independent final reviews. The working tree and observation queue were clean
   immediately after that commit.
+- Received explicit consent for the documented default isolated worktree,
+  committed `.worktrees/` to `.gitignore` on `main` as
+  `efc5ee1a6d41132e837c6c8f7c1daebf8fb35a31`, and created
+  `.worktrees/epi-first-slice` on `codex/epi-first-slice` at that commit.
+- Started Task 1 Wave A with isolated scratch agents drafting the preflight,
+  runner, and package contracts while the coordinator alone owns integration,
+  test gates, and Git.
 
-The following decision is required before Task 1 may begin:
-
-1. The `using-git-worktrees` procedure requires explicit user consent before
-   creating the isolated Epi worktree. If consent is granted without another
-   location preference, the skill default is a project-local
-   `.worktrees/epi-first-slice` on branch `codex/epi-first-slice`. Because no
-   ignore file exists yet, `.worktrees/` must first be added to `.gitignore`
-   and committed before creation.
+Task 1 is unblocked. All implementation changes belong in the isolated feature
+worktree; `main` remains outside the implementation path.
 
 One terminal integration decision is known but does not block Task 1: this
 repository has no remote or upstream. The inherited parent instruction requires
@@ -157,20 +158,16 @@ substituting dependencies.
 
 ## Repository boundary
 
-The current checkout remains branch `main`. It has no configured remote or
-upstream. Feature implementation has not started here. The next implementation
-workspace requires the worktree consent above; the final push requirement
-remains unresolved rather than silently downgraded to a local integration
-boundary.
+The primary checkout remains clean on `main`. Feature implementation is in
+`.worktrees/epi-first-slice` on `codex/epi-first-slice`, based on
+`efc5ee1a6d41132e837c6c8f7c1daebf8fb35a31`. The repository has no configured
+remote or upstream; the final push requirement remains unresolved rather than
+silently downgraded to a local integration boundary.
 
 ## Implementation resume procedure
 
-1. Obtain explicit worktree consent. If granted without another preference,
-   add and commit the project-local `.worktrees/` ignore rule, then create
-   `.worktrees/epi-first-slice` on `codex/epi-first-slice`. If declined, treat
-   that as explicit authorization to work in the current checkout and run
-   `git switch -c codex/epi-first-slice` before any implementation edit or
-   commit; never implement directly on `main`.
+1. Work only in `.worktrees/epi-first-slice` on
+   `codex/epi-first-slice`; never implement directly on `main`.
 2. Use the already verified detached GPTel, Pi, and JCS roots listed above. Do
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
@@ -188,7 +185,7 @@ boundary.
 - Repeated failing gate signature: 0/3.
 - Unusable output from any one reviewer: 0/2.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: first occurrence of required worktree consent; all exact
-  preflight source inputs are present and no preflight attempt has been made.
+- Current stop reason: none. Task 1 Wave A is active; all exact preflight source
+  inputs are present and no preflight attempt has been made.
 - Terminal integration issue: no remote/upstream for the inherited push rule;
   this does not block local Task 1 work.
