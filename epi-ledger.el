@@ -97,6 +97,9 @@ The capsule deliberately excludes the transient reverse record accumulator."
   (pending-proposal nil :read-only t)
   (pending-result nil :read-only t)
   (terminalization-required nil :read-only t)
+  (recovery-evidence nil :read-only t)
+  (latest-recovery-origin nil :read-only t)
+  (recovery-terminalization-required nil :read-only t)
   (deferred-references nil :read-only t)
   (uncertain nil :read-only t)
   (uncertainty-phase nil :read-only t)
@@ -671,6 +674,13 @@ adds at most a sign, decimal point, exponent marker, sign, and three digits.")
       "fragment_object" "destination_valid_prefix_head_sha256"
       "source_evidence_sha256")))
   "Closed schema descriptor for the twenty first-slice record types.")
+
+(defconst epi-ledger--recovery-evidence-v1-fields
+  '("source_path" "source_session_id" "source_file_size"
+    "source_header_sha256" "source_valid_prefix_head_sha256"
+    "fragment_offset" "fragment_sha256" "fragment_size"
+    "fragment_object" "destination_valid_prefix_head_sha256")
+  "Recovery-origin payload fields authenticated by evidence version one.")
 
 (defconst epi-ledger--maximum-record-type-byte-length
   (apply #'max
@@ -3563,6 +3573,10 @@ FIELD identifies a measured comparison and WORK receives bounded charges."
   (epi-ledger--require-string
    (epi-ledger--object-value value "media_type")
    "fragment_object.media_type" t)
+  (unless (equal (epi-ledger--object-value value "media_type")
+                 "application/octet-stream")
+    (epi-ledger--format-fail
+     'invalid-media-type :field "fragment_object.media_type"))
   (unless (equal (epi-ledger--object-value value "role")
                  "recovery-fragment")
     (epi-ledger--format-fail 'invalid-role :field "fragment_object.role")))
@@ -6173,6 +6187,7 @@ an immutable carry window may call `epi-ledger--scan-frame-owned' directly."
   calls calls-by-target reserved-call-ids intents active-operation active-call
   session-seen first-nonsession pending-proposal pending-result
   terminalization-required
+  recovery-evidence latest-recovery-origin recovery-terminalization-required
   deferred-references uncertain uncertainty-phase uncertainty-class
   uncertainty-turn uncertainty-operation)
 
@@ -6201,6 +6216,12 @@ The transient reverse record accumulator is intentionally not represented."
    :pending-result (epi-ledger--validation-state-pending-result state)
    :terminalization-required
    (epi-ledger--validation-state-terminalization-required state)
+   :recovery-evidence
+   (epi-ledger--validation-state-recovery-evidence state)
+   :latest-recovery-origin
+   (epi-ledger--validation-state-latest-recovery-origin state)
+   :recovery-terminalization-required
+   (epi-ledger--validation-state-recovery-terminalization-required state)
    :deferred-references
    (epi-ledger--validation-state-deferred-references state)
    :uncertain (epi-ledger--validation-state-uncertain state)
@@ -6287,6 +6308,15 @@ shared.  The returned record accumulator starts empty."
        :terminalization-required
        (clone
         (epi-ledger--semantic-capsule-raw-terminalization-required capsule))
+       :recovery-evidence
+       (clone (epi-ledger--semantic-capsule-raw-recovery-evidence capsule))
+       :latest-recovery-origin
+       (clone
+        (epi-ledger--semantic-capsule-raw-latest-recovery-origin capsule))
+       :recovery-terminalization-required
+       (clone
+        (epi-ledger--semantic-capsule-raw-recovery-terminalization-required
+         capsule))
        :deferred-references
        (clone
         (epi-ledger--semantic-capsule-raw-deferred-references capsule))
@@ -8923,6 +8953,84 @@ open-turn intent mismatch can retain its more precise diagnostic."
       (setf (epi-ledger--validation-state-uncertainty-phase state)
             'blocked))))
 
+(defun epi-ledger--recovery-evidence-v1 (payload)
+  "Return PAYLOAD's closed version-one recovery evidence object."
+  (append
+   '(("kind" . "epi-recovery-source-evidence") ("version" . 1))
+   (mapcar
+    (lambda (field)
+      (cons field (epi-ledger--object-value payload field)))
+    epi-ledger--recovery-evidence-v1-fields)))
+
+(defun epi-ledger--validate-recovery-origin (state record)
+  "Validate recovery-origin RECORD and retain its provenance in STATE."
+  (let* ((payload (epi-record--raw-payload record))
+         (expected
+          (epi-ledger--object-value payload "source_evidence_sha256"))
+         (actual
+          (epi-ledger--hash
+           (epi-ledger--jcs-encode
+            (epi-ledger--recovery-evidence-v1 payload))
+           'recovery-source-evidence))
+         (evidence
+          (epi-ledger--validation-state-recovery-evidence state)))
+    (unless (equal expected actual)
+      (epi-ledger--semantic-fail 'source-evidence-mismatch))
+    (when (gethash expected evidence)
+      (epi-ledger--semantic-fail 'duplicate-recovery-evidence))
+    (when
+        (epi-ledger--validation-state-recovery-terminalization-required
+         state)
+      (epi-ledger--semantic-fail 'recovery-terminalization-required))
+    (puthash expected t evidence)
+    (setf (epi-ledger--validation-state-latest-recovery-origin state) record
+          (epi-ledger--validation-state-recovery-terminalization-required
+           state)
+          (and (epi-ledger--validation-state-active-operation state) t))))
+
+(defun epi-ledger--recovery-terminalization-record-p (state record kind)
+  "Return non-nil when RECORD passes STATE's recovery terminalization gate.
+KIND is RECORD's message content type, when it is a message.  This gate checks
+recovery-specific type and tool payload constraints.  Ordinary semantic
+validation proves interruption literals, lifecycle identities, and adjacency."
+  (let* ((type (epi-record--raw-type record))
+         (payload (epi-record--raw-payload record))
+         (call (epi-ledger--validation-state-active-call state))
+         (call-state (and call (plist-get call :state)))
+         (phase (epi-ledger--validation-state-uncertainty-phase state))
+         (operation (epi-ledger--validation-state-active-operation state))
+         (turn (and operation (plist-get operation :active-turn))))
+    (cond
+     ((epi-ledger--validation-state-pending-result state)
+      (and (eq type 'message) (equal kind "tool-result")))
+     ((eq phase 'turn-terminal)
+      (eq type 'turn-interrupted))
+     ((eq phase 'operation-terminal)
+      (eq type 'operation-interrupted))
+     ((memq call-state '(planned approved))
+      (and (eq type 'tool-denied)
+           (equal (epi-ledger--payload-value record "reason") "interrupted")
+           (equal (epi-ledger--payload-value record "model_result")
+                  "Denied")))
+     ((eq call-state 'started)
+      (and
+       (eq type 'tool-finished)
+       (let ((status (epi-ledger--payload-value record "status"))
+             (details (epi-ledger--payload-value record "details")))
+         (or
+          (and (equal status "error")
+               (equal details '(("code" . "interrupted")))
+               (equal (epi-ledger--payload-value record "model_result")
+                      "Interrupted"))
+          (and (equal status "uncertain")
+               (null details)
+               (not (epi-ledger--object-has-key-p
+                     payload "model_result")))))))
+     (turn
+      (eq type 'turn-interrupted))
+     (operation
+      (eq type 'operation-interrupted)))))
+
 (defun epi-ledger--validate-record-semantic (state header record)
   "Validate RECORD against HEADER and retain it after STATE's prefix."
   (let* ((type (epi-record--raw-type record))
@@ -8940,74 +9048,96 @@ open-turn intent mismatch can retain its more precise diagnostic."
                    (and (eq type 'message) (equal kind "tool-result"))))))
     (when (and (= sequence 1) (not (eq type 'session-info)))
       (epi-ledger--semantic-fail 'missing-session-info))
-    (epi-ledger--validate-uncertainty-admission state record kind)
-    (epi-ledger--validate-select-leaf-admission state record)
-    (epi-ledger--validate-turn-admission state record)
-    (epi-ledger--validate-intent-admission state record)
-    (when (gethash (epi-record--raw-id record) by-id)
-      (epi-ledger--semantic-fail 'duplicate-id))
-    (cond
-     ((eq type 'session-info)
+    (if (eq type 'recovery-origin)
+        (progn
+          (when (gethash (epi-record--raw-id record) by-id)
+            (epi-ledger--semantic-fail 'duplicate-id))
+          (epi-ledger--validate-recovery-origin state record))
+      (when
+          (and
+           (epi-ledger--validation-state-recovery-terminalization-required
+            state)
+           (not
+            (epi-ledger--recovery-terminalization-record-p
+             state record kind)))
+        (epi-ledger--semantic-fail 'recovery-terminalization-required))
+      (epi-ledger--validate-uncertainty-admission state record kind)
+      (epi-ledger--validate-select-leaf-admission state record)
+      (epi-ledger--validate-turn-admission state record)
+      (epi-ledger--validate-intent-admission state record)
+      (when (gethash (epi-record--raw-id record) by-id)
+        (epi-ledger--semantic-fail 'duplicate-id))
       (cond
-       ((epi-ledger--validation-state-session-seen state)
-        (epi-ledger--semantic-fail 'duplicate-session-info))
-       ((/= sequence 1)
-        (epi-ledger--semantic-fail 'nonfirst-session-info)))
-      (unless (equal (epi-ledger--payload-value record "session_id")
-                     (epi-header--raw-session-id header))
-        (epi-ledger--semantic-fail 'session-id-mismatch))
-      (setf (epi-ledger--validation-state-session-seen state) t))
-     ((= sequence 1)
-      (setf (epi-ledger--validation-state-first-nonsession state) record)))
-    ;; These adjacency checks deliberately precede all unrelated semantics.
-    (when (epi-ledger--proposal-interruption-p state record)
-      (setf (epi-ledger--validation-state-pending-proposal state) nil))
-    (when (and (epi-ledger--validation-state-pending-proposal state)
-               (not (eq type 'tool-planned)))
-      (epi-ledger--semantic-fail 'delayed-tool-plan))
-    (when (and (epi-ledger--validation-state-pending-result state)
-               (not (equal kind "tool-result")))
-      (epi-ledger--semantic-fail 'delayed-required-result))
-    (when (and
-           (epi-ledger--validation-state-terminalization-required state)
-           (not (or (epi-ledger--turn-terminal-p type)
-                    (and
-                     (epi-ledger--validation-state-pending-result state)
-                     (equal kind "tool-result")))))
-      (epi-ledger--semantic-fail 'tool-cause-terminal-mismatch))
-    (epi-ledger--validate-active-call-continuation state type)
-    (when reference-required
-      (epi-ledger--validate-operation-reference
-       state record (eq type 'message)))
-    (epi-ledger--validate-intended-message state record)
-    (when (and reference-required (eq type 'message))
-      (epi-ledger--validate-operation-reference state record))
-    (pcase type
-      ('operation-started
-       (epi-ledger--validate-operation-start state record))
-      ('turn-started
-       (epi-ledger--validate-turn-start state record))
-      ('leaf
-       (epi-ledger--validate-leaf state record))
-      ('tool-planned
-       (epi-ledger--validate-tool-plan state record))
-      ((or 'tool-approved 'tool-started 'tool-finished 'tool-denied)
-       (epi-ledger--validate-tool-lifecycle state record))
-      ((pred epi-ledger--turn-terminal-p)
-       (epi-ledger--validate-turn-terminal state record))
-      ((pred epi-ledger--operation-terminal-p)
-       (epi-ledger--validate-operation-terminal state record))
-      ('message
-       (cond
-        ((equal kind "tool-result")
-         (epi-ledger--validate-tool-result state record))
-        (t
-         (let ((parent-valid
-                (epi-ledger--validate-message-parent state record)))
-           (when parent-valid
-             (epi-ledger--commit-intended-message state record)
-             (when (equal kind "tool-call")
-               (epi-ledger--validate-proposal state record))))))))
+       ((eq type 'session-info)
+        (cond
+         ((epi-ledger--validation-state-session-seen state)
+          (epi-ledger--semantic-fail 'duplicate-session-info))
+         ((/= sequence 1)
+          (epi-ledger--semantic-fail 'nonfirst-session-info)))
+        (unless (equal (epi-ledger--payload-value record "session_id")
+                       (epi-header--raw-session-id header))
+          (epi-ledger--semantic-fail 'session-id-mismatch))
+        (setf (epi-ledger--validation-state-session-seen state) t))
+       ((= sequence 1)
+        (setf (epi-ledger--validation-state-first-nonsession state) record)))
+      ;; These adjacency checks deliberately precede unrelated semantics.
+      (when (epi-ledger--proposal-interruption-p state record)
+        (setf (epi-ledger--validation-state-pending-proposal state) nil))
+      (when (and (epi-ledger--validation-state-pending-proposal state)
+                 (not (eq type 'tool-planned)))
+        (epi-ledger--semantic-fail 'delayed-tool-plan))
+      (when (and (epi-ledger--validation-state-pending-result state)
+                 (not (equal kind "tool-result")))
+        (epi-ledger--semantic-fail 'delayed-required-result))
+      (when (and
+             (epi-ledger--validation-state-terminalization-required state)
+             (not (or (epi-ledger--turn-terminal-p type)
+                      (and
+                       (epi-ledger--validation-state-pending-result state)
+                       (equal kind "tool-result")))))
+        (epi-ledger--semantic-fail 'tool-cause-terminal-mismatch))
+      (epi-ledger--validate-active-call-continuation state type)
+      (when reference-required
+        (epi-ledger--validate-operation-reference
+         state record (eq type 'message)))
+      (epi-ledger--validate-intended-message state record)
+      (when (and reference-required (eq type 'message))
+        (epi-ledger--validate-operation-reference state record))
+      (pcase type
+        ('operation-started
+         (epi-ledger--validate-operation-start state record))
+        ('turn-started
+         (epi-ledger--validate-turn-start state record))
+        ('leaf
+         (epi-ledger--validate-leaf state record))
+        ('tool-planned
+         (epi-ledger--validate-tool-plan state record))
+        ((or 'tool-approved 'tool-started 'tool-finished 'tool-denied)
+         (epi-ledger--validate-tool-lifecycle state record))
+        ((pred epi-ledger--turn-terminal-p)
+         (epi-ledger--validate-turn-terminal state record))
+        ((pred epi-ledger--operation-terminal-p)
+         (epi-ledger--validate-operation-terminal state record))
+        ('message
+         (cond
+          ((equal kind "tool-result")
+           (epi-ledger--validate-tool-result state record))
+          (t
+           (let ((parent-valid
+                  (epi-ledger--validate-message-parent state record)))
+             (when parent-valid
+               (epi-ledger--commit-intended-message state record)
+               (when (equal kind "tool-call")
+                 (epi-ledger--validate-proposal state record))))))))
+      (when
+          (and
+           (epi-ledger--validation-state-recovery-terminalization-required
+            state)
+           (not (epi-ledger--validation-state-active-operation state)))
+        (setf
+         (epi-ledger--validation-state-recovery-terminalization-required
+          state)
+         nil)))
     (puthash (epi-record--raw-id record) record by-id)
     (push record (epi-ledger--validation-state-records-reverse state))))
 
@@ -9021,6 +9151,18 @@ open-turn intent mismatch can retain its more precise diagnostic."
     (let* ((reference (epi-ledger--earliest-deferred-reference state))
            (record (plist-get reference :record)))
       (list (epi-ledger--deferred-reference-code reference nil) record)))
+   ((let ((origin
+           (epi-ledger--validation-state-latest-recovery-origin state)))
+      (and
+       origin
+       (not
+        (equal
+         (epi-ledger--payload-value
+          origin "destination_valid_prefix_head_sha256")
+         (epi-record--raw-previous-hash origin)))))
+    (list
+     'recovery-prefix-head-mismatch
+     (epi-ledger--validation-state-latest-recovery-origin state)))
    ;; Proposal/plan and terminal/result pairs are written in one crash barrier,
    ;; but complete first frames remain truthful typed EOF prefixes when a
    ;; regular-file write stops at that boundary.  Interior violations are
@@ -9042,6 +9184,9 @@ open-turn intent mismatch can retain its more precise diagnostic."
    :session-seen nil :first-nonsession nil
    :pending-proposal nil :pending-result nil
    :terminalization-required nil
+   :recovery-evidence (make-hash-table :test #'equal)
+   :latest-recovery-origin nil
+   :recovery-terminalization-required nil
    :deferred-references nil :uncertain nil
    :uncertainty-phase nil :uncertainty-class nil
    :uncertainty-turn nil :uncertainty-operation nil))

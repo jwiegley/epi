@@ -4502,6 +4502,13 @@ When CAPTURE-UTF16-CHUNKS is non-nil, also track the chunk list returned by
     (setcdr (assoc "role" object) "attachment")
     (should (eq 'invalid-role
                 (epi-test-ledger--condition-code
+                 (epi-test-ledger--seal-draft-condition draft)))))
+  (let* ((draft (epi-test-ledger--valid-draft 'recovery-origin))
+         (object (cdr (assoc "fragment_object"
+                             (epi-draft-payload draft)))))
+    (setcdr (assoc "media_type" object) "text/plain")
+    (should (eq 'invalid-media-type
+                (epi-test-ledger--condition-code
                  (epi-test-ledger--seal-draft-condition draft))))))
 
 (ert-deftest epi-ledger-rfc3339-validator-rejects-impossible-values ()

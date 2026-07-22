@@ -282,6 +282,10 @@
    (epi-ledger--semantic-capsule-raw-pending-proposal capsule)
    (epi-ledger--semantic-capsule-raw-pending-result capsule)
    (epi-ledger--semantic-capsule-raw-terminalization-required capsule)
+   (epi-ledger--semantic-capsule-raw-recovery-evidence capsule)
+   (epi-ledger--semantic-capsule-raw-latest-recovery-origin capsule)
+   (epi-ledger--semantic-capsule-raw-recovery-terminalization-required
+    capsule)
    (epi-ledger--semantic-capsule-raw-deferred-references capsule)
    (epi-ledger--semantic-capsule-raw-uncertain capsule)
    (epi-ledger--semantic-capsule-raw-uncertainty-phase capsule)
@@ -307,6 +311,9 @@
    (epi-ledger--validation-state-pending-proposal state)
    (epi-ledger--validation-state-pending-result state)
    (epi-ledger--validation-state-terminalization-required state)
+   (epi-ledger--validation-state-recovery-evidence state)
+   (epi-ledger--validation-state-latest-recovery-origin state)
+   (epi-ledger--validation-state-recovery-terminalization-required state)
    (epi-ledger--validation-state-deferred-references state)
    (epi-ledger--validation-state-uncertain state)
    (epi-ledger--validation-state-uncertainty-phase state)
@@ -408,6 +415,9 @@ Validated `epi-record' values are immutable leaves and are not traversed."
              epi-ledger--semantic-capsule-raw-pending-proposal
              epi-ledger--semantic-capsule-raw-pending-result
              epi-ledger--semantic-capsule-raw-terminalization-required
+             epi-ledger--semantic-capsule-raw-recovery-evidence
+             epi-ledger--semantic-capsule-raw-latest-recovery-origin
+             epi-ledger--semantic-capsule-raw-recovery-terminalization-required
              epi-ledger--semantic-capsule-raw-deferred-references
              epi-ledger--semantic-capsule-raw-uncertain
              epi-ledger--semantic-capsule-raw-uncertainty-phase
@@ -437,7 +447,8 @@ Validated `epi-record' values are immutable leaves and are not traversed."
                 calls
                 (epi-ledger--semantic-capsule-raw-calls-by-target capsule)
                 (epi-ledger--semantic-capsule-raw-reserved-call-ids capsule)
-                (epi-ledger--semantic-capsule-raw-intents capsule)))
+                (epi-ledger--semantic-capsule-raw-intents capsule)
+                (epi-ledger--semantic-capsule-raw-recovery-evidence capsule)))
         (should (hash-table-p table)))
       (should
        (eq (epi-ledger--checkpoint-raw-by-id checkpoint)
@@ -481,6 +492,15 @@ Validated `epi-record' values are immutable leaves and are not traversed."
       (should-not (epi-ledger--semantic-capsule-raw-pending-proposal capsule))
       (should-not
        (epi-ledger--semantic-capsule-raw-terminalization-required capsule))
+      (should
+       (= 0
+          (hash-table-count
+           (epi-ledger--semantic-capsule-raw-recovery-evidence capsule))))
+      (should-not
+       (epi-ledger--semantic-capsule-raw-latest-recovery-origin capsule))
+      (should-not
+       (epi-ledger--semantic-capsule-raw-recovery-terminalization-required
+        capsule))
       (should-not
        (epi-ledger--semantic-capsule-raw-deferred-references capsule))
       (should-not (epi-ledger--semantic-capsule-raw-uncertain capsule))
@@ -10113,6 +10133,970 @@ INODE defaults to 606."
       (should
        (eq 'invalid-complete-inspection
            (epi-test-ledger-io--condition-code condition))))))
+
+(defconst epi-test-ledger-io--recovery-evidence-v1-fields
+  '("source_path" "source_session_id" "source_file_size"
+    "source_header_sha256" "source_valid_prefix_head_sha256"
+    "fragment_offset" "fragment_sha256" "fragment_size"
+    "fragment_object" "destination_valid_prefix_head_sha256")
+  "Exact payload fields authenticated by recovery evidence version one.")
+
+(defconst epi-test-ledger-io--recovery-evidence-v1-golden
+  (concat
+   "{\"destination_valid_prefix_head_sha256\":"
+   "\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\","
+   "\"fragment_object\":{\"hash\":"
+   "\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+   "\"media_type\":\"application/octet-stream\","
+   "\"role\":\"recovery-fragment\",\"size\":24},"
+   "\"fragment_offset\":1000,\"fragment_sha256\":"
+   "\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\","
+   "\"fragment_size\":24,"
+   "\"kind\":\"epi-recovery-source-evidence\","
+   "\"source_file_size\":1024,\"source_header_sha256\":"
+   "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+   "\"source_path\":\"/tmp/source-1.org\","
+   "\"source_session_id\":\"60000000-0000-4000-8000-000000000001\","
+   "\"source_valid_prefix_head_sha256\":"
+   "\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\","
+   "\"version\":1}")
+  "Independent canonical JSON golden for recovery evidence version one.")
+
+(defconst epi-test-ledger-io--recovery-evidence-v1-digest
+  "5f051c06426ab37606529459cce6595ef65d2b45a28ed651550d4f540365098c"
+  "Independent SHA-256 of the version-one evidence golden bytes.")
+
+(defconst epi-test-ledger-io--recovery-resealed-session-id
+  "22222222-2222-4222-8222-222222222222"
+  "Session ID used to prove historical evidence survives re-sealing.")
+
+(defun epi-test-ledger-io--recovery-field (object key)
+  "Return KEY's value from string-keyed alist OBJECT."
+  (cdr (assoc key object)))
+
+(defun epi-test-ledger-io--recovery-set-field (object key value)
+  "Set KEY to VALUE in string-keyed alist OBJECT and return OBJECT."
+  (let ((cell (assoc key object)))
+    (unless cell
+      (error "Missing recovery test field: %s" key))
+    (setcdr cell value))
+  object)
+
+(defun epi-test-ledger-io--recovery-canonical-source-path (ordinal)
+  "Return a nonexistent canonical local source path for ORDINAL."
+  (expand-file-name
+   (format "epi-recovery-source-%d.org" ordinal)
+   (file-truename temporary-file-directory)))
+
+(defun epi-test-ledger-io--recovery-evidence-v1-material (payload)
+  "Return the exact version-one evidence object derived from PAYLOAD."
+  (append
+   '(("kind" . "epi-recovery-source-evidence") ("version" . 1))
+   (mapcar
+    (lambda (key)
+      (cons key
+            (copy-tree
+             (epi-test-ledger-io--recovery-field payload key) t)))
+    epi-test-ledger-io--recovery-evidence-v1-fields)))
+
+(defun epi-test-ledger-io--recovery-evidence-v1-sha256 (payload)
+  "Return the version-one JCS evidence digest for PAYLOAD."
+  (secure-hash
+   'sha256
+   (epi-ledger--jcs-encode
+    (epi-test-ledger-io--recovery-evidence-v1-material payload))))
+
+(defun epi-test-ledger-io--recovery-refresh-evidence (payload)
+  "Recompute PAYLOAD's version-one evidence digest and return PAYLOAD."
+  (epi-test-ledger-io--recovery-set-field
+   payload "source_evidence_sha256"
+   (epi-test-ledger-io--recovery-evidence-v1-sha256 payload)))
+
+(defun epi-test-ledger-io--recovery-payload
+    (predecessor ordinal &optional source-path)
+  "Return deterministic recovery-origin payload after PREDECESSOR.
+ORDINAL gives distinct source provenance to successive recoveries.
+SOURCE-PATH overrides the canonical temporary source used by open tests."
+  (let* ((fragment-size (+ 23 ordinal))
+         (hash-base (+ ?a (* 3 (1- ordinal))))
+         (header-hash (make-string 64 hash-base))
+         (prefix-hash (make-string 64 (1+ hash-base)))
+         (fragment-hash (make-string 64 (+ 2 hash-base)))
+         (payload
+          `(("source_path" .
+             ,(or source-path
+                  (epi-test-ledger-io--recovery-canonical-source-path
+                   ordinal)))
+            ("source_session_id" .
+             ,(format "60000000-0000-4000-8000-%012d" ordinal))
+            ("source_file_size" . ,(+ 1000 fragment-size))
+            ("source_header_sha256" . ,header-hash)
+            ("source_valid_prefix_head_sha256" . ,prefix-hash)
+            ("fragment_offset" . 1000)
+            ("fragment_sha256" . ,fragment-hash)
+            ("fragment_size" . ,fragment-size)
+            ("fragment_object" .
+             (("hash" . ,fragment-hash)
+              ("size" . ,fragment-size)
+              ("media_type" . "application/octet-stream")
+              ("role" . "recovery-fragment")))
+            ("destination_valid_prefix_head_sha256" . ,predecessor)
+            ("source_evidence_sha256" . ,(make-string 64 ?0)))))
+    (epi-test-ledger-io--recovery-refresh-evidence payload)))
+
+(defun epi-test-ledger-io--recovery-header (session-id)
+  "Return a deterministic sealed header for SESSION-ID."
+  (epi-ledger-seal-header
+   :session-id session-id
+   :created-at "2026-07-21T18:42:17-07:00"
+   :project-root "/tmp/epi-project/"))
+
+(defun epi-test-ledger-io--recovery-reseal-drafts (drafts session-id)
+  "Copy DRAFTS and substitute SESSION-ID in their first session-info."
+  (let ((copies
+         (mapcar
+          (lambda (draft)
+            (let ((copy (copy-epi-draft draft)))
+              (setf (epi-draft-payload copy)
+                    (copy-tree (epi-draft-payload draft) t))
+              copy))
+          drafts)))
+    (unless (and copies (eq (epi-draft-type (car copies)) 'session-info))
+      (error "Recovery reseal fixture must begin with session-info"))
+    (epi-test-ledger-io--recovery-set-field
+     (epi-draft-payload (car copies)) "session_id" session-id)
+    copies))
+
+(defun epi-test-ledger-io--recovery-origin-draft
+    (payload ordinal &optional record-id)
+  "Return a recovery-origin draft for PAYLOAD and ORDINAL.
+RECORD-ID overrides the deterministic distinct origin record ID."
+  (epi-test-ledger-io--draft
+   (or record-id
+       (format "90000000-0000-4000-8000-%012d" ordinal))
+   'recovery-origin (copy-tree payload t)))
+
+(cl-defun epi-test-ledger-io--recovery-history
+    (prefix &key origins origin-ids suffix
+            (header (epi-test-ledger-io--header)))
+  "Seal PREFIX, ORIGINS, and SUFFIX into one deterministic test history.
+Each ORIGINS element is `fresh', a payload alist preserved exactly, or a
+function called with the actual predecessor and one-based ordinal.
+ORIGIN-IDS may override the corresponding record IDs.
+HEADER permits a real re-seal under a distinct destination session root."
+  (let ((tail (epi-header-hash header))
+        (sequence 1)
+        (chunks (list (epi-ledger-render-header header)))
+        origin-payloads
+        origin-records)
+    (cl-labels
+        ((seal
+          (draft)
+          (let ((record (epi-ledger-seal-record draft tail sequence)))
+            (push (epi-ledger-render-record record) chunks)
+            (setq tail (epi-record-hash record)
+                  sequence (1+ sequence))
+            record)))
+      (mapc #'seal prefix)
+      (cl-loop
+       for spec in origins
+       for ordinal from 1
+       do
+       (let* ((record-id (nth (1- ordinal) origin-ids))
+              (payload
+               (cond
+                ((eq spec 'fresh)
+                 (epi-test-ledger-io--recovery-payload tail ordinal))
+                ((functionp spec)
+                 (funcall spec tail ordinal))
+                (t (copy-tree spec t))))
+              (record
+               (seal
+                (epi-test-ledger-io--recovery-origin-draft
+                 payload ordinal record-id))))
+         (push (copy-tree payload t) origin-payloads)
+         (push record origin-records)))
+      (mapc #'seal suffix))
+    (list :bytes (apply #'concat (nreverse chunks))
+          :origin-payloads (nreverse origin-payloads)
+          :origin-records (nreverse origin-records))))
+
+(defun epi-test-ledger-io--recovery-open-bytes (bytes)
+  "Write and open unibyte ledger BYTES, then remove the temporary file."
+  (let ((file (make-temp-file "epi-recovery-origin-" nil ".org")))
+    (unwind-protect
+        (progn
+          (with-temp-buffer
+            (set-buffer-multibyte nil)
+            (insert bytes)
+            (let ((coding-system-for-write 'no-conversion)
+                  (create-lockfiles nil)
+                  (write-region-annotate-functions nil)
+                  (write-region-post-annotation-function nil))
+              (write-region (point-min) (point-max) file nil 'silent)))
+          (epi-ledger-open file))
+      (when (file-exists-p file)
+        (delete-file file)))))
+
+(defun epi-test-ledger-io--recovery-find-record (ledger record-id)
+  "Return RECORD-ID from LEDGER, or nil."
+  (seq-find
+   (lambda (record) (equal record-id (epi-record--raw-id record)))
+   (epi-ledger-records ledger)))
+
+(defun epi-test-ledger-io--recovery-record-id (record)
+  "Return RECORD's ID, or nil when RECORD is nil."
+  (and record (epi-record--raw-id record)))
+
+(defun epi-test-ledger-io--normalize-semantic-value (value)
+  "Return a deterministic tree describing semantic VALUE."
+  (cond
+   ((epi-record-p value)
+    (list 'record (epi-record--raw-id value)
+          (epi-record--raw-type value) (epi-record-hash value)))
+   ((hash-table-p value)
+    (let (entries)
+      (maphash
+       (lambda (key item)
+         (push
+          (cons
+           (epi-test-ledger-io--normalize-semantic-value key)
+           (epi-test-ledger-io--normalize-semantic-value item))
+          entries))
+       value)
+      (sort
+       entries
+       (lambda (left right)
+         (string< (prin1-to-string (car left))
+                  (prin1-to-string (car right)))))))
+   ((consp value)
+    (cons (epi-test-ledger-io--normalize-semantic-value (car value))
+          (epi-test-ledger-io--normalize-semantic-value (cdr value))))
+   ((vectorp value)
+    (apply
+     #'vector
+     (mapcar #'epi-test-ledger-io--normalize-semantic-value value)))
+   ((stringp value) (substring-no-properties value))
+   (t value)))
+
+(defun epi-test-ledger-io--recovery-prefix-capsule-snapshot (ledger)
+  "Return LEDGER's complete non-recovery semantic capsule state."
+  (let* ((roots (epi-test-ledger-io--capsule-roots
+                 (epi-test-ledger-io--capsule ledger)))
+         (by-id (make-hash-table :test #'equal)))
+    (maphash
+     (lambda (key record)
+       (unless (eq (epi-record--raw-type record) 'recovery-origin)
+         (puthash key record by-id)))
+     (car roots))
+    (setcar roots by-id)
+    (epi-test-ledger-io--normalize-semantic-value
+     (append (cl-subseq roots 0 15) (nthcdr 18 roots)))))
+
+(defun epi-test-ledger-io--recovery-turn-interrupted
+    (&optional reason record-id)
+  "Return the exact recovery interruption for the deterministic turn."
+  (epi-test-ledger-io--draft
+   (or record-id "91000000-0000-4000-8000-000000000001")
+   'turn-interrupted
+   `(("turn_id" . ,epi-test-ledger-io--turn-id)
+     ("reason" . ,(or reason "interrupted")))
+   :turn epi-test-ledger-io--turn-id
+   :operation epi-test-ledger-io--operation-id))
+
+(defun epi-test-ledger-io--recovery-turn-failed ()
+  "Return the non-reopen uncertain turn terminal forbidden by recovery."
+  (epi-test-ledger-io--draft
+   "91000000-0000-4000-8000-000000000009" 'turn-failed
+   `(("turn_id" . ,epi-test-ledger-io--turn-id)
+     ("code" . "tool-uncertain") ("details"))
+   :turn epi-test-ledger-io--turn-id
+   :operation epi-test-ledger-io--operation-id))
+
+(defun epi-test-ledger-io--recovery-operation-interrupted
+    (&optional operation reason record-id)
+  "Return the exact recovery interruption for OPERATION.
+REASON defaults to `interrupted' and RECORD-ID defaults deterministically."
+  (let ((operation (or operation epi-test-ledger-io--operation-id)))
+    (epi-test-ledger-io--draft
+     (or record-id "91000000-0000-4000-8000-000000000002")
+     'operation-interrupted
+     `(("operation_id" . ,operation)
+       ("reason" . ,(or reason "interrupted")))
+     :operation operation)))
+
+(defun epi-test-ledger-io--recovery-tool-denied ()
+  "Return the exact interrupted denial for a recovery-planned call."
+  (epi-test-ledger-io--draft
+   "91000000-0000-4000-8000-000000000003" 'tool-denied
+   `(("call_id" . ,epi-test-ledger-io--call-id)
+     ("reason" . "interrupted")
+     ("model_result" . "Denied"))
+   :target epi-test-ledger-io--proposal-id
+   :turn epi-test-ledger-io--turn-id
+   :operation epi-test-ledger-io--operation-id))
+
+(defun epi-test-ledger-io--recovery-denied-result ()
+  "Return the exact denied result paired with recovery denial."
+  (epi-test-ledger-io--draft
+   "91000000-0000-4000-8000-000000000004" 'message
+   `(("role" . "tool")
+     ("content" .
+      ,(vector
+        `(("type" . "tool-result")
+          ("call_id" . ,epi-test-ledger-io--call-id)
+          ("name" . "read_file")
+          ("result" . "Denied")
+          ("status" . "denied")))))
+   :parent epi-test-ledger-io--proposal-id
+   :turn epi-test-ledger-io--turn-id))
+
+(defun epi-test-ledger-io--recovery-tool-error ()
+  "Return the exact interrupted error for a started safe call."
+  (epi-test-ledger-io--draft
+   "91000000-0000-4000-8000-000000000007" 'tool-finished
+   `(("call_id" . ,epi-test-ledger-io--call-id)
+     ("status" . "error")
+     ("details" . (("code" . "interrupted")))
+     ("model_result" . "Interrupted"))
+   :target epi-test-ledger-io--proposal-id
+   :turn epi-test-ledger-io--turn-id
+   :operation epi-test-ledger-io--operation-id))
+
+(defun epi-test-ledger-io--recovery-error-result ()
+  "Return the exact error result paired with recovery safe-call failure."
+  (epi-test-ledger-io--draft
+   "91000000-0000-4000-8000-000000000008" 'message
+   `(("role" . "tool")
+     ("content" .
+      ,(vector
+        `(("type" . "tool-result")
+          ("call_id" . ,epi-test-ledger-io--call-id)
+          ("name" . "read_file")
+          ("result" . "Interrupted")
+          ("status" . "error")))))
+   :parent epi-test-ledger-io--proposal-id
+   :turn epi-test-ledger-io--turn-id))
+
+(defun epi-test-ledger-io--recovery-tool-uncertain ()
+  "Return the exact uncertain terminal for a recovery-started call."
+  (epi-test-ledger-io--draft
+   "91000000-0000-4000-8000-000000000005" 'tool-finished
+   `(("call_id" . ,epi-test-ledger-io--call-id)
+     ("status" . "uncertain") ("details"))
+   :target epi-test-ledger-io--proposal-id
+   :turn epi-test-ledger-io--turn-id
+   :operation epi-test-ledger-io--operation-id))
+
+(defun epi-test-ledger-io--recovery-set-draft-field (draft key value)
+  "Set DRAFT payload KEY to VALUE, adding it when absent, and return DRAFT."
+  (let* ((payload (epi-draft-payload draft))
+         (cell (assoc key payload)))
+    (if cell
+        (setcdr cell value)
+      (setf (epi-draft-payload draft)
+            (append payload (list (cons key value))))))
+  draft)
+
+(defconst epi-test-ledger-io--recovery-select-operation-id
+  "70000000-0000-4000-8000-000000000001"
+  "Operation ID for recovery select-leaf tests.")
+
+(defun epi-test-ledger-io--recovery-select-start ()
+  "Return a deterministic open select-leaf operation."
+  (epi-test-ledger-io--draft
+   "71000000-0000-4000-8000-000000000001" 'operation-started
+   `(("operation_id" .
+      ,epi-test-ledger-io--recovery-select-operation-id)
+     ("kind" . "select-leaf"))
+   :operation epi-test-ledger-io--recovery-select-operation-id))
+
+(defun epi-test-ledger-io--recovery-select-leaf ()
+  "Return the ordinary leaf continuation forbidden after recovery."
+  (epi-test-ledger-io--draft
+   "71000000-0000-4000-8000-000000000002" 'leaf nil
+   :target epi-test-ledger-io--user-id
+   :operation epi-test-ledger-io--recovery-select-operation-id))
+
+(defun epi-test-ledger-io--recovery-select-finished ()
+  "Return the ordinary successful select terminal forbidden after recovery."
+  (epi-test-ledger-io--draft
+   "71000000-0000-4000-8000-000000000003" 'operation-finished
+   `(("operation_id" .
+      ,epi-test-ledger-io--recovery-select-operation-id)
+     ("status" . "success"))
+   :operation epi-test-ledger-io--recovery-select-operation-id))
+
+(defun epi-test-ledger-io--recovery-select-interrupted ()
+  "Return the sole recovery terminal for the open select operation."
+  (epi-test-ledger-io--recovery-operation-interrupted
+   epi-test-ledger-io--recovery-select-operation-id
+   "interrupted" "91000000-0000-4000-8000-000000000006"))
+
+(defun epi-test-ledger-io--recovery-next-operation ()
+  "Return a valid new operation after a fully settled recovered prefix."
+  (let ((operation "72000000-0000-4000-8000-000000000001"))
+    (epi-test-ledger-io--draft
+     "73000000-0000-4000-8000-000000000001" 'operation-started
+     `(("operation_id" . ,operation) ("kind" . "prompt"))
+     :operation operation)))
+
+(defun epi-test-ledger-io--recovery-select-prefix (&optional after-leaf)
+  "Return settled history and an open select operation.
+When AFTER-LEAF is non-nil, include its leaf and await only the terminal."
+  (append
+   (epi-test-ledger-io--full-drafts)
+   (list (epi-test-ledger-io--recovery-select-start))
+   (and after-leaf (list (epi-test-ledger-io--recovery-select-leaf)))))
+
+(ert-deftest epi-ledger-recovery-origin-v1-evidence-has-exact-jcs-golden ()
+  (let* ((payload
+          (epi-test-ledger-io--recovery-payload
+           (make-string 64 ?d) 1 "/tmp/source-1.org"))
+         (material
+          (epi-test-ledger-io--recovery-evidence-v1-material payload))
+         (bytes (epi-ledger--jcs-encode material)))
+    (should (= 10 (length epi-test-ledger-io--recovery-evidence-v1-fields)))
+    (should
+     (equal
+      '("destination_valid_prefix_head_sha256" "fragment_object"
+        "fragment_offset" "fragment_sha256" "fragment_size" "kind"
+        "source_file_size" "source_header_sha256" "source_path"
+        "source_session_id" "source_valid_prefix_head_sha256" "version")
+      (sort (mapcar #'car material) #'string<)))
+    (should (equal "epi-recovery-source-evidence"
+                   (epi-test-ledger-io--recovery-field material "kind")))
+    (should (= 1 (epi-test-ledger-io--recovery-field material "version")))
+    (should-not (string-match-p "\n" bytes))
+    (should (equal epi-test-ledger-io--recovery-evidence-v1-golden bytes))
+    (should
+     (equal epi-test-ledger-io--recovery-evidence-v1-digest
+            (secure-hash 'sha256 bytes)))
+    (should
+     (equal epi-test-ledger-io--recovery-evidence-v1-digest
+            (epi-test-ledger-io--recovery-field
+             payload "source_evidence_sha256")))))
+
+(ert-deftest epi-ledger-recovery-origin-recomputes-historical-evidence ()
+  (let* ((history
+          (epi-test-ledger-io--recovery-history
+           (epi-test-ledger-io--full-drafts)
+           :origins
+           (list
+            (lambda (tail _ordinal)
+              (let ((bad
+                     (epi-test-ledger-io--recovery-payload tail 1)))
+                (epi-test-ledger-io--recovery-set-field
+                 bad "source_evidence_sha256" (make-string 64 ?0))))
+            'fresh))))
+    (let ((condition
+           (should-error
+            (epi-test-ledger-io--recovery-open-bytes
+             (plist-get history :bytes))
+            :type 'epi-ledger-corrupt)))
+      (should
+       (eq 'source-evidence-mismatch
+           (epi-test-ledger-io--condition-code condition))))))
+
+(ert-deftest epi-ledger-recovery-origin-allows-reconciled-history-on-reseal ()
+  (let* ((full (epi-test-ledger-io--full-drafts))
+         (source-prefix (cl-subseq full 0 3))
+         (source
+          (epi-test-ledger-io--recovery-history
+           source-prefix :origins '(fresh)
+           :suffix
+           (list
+            (epi-test-ledger-io--recovery-turn-interrupted)
+            (epi-test-ledger-io--recovery-operation-interrupted))))
+         (historical (car (plist-get source :origin-payloads)))
+         (source-origin (car (plist-get source :origin-records)))
+         (destination-prefix
+          (append
+           (epi-test-ledger-io--recovery-reseal-drafts
+            source-prefix epi-test-ledger-io--recovery-resealed-session-id)
+           (list
+            (epi-test-ledger-io--recovery-origin-draft historical 1)
+            (epi-test-ledger-io--recovery-turn-interrupted)
+            (epi-test-ledger-io--recovery-operation-interrupted))))
+         (history
+          (epi-test-ledger-io--recovery-history
+           destination-prefix
+           :header
+           (epi-test-ledger-io--recovery-header
+            epi-test-ledger-io--recovery-resealed-session-id)
+           :origins
+           (list
+            (lambda (tail _ordinal)
+              (epi-test-ledger-io--recovery-payload tail 2)))
+           :origin-ids
+           '("90000000-0000-4000-8000-000000000002")))
+         (ledger
+          (epi-test-ledger-io--recovery-open-bytes
+           (plist-get history :bytes)))
+         (older
+          (epi-test-ledger-io--recovery-find-record
+           ledger "90000000-0000-4000-8000-000000000001"))
+         (newest
+          (epi-test-ledger-io--recovery-find-record
+           ledger "90000000-0000-4000-8000-000000000002")))
+    ;; The historical payload was genuinely bound when it was first created.
+    (should
+     (equal
+      (epi-test-ledger-io--recovery-field
+       historical "destination_valid_prefix_head_sha256")
+      (epi-record--raw-previous-hash source-origin)))
+    ;; Re-sealing under a new root changes its physical predecessor, while the
+    ;; already authenticated historical payload remains byte-identical.
+    (should-not
+     (equal
+      (epi-test-ledger-io--recovery-field
+       (epi-record--raw-payload older)
+       "destination_valid_prefix_head_sha256")
+      (epi-record--raw-previous-hash older)))
+    (should
+     (equal
+      (epi-ledger--jcs-encode historical)
+      (epi-ledger--jcs-encode (epi-record--raw-payload older))))
+    (should
+     (equal
+      (epi-test-ledger-io--recovery-field
+       (epi-record--raw-payload newest)
+       "destination_valid_prefix_head_sha256")
+      (epi-record--raw-previous-hash newest)))))
+
+(ert-deftest epi-ledger-recovery-origin-rejects-unreconciled-history ()
+  (let* ((source-prefix
+          (cl-subseq (epi-test-ledger-io--full-drafts) 0 3))
+         (source
+          (epi-test-ledger-io--recovery-history
+           source-prefix :origins '(fresh)))
+         (historical (car (plist-get source :origin-payloads)))
+         (destination-prefix
+          (append
+           (epi-test-ledger-io--recovery-reseal-drafts
+            source-prefix epi-test-ledger-io--recovery-resealed-session-id)
+           (list
+            (epi-test-ledger-io--recovery-origin-draft historical 1))))
+         (history
+          (epi-test-ledger-io--recovery-history
+           destination-prefix
+           :header
+           (epi-test-ledger-io--recovery-header
+            epi-test-ledger-io--recovery-resealed-session-id)
+           :origins
+           (list
+            (lambda (tail _ordinal)
+              (epi-test-ledger-io--recovery-payload tail 2)))
+           :origin-ids
+           '("90000000-0000-4000-8000-000000000002"))))
+    (let ((condition
+           (should-error
+            (epi-test-ledger-io--recovery-open-bytes
+             (plist-get history :bytes))
+            :type 'epi-ledger-corrupt)))
+      (should
+       (eq 'recovery-terminalization-required
+           (epi-test-ledger-io--condition-code condition))))))
+
+(ert-deftest epi-ledger-recovery-origin-rejects-an-unbound-newest-origin ()
+  (let* ((stale
+          (epi-test-ledger-io--recovery-payload (make-string 64 ?d) 1))
+         (history
+          (epi-test-ledger-io--recovery-history
+           (epi-test-ledger-io--full-drafts) :origins (list stale))))
+    (let ((condition
+           (should-error
+            (epi-test-ledger-io--recovery-open-bytes
+             (plist-get history :bytes))
+            :type 'epi-ledger-corrupt)))
+      (should
+       (eq 'recovery-prefix-head-mismatch
+           (epi-test-ledger-io--condition-code condition))))))
+
+(ert-deftest epi-ledger-recovery-origin-duplicate-id-remains-corruption ()
+  (let* ((record-id "90000000-0000-4000-8000-000000000099")
+         (history
+          (epi-test-ledger-io--recovery-history
+           (epi-test-ledger-io--full-drafts)
+           :origins
+           (list
+            'fresh
+            (lambda (tail _ordinal)
+              (epi-test-ledger-io--recovery-payload tail 2)))
+           :origin-ids (list record-id record-id))))
+    (let ((condition
+           (should-error
+            (epi-test-ledger-io--recovery-open-bytes
+             (plist-get history :bytes))
+            :type 'epi-ledger-corrupt)))
+      (should
+       (eq 'duplicate-id
+           (epi-test-ledger-io--condition-code condition))))))
+
+(ert-deftest epi-ledger-recovery-origin-rejects-duplicate-evidence-hash ()
+  (let* ((source-prefix
+          (cl-subseq (epi-test-ledger-io--full-drafts) 0 3))
+         (source
+          (epi-test-ledger-io--recovery-history
+           source-prefix :origins '(fresh)))
+         (historical (car (plist-get source :origin-payloads)))
+         (destination-prefix
+          (append
+           (epi-test-ledger-io--recovery-reseal-drafts
+            source-prefix epi-test-ledger-io--recovery-resealed-session-id)
+           (list
+            (epi-test-ledger-io--recovery-origin-draft historical 1)
+            (epi-test-ledger-io--recovery-turn-interrupted)
+            (epi-test-ledger-io--recovery-operation-interrupted))))
+         (history
+          (epi-test-ledger-io--recovery-history
+           destination-prefix
+           :header
+           (epi-test-ledger-io--recovery-header
+            epi-test-ledger-io--recovery-resealed-session-id)
+           :origins (list historical)
+           :origin-ids
+           '("90000000-0000-4000-8000-000000000002"))))
+    (let ((condition
+           (should-error
+            (epi-test-ledger-io--recovery-open-bytes
+             (plist-get history :bytes))
+            :type 'epi-ledger-corrupt)))
+      (should
+       (eq 'duplicate-recovery-evidence
+           (epi-test-ledger-io--condition-code condition))))))
+
+(ert-deftest epi-ledger-recovery-origin-preserves-every-typed-eof-state ()
+  (let* ((full (epi-test-ledger-io--full-drafts))
+         (uncertain
+          (append (cl-subseq full 0 8)
+                  (list (epi-test-ledger-io--recovery-tool-uncertain))))
+         (cases
+          (list
+           (cons 'operation-only (cl-subseq full 0 2))
+           (cons 'intended-message (cl-subseq full 0 3))
+           (cons 'open-turn (cl-subseq full 0 4))
+           (cons 'proposal (cl-subseq full 0 5))
+           (cons 'planned (cl-subseq full 0 6))
+           (cons 'approved (cl-subseq full 0 7))
+           (cons 'started (cl-subseq full 0 8))
+           (cons 'result-pending (cl-subseq full 0 9))
+           (cons 'uncertain uncertain)
+           (cons 'select-await-leaf
+                 (epi-test-ledger-io--recovery-select-prefix))
+           (cons 'select-await-terminal
+                 (epi-test-ledger-io--recovery-select-prefix t))
+           (cons 'settled full))))
+    (dolist (case cases)
+      (ert-info ((format "source EOF class %S" (car case)))
+        (let* ((prefix (cdr case))
+               ;; Opening BEFORE is a control: no recovery test is permitted
+               ;; to manufacture an already-invalid source prefix.
+               (before
+                (epi-test-ledger-io--recovery-open-bytes
+                 (plist-get
+                  (epi-test-ledger-io--recovery-history prefix)
+                  :bytes)))
+               (after
+                (epi-test-ledger-io--recovery-open-bytes
+                 (plist-get
+                  (epi-test-ledger-io--recovery-history
+                   prefix :origins '(fresh))
+                  :bytes))))
+          (should
+           (equal
+            (epi-test-ledger-io--recovery-prefix-capsule-snapshot before)
+            (epi-test-ledger-io--recovery-prefix-capsule-snapshot after))))))))
+
+(ert-deftest epi-ledger-recovery-origin-survives-warm-checkpoint-appends ()
+  (epi-test-with-temporary-root (root)
+    (let* ((prefix (cl-subseq (epi-test-ledger-io--full-drafts) 0 4))
+           (history
+            (epi-test-ledger-io--recovery-history
+             prefix :origins '(fresh)))
+           (path
+            (epi-test-ledger-io--recovery-write-source
+             root (plist-get history :bytes)))
+           (ledger (epi-ledger-open path))
+           (origin (car (plist-get history :origin-records)))
+           (origin-id (epi-record--raw-id origin))
+           (evidence
+            (epi-ledger--payload-value origin "source_evidence_sha256")))
+      (cl-labels
+          ((check
+            (candidate barrier)
+            (let* ((capsule (epi-test-ledger-io--capsule candidate))
+                   (table
+                    (epi-ledger--semantic-capsule-raw-recovery-evidence
+                     capsule))
+                   (latest
+                    (epi-ledger--semantic-capsule-raw-latest-recovery-origin
+                     capsule)))
+              (should (= 1 (hash-table-count table)))
+              (should (gethash evidence table))
+              (should (equal origin-id (epi-record--raw-id latest)))
+              (should
+               (eq barrier
+                   (and
+                    (epi-ledger--semantic-capsule-raw-recovery-terminalization-required
+                     capsule)
+                    t))))))
+        (check ledger t)
+        (let* ((capsule (epi-test-ledger-io--capsule ledger))
+               (clone (epi-ledger--semantic-capsule-clone capsule))
+               (clone-table
+                (epi-ledger--validation-state-recovery-evidence clone)))
+          (should
+           (epi-ledger--validation-state-recovery-terminalization-required
+            clone))
+          (should
+           (equal origin-id
+                  (epi-record--raw-id
+                   (epi-ledger--validation-state-latest-recovery-origin
+                    clone))))
+          (should (gethash evidence clone-table))
+          (epi-test-ledger-io--assert-disjoint-graphs
+           (epi-test-ledger-io--capsule-roots capsule)
+           (epi-test-ledger-io--validation-roots clone))
+          (puthash "clone-only" t clone-table)
+          (should-not
+           (gethash
+            "clone-only"
+            (epi-ledger--semantic-capsule-raw-recovery-evidence capsule))))
+        (let ((before (epi-test-ledger-io--literal-file-bytes path)))
+          (epi-test-ledger-io--wave5-with-process
+            (let ((condition
+                   (should-error
+                    (epi-ledger--append
+                     ledger (vector (epi-test-ledger-io--proposal)))
+                    :type 'epi-ledger-format-error)))
+              (should
+               (eq 'recovery-terminalization-required
+                   (epi-test-ledger-io--condition-code condition)))))
+          (should
+           (equal before (epi-test-ledger-io--literal-file-bytes path))))
+        (epi-test-ledger-io--wave5-with-process
+          (epi-ledger--append
+           ledger
+           (vector (epi-test-ledger-io--recovery-turn-interrupted))))
+        (check ledger t)
+        (epi-test-ledger-io--wave5-with-process
+          (epi-ledger--append
+           ledger
+           (vector (epi-test-ledger-io--recovery-operation-interrupted))))
+        (check ledger nil)
+        (check (epi-ledger-open path) nil)))))
+
+(ert-deftest epi-ledger-recovery-origin-admits-exact-terminalization-matrix ()
+  (let* ((full (epi-test-ledger-io--full-drafts))
+         (turn-and-operation
+          (list (epi-test-ledger-io--recovery-turn-interrupted)
+                (epi-test-ledger-io--recovery-operation-interrupted)))
+         (denied
+          (append
+           (list (epi-test-ledger-io--recovery-tool-denied)
+                 (epi-test-ledger-io--recovery-denied-result))
+           turn-and-operation))
+         (safe-started
+          (append
+           (list (epi-test-ledger-io--recovery-tool-error)
+                 (epi-test-ledger-io--recovery-error-result))
+           turn-and-operation))
+         (uncertain-started
+          (list
+           (epi-test-ledger-io--recovery-tool-uncertain)
+           (epi-test-ledger-io--recovery-turn-interrupted
+            "tool-uncertain")
+           (epi-test-ledger-io--recovery-operation-interrupted
+            nil "tool-uncertain")))
+         (already-uncertain
+          (append (cl-subseq full 0 8)
+                  (list (epi-test-ledger-io--recovery-tool-uncertain))))
+         (uncertain-terminals
+          (list
+           (epi-test-ledger-io--recovery-turn-interrupted
+            "tool-uncertain")
+           (epi-test-ledger-io--recovery-operation-interrupted
+            nil "tool-uncertain")))
+         (cases
+          (list
+           (list 'operation-only (cl-subseq full 0 2)
+                 (list (epi-test-ledger-io--recovery-operation-interrupted)))
+           (list 'intended-message (cl-subseq full 0 3) turn-and-operation)
+           (list 'open-turn (cl-subseq full 0 4) turn-and-operation)
+           (list 'proposal (cl-subseq full 0 5) turn-and-operation)
+           (list 'planned (cl-subseq full 0 6) denied)
+           (list 'approved (cl-subseq full 0 7) denied)
+           (list 'started-safe (cl-subseq full 0 8) safe-started)
+           (list 'started-uncertain
+                 (cl-subseq full 0 8) uncertain-started)
+           (list 'result-pending (cl-subseq full 0 9)
+                 (append
+                  (list (epi-test-ledger-io--tool-result))
+                  turn-and-operation))
+           (list 'already-uncertain already-uncertain uncertain-terminals)
+           (list 'select-await-leaf
+                 (epi-test-ledger-io--recovery-select-prefix)
+                 (list (epi-test-ledger-io--recovery-select-interrupted)))
+           (list 'select-await-terminal
+                 (epi-test-ledger-io--recovery-select-prefix t)
+                 (list (epi-test-ledger-io--recovery-select-interrupted))))))
+    (dolist (case cases)
+      (ert-info ((format "terminalization class %S" (car case)))
+        (let ((baseline
+               (epi-test-ledger-io--recovery-history
+                (nth 1 case) :suffix (nth 2 case)))
+              (recovered
+               (epi-test-ledger-io--recovery-history
+                (nth 1 case) :origins '(fresh) :suffix (nth 2 case))))
+          ;; This control proves the terminal sequence itself is valid and the
+          ;; recovered assertion tests only the recovery adjacency exception.
+          (should
+           (epi-ledger-p
+            (epi-test-ledger-io--recovery-open-bytes
+             (plist-get baseline :bytes))))
+          (should
+            (epi-ledger-p
+             (epi-test-ledger-io--recovery-open-bytes
+             (plist-get recovered :bytes)))))))))
+
+(ert-deftest epi-ledger-recovery-origin-rejects-terminalization-near-misses ()
+  (let* ((full (epi-test-ledger-io--full-drafts))
+         (already-uncertain
+          (append (cl-subseq full 0 8)
+                  (list (epi-test-ledger-io--recovery-tool-uncertain))))
+         (cases
+          (list
+           (list
+            'denial-reason (cl-subseq full 0 6)
+            (epi-test-ledger-io--recovery-set-draft-field
+             (epi-test-ledger-io--recovery-tool-denied)
+             "reason" "operation-failed")
+            'recovery-terminalization-required)
+           (list
+            'denial-result (cl-subseq full 0 6)
+            (epi-test-ledger-io--recovery-set-draft-field
+             (epi-test-ledger-io--recovery-tool-denied)
+             "model_result" "Rejected")
+            'recovery-terminalization-required)
+           (list
+            'interruption-detail (cl-subseq full 0 8)
+            (epi-test-ledger-io--recovery-set-draft-field
+             (epi-test-ledger-io--recovery-tool-error)
+             "details" '(("code" . "timeout")))
+            'recovery-terminalization-required)
+           (list
+            'interruption-result (cl-subseq full 0 8)
+            (epi-test-ledger-io--recovery-set-draft-field
+             (epi-test-ledger-io--recovery-tool-error)
+             "model_result" "Failed")
+            'recovery-terminalization-required)
+           (list
+            'uncertain-detail (cl-subseq full 0 8)
+            (epi-test-ledger-io--recovery-set-draft-field
+             (epi-test-ledger-io--recovery-tool-uncertain)
+             "details" '(("code" . "unexpected")))
+            'recovery-terminalization-required)
+           (list
+            'turn-reason (cl-subseq full 0 4)
+            (epi-test-ledger-io--recovery-turn-interrupted
+             "tool-uncertain")
+            'interrupted-terminal-reason)
+           (list
+            'operation-reason (cl-subseq full 0 2)
+            (epi-test-ledger-io--recovery-operation-interrupted
+             nil "tool-uncertain")
+            'interrupted-terminal-reason)
+           (list
+            'uncertain-turn-reason already-uncertain
+            (epi-test-ledger-io--recovery-turn-interrupted "interrupted")
+            'uncertain-terminal-detail))))
+    (dolist (case cases)
+      (ert-info ((format "terminalization near miss %S" (car case)))
+        (let* ((history
+                (epi-test-ledger-io--recovery-history
+                 (nth 1 case) :origins '(fresh)
+                 :suffix (list (nth 2 case))))
+               (condition
+                (should-error
+                 (epi-test-ledger-io--recovery-open-bytes
+                  (plist-get history :bytes))
+                 :type 'epi-ledger-corrupt)))
+          (should
+           (eq (nth 3 case)
+               (epi-test-ledger-io--condition-code condition))))))))
+
+(ert-deftest epi-ledger-recovery-origin-rejects-nonrecovery-continuations ()
+  (let* ((full (epi-test-ledger-io--full-drafts))
+         (already-uncertain
+          (append (cl-subseq full 0 8)
+                  (list (epi-test-ledger-io--recovery-tool-uncertain))))
+         (cases
+          (list
+           (list 'operation-only (cl-subseq full 0 2)
+                 (list (epi-test-ledger-io--turn-started)))
+           (list 'intended-message (cl-subseq full 0 3)
+                 (list (epi-test-ledger-io--user-message)))
+           (list 'open-turn (cl-subseq full 0 4)
+                 (list (epi-test-ledger-io--proposal)))
+           (list 'proposal (cl-subseq full 0 5)
+                 (list (epi-test-ledger-io--tool-planned)))
+           (list 'planned (cl-subseq full 0 6)
+                 (list (epi-test-ledger-io--tool-approved)))
+           (list 'approved (cl-subseq full 0 7)
+                 (list (epi-test-ledger-io--tool-started)))
+           (list 'started (cl-subseq full 0 8)
+                 (list (epi-test-ledger-io--tool-finished)))
+           (list 'result-pending (cl-subseq full 0 9)
+                 (list (epi-test-ledger-io--tool-result)
+                       (epi-test-ledger-io--turn-finished)))
+           (list 'already-uncertain already-uncertain
+                 (list (epi-test-ledger-io--recovery-turn-failed)))
+           (list 'select-await-leaf
+                 (epi-test-ledger-io--recovery-select-prefix)
+                 (list (epi-test-ledger-io--recovery-select-leaf)))
+           (list 'select-await-terminal
+                 (epi-test-ledger-io--recovery-select-prefix t)
+                 (list (epi-test-ledger-io--recovery-select-finished))))))
+    (dolist (case cases)
+      (ert-info ((format "forbidden continuation class %S" (car case)))
+        (let* ((baseline
+                (epi-test-ledger-io--recovery-history
+                 (nth 1 case) :suffix (nth 2 case)))
+               (recovered
+                (epi-test-ledger-io--recovery-history
+                 (nth 1 case) :origins '(fresh) :suffix (nth 2 case))))
+          ;; Without an origin, each continuation is intentionally valid.
+          (should
+           (epi-ledger-p
+            (epi-test-ledger-io--recovery-open-bytes
+             (plist-get baseline :bytes))))
+          (let ((condition
+                 (should-error
+                  (epi-test-ledger-io--recovery-open-bytes
+                   (plist-get recovered :bytes))
+                  :type 'epi-ledger-corrupt)))
+            (should
+             (eq 'recovery-terminalization-required
+                 (epi-test-ledger-io--condition-code condition)))))))))
+
+(ert-deftest epi-ledger-recovery-origin-settled-prefix-needs-no-terminalization ()
+  (let* ((full (epi-test-ledger-io--full-drafts))
+         (next (list (epi-test-ledger-io--recovery-next-operation)))
+         (baseline
+          (epi-test-ledger-io--recovery-history full :suffix next))
+         (recovered
+          (epi-test-ledger-io--recovery-history
+           full :origins '(fresh) :suffix next)))
+    (should
+     (epi-ledger-p
+      (epi-test-ledger-io--recovery-open-bytes
+       (plist-get baseline :bytes))))
+    (should
+     (epi-ledger-p
+      (epi-test-ledger-io--recovery-open-bytes
+       (plist-get recovered :bytes))))))
+
 
 (provide 'epi-ledger-io-test)
 
