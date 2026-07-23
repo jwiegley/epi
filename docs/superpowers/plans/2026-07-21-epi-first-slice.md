@@ -1130,9 +1130,13 @@ test, and frozen-scope reviews. Wave 5's close gate passed 496/496 ledger tests
 across three parallel shards, 342/342 codec/JCS tests, 79/79 GPTel tests, 30/30
 package tests, 26/26 preflight tests, warning-as-error byte compilation,
 Checkdoc, parenthesis, diff, and Pandoc gates, plus independent production,
-test, resource, and frozen-scope reviews. Wave 6 restart reconciliation is the
-next implementation boundary. The remaining Task 6 checkboxes deliberately
-stay open until their resume and refusal behavior exists.
+test, resource, and frozen-scope reviews. Wave 6a.1 is committed as `84ea7d3`:
+the strict file-level restart helper converges source-only, exact same-inode
+dual-name, and target-only states while failing closed on conflicting or
+drifting authority. Wave 6a.2, the complete two-root evidence-tree union
+converger, is the next implementation boundary. The remaining Task 6
+checkboxes deliberately stay open until their resume and refusal behavior
+exists.
 
 **Wave 5 committed checkpoint (2026-07-23):** commit
 `501be5b77d414a7dc0ae8f0edbd8d7e8947ff704` advances through

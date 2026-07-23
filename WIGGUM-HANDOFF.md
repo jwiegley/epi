@@ -1,13 +1,14 @@
 # Epi Implementation Wiggum Handoff
 
-Status: Tasks 1–5 complete; Task 6 Waves 0–5 complete and Wave 6 is next; productization remains at its approved later integration boundary
+Status: Tasks 1–5 complete; Task 6 Waves 0–5 and Wave 6a.1 complete; halted cleanly before Wave 6a.2; productization remains at its approved later integration boundary
 
 Last updated: 2026-07-23
 
 ## Current implementation run
 
 The active objective is to implement the approved first slice under the Wiggum
-loop. Tasks 1–5 and Task 6 Waves 0–5 are complete on the isolated feature
+loop. Work is paused at the user's explicit halt boundary. Tasks 1–5, Task 6
+Waves 0–5, and Task 6 Wave 6a.1 are complete on the isolated feature
 branch. The package foundation, pinned GPTel seam, canonical ledger codec,
 semantic loader, private storage/append layer, tail inspector, recovery
 semantics, deterministic reseal, closed recovery preparation, and private
@@ -101,9 +102,10 @@ reseal, closed same-device preflight, verified bounded object inventory, and
 exclusively published canonical `prepared` and `objects-transferred` manifests,
 with exact private object and destination-ledger staging. Wave 5 additionally
 publishes destination objects before the ledger and preserves the complete
-original evidence through manifest-driven staging and quarantine. Wave 6
-restart reconciliation is next. All changes remain in the isolated feature
-worktree; `main` remains outside the implementation path.
+original evidence through manifest-driven staging and quarantine. Wave 6a.1
+adds the strict file-level restart converger at `84ea7d3`; Wave 6a.2, the
+evidence-tree union converger, is next. All changes remain in the isolated
+feature worktree; `main` remains outside the implementation path.
 
 The user also invoked `command-productize`. Read-only reconnaissance and
 current-tool research are complete. Productization integrates after Task 15
@@ -337,8 +339,15 @@ branch tracks `origin/codex/epi-first-slice` and is pushed at task checkpoints.
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
    install a dependency, enter `nix develop`, or substitute installed Pi.
-4. Resume Task 6 at Wave 6 test-first in its exact file scope. First implement
-   the two-root file/evidence converger; then disk-only phase rehydration and
+4. Resume Task 6 at Wave 6a.2 test-first in its exact file scope. The
+   file-level converger is already committed at `84ea7d3`; first implement the
+   complete two-root evidence-tree census, union convergence, exact-empty
+   source pruning, and final target proof. Feed it only the historical
+   manifest `reachable_objects`; the current fragment object belongs to the
+   recovered destination store and is not original quarantine evidence. Enter
+   this tree helper only for durable `source_object_state = present`; the
+   absent-source marker is a separate 6a.1 file transition integrated later.
+   Then implement disk-only phase rehydration and
    source/destination lock reacquisition; then the seven-phase iterative resume
    loop and cleanup; finally add representative adversarial constructed states.
    Preserve Waves 0–5 and Task 5 storage/locking behavior as the regression
@@ -501,7 +510,27 @@ Task 6 progress facts:
   the committed test SHA-256 is
   `94bd4ad0e4a5e69b42b26e5c97d6b31ac1a1bff2ed214089d61c20beb040868b`.
   The commit is published at `origin/codex/epi-first-slice`.
-- Wave 6 is the next boundary. Task 6 must implement production restart
+- Wave 6a.1 is
+  `84ea7d37d8bb2034e2e448b5187ff213534ad788`
+  (`feat: reconcile interrupted Epi file moves`). It handles source-only,
+  exact same-inode dual-name, and target-only file states; rejects conflicting
+  inodes, extra links, wrong mode/device, both-absent state, and verifier or
+  closure drift; and preserves a mutation-free repeated target-only call. Its
+  focused 8/8 selector, adjacent 7/7 legacy mover selector, linked-verifier
+  selector, warning-as-error compilation, Checkdoc, parenthesis, diff, and
+  independent final review passed. The commit is pushed and the worktree is
+  clean.
+- Wave 6a.2 is the next boundary. No Wave 6a.2 test or production edit exists
+  at this halt. Read-only design work froze the following contract: preflight
+  and authenticate both roots before mutation; admit source-only, target-only,
+  and exact same-inode dual leaves; preserve the complete valid union including
+  unreachable leaves and empty topology; require every persisted historical
+  reachable object; converge leaves through the 6a.1 helper; prove the final
+  target; prune only captured exact-empty source directories bottom-up; and
+  make a repeated target-only invocation mutation-free. Debris, distinct
+  inodes for one canonical hash, missing required reachable objects, replaced
+  roots, or closure drift must fail without mutation.
+- Task 6 must implement production restart
   reconciliation for every durable phase and prove representative constructed
   pre-action/post-action states, including split roots and the
   post-link/pre-unlink case. Task 15 retains actual worker-process deaths,
@@ -514,15 +543,33 @@ Task 6 progress facts:
   missing from both roots. Persisting that stronger proof would be a later
   schema capability, not Task 6 work.
 
+## Halt checkpoint — 2026-07-23 15:51 PDT
+
+- The user requested `command-halt`; all Wave 6a.2 parallel workers were
+  interrupted immediately. They made no shared-worktree edits.
+- The exact implementation tip at halt is
+  `84ea7d37d8bb2034e2e448b5187ff213534ad788`, identical to
+  `origin/codex/epi-first-slice` before this documentation checkpoint.
+- No implementation test was running and no untracked implementation artifact
+  remained. The only new work after `84ea7d3` is this durable halt
+  documentation and the external remaining-scope report named below.
+- Resume in
+  `/Users/johnw/src/dot-emacs/lisp/epi/.worktrees/epi-first-slice` on
+  `codex/epi-first-slice`. Do not implement on `main`.
+- The comprehensive remaining-scope and requirements report is
+  `/Users/johnw/dl/20260723T1551-EPI-PHASE1-HALT-REMAINING-SCOPE.md`.
+- At the end of every resumed subtask, run the `fess` skill and record or fix
+  every finding before claiming that subtask complete.
+
 ## Stop-and-escalate counters
 
 - Repeated failing gate signature: 0/3.
 - Maximum unusable outputs from any one reviewer: 1/2; each affected reviewer
   recovered after one neutral local-quality prompt.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: none. Tasks 1–5 and Task 6 Waves 0–5 are committed and
-  pushed; Wave 6 is next and all exact source inputs remain present and
-  validated.
+- Current stop reason: explicit user-requested halt. Tasks 1–5, Task 6 Waves
+  0–5, and Wave 6a.1 are committed and pushed; Wave 6a.2 is next and all exact
+  source inputs remain present and validated.
 - Terminal integration issue: none. The public remote, 20 `phase1` issues,
   and linked Phase 1 project now exist; the feature branch is published at its
   exact checkpoint.
