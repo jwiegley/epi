@@ -23413,6 +23413,427 @@ Return the number of distinct strings changed."
       (insert bytes)
       (write-region (point-min) (point-max) path nil 'silent))))
 
+(defun epi-test-wave6--file-parent-identity (path)
+  "Return PATH's current exact parent-directory identity."
+  (epi-ledger--recovery-raw-directory-stat
+   (directory-file-name (file-name-directory path))))
+
+(defun epi-test-wave6--file-state-snapshot (paths)
+  "Return exact identity, mode, and bytes for every existing name in PATHS."
+  (mapcar
+   (lambda (path)
+     (let ((identity (epi-ledger--raw-object-name-state path)))
+       (list
+        path identity
+        (and identity (epi-ledger--recovery-raw-mode path))
+        (and (file-regular-p path)
+             (epi-test-ledger-io--literal-file-bytes path)))))
+   paths))
+
+(ert-deftest
+    epi-ledger-recovery-converge-file-move-completes-source-only ()
+  "Resume moves one authenticated source-only name to its target."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--link-move-case root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (bytes (plist-get case :bytes))
+           verifier-links
+           (result
+            (epi-ledger--recovery-converge-file-move
+             source target (plist-get case :device)
+             (epi-test-wave6--file-parent-identity source)
+             (epi-test-wave6--file-parent-identity target)
+             (lambda (path identity links)
+               (push links verifier-links)
+               (epi-ledger--recovery-require-exact-file-bytes
+                path identity bytes 'recovery-path-conflict links)))))
+      (should (equal '(2 1) verifier-links))
+      (should-not (file-exists-p source))
+      (should (equal result (epi-ledger--raw-object-name-state target)))
+      (should
+       (epi-ledger--same-file-object-p
+        (plist-get case :source-identity) result))
+      (should (= 1 (plist-get result :links)))
+      (should (= #o600 (epi-ledger--recovery-raw-mode target)))
+      (should
+       (equal bytes (epi-test-ledger-io--literal-file-bytes target))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-file-move-completes-dual-link ()
+  "Resume removes only the source name of one authenticated dual link."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--link-move-case root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (bytes (plist-get case :bytes))
+           verifier-links result)
+      (add-name-to-file source target nil)
+      (setq result
+            (epi-ledger--recovery-converge-file-move
+             source target (plist-get case :device)
+             (epi-test-wave6--file-parent-identity source)
+             (epi-test-wave6--file-parent-identity target)
+             (lambda (path identity links)
+               (push links verifier-links)
+               (epi-ledger--recovery-require-exact-file-bytes
+                path identity bytes 'recovery-path-conflict links))))
+      (should (equal '(2) verifier-links))
+      (should-not (file-exists-p source))
+      (should (equal result (epi-ledger--raw-object-name-state target)))
+      (should
+       (epi-ledger--same-file-object-p
+        (plist-get case :source-identity) result))
+      (should (= 1 (plist-get result :links)))
+      (should
+       (equal bytes (epi-test-ledger-io--literal-file-bytes target))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-file-move-accepts-target-only ()
+  "Resume authenticates an already completed target-only file move."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--link-move-case root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (bytes (plist-get case :bytes))
+           verifier-links result repeated)
+      (add-name-to-file source target nil)
+      (delete-file source)
+      (setq result
+            (epi-ledger--recovery-converge-file-move
+             source target (plist-get case :device)
+             (epi-test-wave6--file-parent-identity source)
+             (epi-test-wave6--file-parent-identity target)
+             (lambda (path identity links)
+               (push links verifier-links)
+               (epi-ledger--recovery-require-exact-file-bytes
+                path identity bytes 'recovery-path-conflict links))))
+      (should (equal '(1) verifier-links))
+      (should-not (file-exists-p source))
+      (should (equal result (epi-ledger--raw-object-name-state target)))
+      (should
+       (epi-ledger--same-file-object-p
+        (plist-get case :source-identity) result))
+      (should (= 1 (plist-get result :links)))
+      (should
+       (equal bytes (epi-test-ledger-io--literal-file-bytes target)))
+      (cl-letf
+          (((symbol-function 'add-name-to-file)
+            (lambda (&rest arguments)
+              (ert-fail
+               (format "Repeated target-only linked: %S" arguments))))
+           ((symbol-function 'delete-file)
+            (lambda (&rest arguments)
+              (ert-fail
+               (format "Repeated target-only deleted: %S" arguments))))
+           ((symbol-function 'write-region)
+            (lambda (&rest arguments)
+              (ert-fail
+               (format "Repeated target-only wrote: %S" arguments)))))
+        (setq repeated
+              (epi-ledger--recovery-converge-file-move
+               source target (plist-get case :device)
+               (epi-test-wave6--file-parent-identity source)
+               (epi-test-wave6--file-parent-identity target)
+               (lambda (path identity links)
+                 (epi-ledger--recovery-require-exact-file-bytes
+                  path identity bytes 'recovery-path-conflict links)))))
+      (should (equal result repeated)))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-file-move-rejects-conflicting-target ()
+  "Resume leaves distinct source and target files untouched on conflict."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--link-move-case root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (bytes (plist-get case :bytes))
+           (foreign (string-as-unibyte "foreign-evidence"))
+           (verifier-calls 0))
+      (epi-ledger--write-bytes target foreign 'exclusive-create t)
+      (set-file-modes target #o600)
+      (let ((source-before (epi-ledger--stat-local-file source))
+            (target-before (epi-ledger--stat-local-file target))
+            (condition
+             (should-error
+              (epi-ledger--recovery-converge-file-move
+               source target (plist-get case :device)
+               (epi-test-wave6--file-parent-identity source)
+               (epi-test-wave6--file-parent-identity target)
+               (lambda (path identity links)
+                 (setq verifier-calls (1+ verifier-calls))
+                 (epi-ledger--recovery-require-exact-file-bytes
+                  path identity bytes 'recovery-path-conflict links)))
+              :type 'epi-ledger-conflict)))
+        (should
+         (eq 'recovery-path-conflict
+             (epi-test-ledger-io--condition-code condition)))
+        (should (= 0 verifier-calls))
+        (should (equal source-before (epi-ledger--stat-local-file source)))
+        (should (equal target-before (epi-ledger--stat-local-file target)))
+        (should
+         (equal bytes (epi-test-ledger-io--literal-file-bytes source)))
+        (should
+         (equal foreign (epi-test-ledger-io--literal-file-bytes target)))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-file-move-rejects-ambiguous-states ()
+  "Resume rejects ambiguous topology before content callbacks or mutation."
+  (dolist (shape '(same-bytes-distinct-inode target-extra-link
+                   dual-third-link wrong-mode wrong-device both-absent))
+    (epi-test-with-temporary-root (root)
+      (let* ((case (epi-test-wave5--link-move-case root))
+             (source (plist-get case :source))
+             (target (plist-get case :target))
+             (bytes (plist-get case :bytes))
+             (third (expand-file-name "third-name" root))
+             (device (plist-get case :device))
+             (call-device device)
+             (verifier-calls 0))
+        (pcase shape
+          ('same-bytes-distinct-inode
+           (epi-ledger--write-bytes target bytes 'exclusive-create t)
+           (set-file-modes target #o600))
+          ('target-extra-link
+           (add-name-to-file source target nil)
+           (delete-file source)
+           (add-name-to-file target third nil))
+          ('dual-third-link
+           (add-name-to-file source target nil)
+           (add-name-to-file source third nil))
+          ('wrong-mode
+           (set-file-modes source #o640))
+          ('wrong-device
+           (setq call-device
+                 (if (integerp device)
+                     (1+ device)
+                   (cons (1+ (car device)) (cdr device)))))
+          ('both-absent
+           (delete-file source)))
+        (let* ((paths (list source target third))
+               (before (epi-test-wave6--file-state-snapshot paths))
+               (condition
+                (should-error
+                 (epi-ledger--recovery-converge-file-move
+                  source target call-device
+                  (epi-test-wave6--file-parent-identity source)
+                  (epi-test-wave6--file-parent-identity target)
+                  (lambda (path identity links)
+                    (setq verifier-calls (1+ verifier-calls))
+                    (epi-ledger--recovery-require-exact-file-bytes
+                     path identity bytes 'recovery-path-conflict links)))
+                 :type 'epi-ledger-conflict)))
+          (ert-info ((format "ambiguous shape: %S" shape))
+            (should
+             (eq 'recovery-path-conflict
+                 (epi-test-ledger-io--condition-code condition)))
+            (should (= 0 verifier-calls))
+            (should
+             (equal before (epi-test-wave6--file-state-snapshot paths)))))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-file-move-recloses-after-verifier-drift ()
+  "Resume never unlinks source after target or parent authority drifts."
+  (dolist (shape '(dual-target target-only-target
+                   dual-target-parent target-only-source-parent))
+    (epi-test-with-temporary-root (root)
+      (let* ((case (epi-test-wave5--link-move-case root))
+             (source (plist-get case :source))
+             (target (plist-get case :target))
+             (bytes (plist-get case :bytes))
+             (replacement (string-as-unibyte "replacement-evid"))
+             (dual (memq shape '(dual-target dual-target-parent)))
+             (source-parent
+              (directory-file-name (file-name-directory source)))
+             (target-parent
+              (directory-file-name (file-name-directory target)))
+             (displaced
+              (concat
+               (if (eq shape 'target-only-source-parent)
+                   source-parent
+                 target-parent)
+               "-displaced"))
+             (real-delete (symbol-function 'delete-file))
+             (source-delete-calls 0)
+             condition)
+        (add-name-to-file source target nil)
+        (unless dual (delete-file source))
+        (cl-letf
+            (((symbol-function 'delete-file)
+              (lambda (path &optional trash)
+                (when (equal path source)
+                  (setq source-delete-calls (1+ source-delete-calls)))
+                (funcall real-delete path trash))))
+          (setq condition
+                (should-error
+                 (epi-ledger--recovery-converge-file-move
+                  source target (plist-get case :device)
+                  (epi-test-wave6--file-parent-identity source)
+                  (epi-test-wave6--file-parent-identity target)
+                  (lambda (path identity links)
+                    (let ((verified
+                           (epi-ledger--recovery-require-exact-file-bytes
+                            path identity bytes
+                            'recovery-path-conflict links)))
+                      (pcase shape
+                        ((or 'dual-target 'target-only-target)
+                         (funcall real-delete target)
+                         (epi-ledger--write-bytes
+                          target replacement 'exclusive-create t)
+                         (set-file-modes target #o600))
+                        ('dual-target-parent
+                         (rename-file target-parent displaced nil)
+                         (make-directory target-parent)
+                         (set-file-modes target-parent #o700))
+                        ('target-only-source-parent
+                         (rename-file source-parent displaced nil)
+                         (make-directory source-parent)
+                         (set-file-modes source-parent #o700)))
+                      verified)))
+                 :type 'epi-ledger-conflict)))
+        (ert-info ((format "post-verifier drift: %S" shape))
+          (should
+           (eq 'recovery-path-conflict
+               (epi-test-ledger-io--condition-code condition)))
+          (should (= 0 source-delete-calls))
+          (when dual
+            (should (file-regular-p source))
+            (should
+             (equal bytes
+                    (epi-test-ledger-io--literal-file-bytes source))))
+          (when (memq shape '(dual-target target-only-target))
+            (should
+             (equal replacement
+                    (epi-test-ledger-io--literal-file-bytes target))))
+          (when (eq shape 'dual-target-parent)
+            (should
+             (equal bytes
+                    (epi-test-ledger-io--literal-file-bytes
+                     (expand-file-name
+                      (file-name-nondirectory target)
+                      (file-name-as-directory displaced))))))
+          (when (eq shape 'target-only-source-parent)
+            (should
+             (equal bytes
+                    (epi-test-ledger-io--literal-file-bytes target)))))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-file-move-preserves-closure-boundaries ()
+  "Dual convergence keeps cooperative verification and masks final unlink."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--link-move-case root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (bytes (plist-get case :bytes))
+           (real-delete (symbol-function 'delete-file))
+           verifier-threshold verifier-hook delete-threshold delete-hook
+           delete-inhibit delete-yield result)
+      (add-name-to-file source target nil)
+      (let ((gc-cons-threshold 12345)
+            (post-gc-hook (list #'ignore))
+            (epi--yield-function (lambda () nil)))
+        (cl-letf
+            (((symbol-function 'delete-file)
+              (lambda (path &optional trash)
+                (when (equal path source)
+                  (setq delete-threshold gc-cons-threshold
+                        delete-hook post-gc-hook
+                        delete-inhibit inhibit-quit
+                        delete-yield epi--yield-function))
+                (funcall real-delete path trash))))
+          (setq result
+                (epi-ledger--recovery-converge-file-move
+                 source target (plist-get case :device)
+                 (epi-test-wave6--file-parent-identity source)
+                 (epi-test-wave6--file-parent-identity target)
+                 (lambda (path identity links)
+                   (setq verifier-threshold gc-cons-threshold
+                         verifier-hook post-gc-hook)
+                   (garbage-collect)
+                   (epi-ledger--recovery-require-exact-file-bytes
+                    path identity bytes 'recovery-path-conflict links))))))
+      (should (= 12345 verifier-threshold))
+      (should-not verifier-hook)
+      (should (= most-positive-fixnum delete-threshold))
+      (should-not delete-hook)
+      (should (eq t delete-inhibit))
+      (should (eq #'ignore delete-yield))
+      (should-not (file-exists-p source))
+      (should (equal result (epi-ledger--raw-object-name-state target))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-file-move-preserves-errors-and-unlink-failure
+    ()
+  "Resume preserves structured verifier errors and uncertain dual unlink."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--link-move-case root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (bytes (plist-get case :bytes))
+           condition)
+      (add-name-to-file source target nil)
+      (delete-file source)
+      (setq condition
+            (should-error
+             (epi-ledger--recovery-converge-file-move
+              source target (plist-get case :device)
+              (epi-test-wave6--file-parent-identity source)
+              (epi-test-wave6--file-parent-identity target)
+              (lambda (&rest _arguments)
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'recovery-object-content-changed)))
+             :type 'epi-ledger-conflict))
+      (should
+       (eq 'recovery-object-content-changed
+           (epi-test-ledger-io--condition-code condition)))
+      (should-not (file-exists-p source))
+      (should
+       (equal bytes (epi-test-ledger-io--literal-file-bytes target)))))
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--link-move-case root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (bytes (plist-get case :bytes))
+           (real-delete (symbol-function 'delete-file))
+           (unlink-attempts 0)
+           condition)
+      (add-name-to-file source target nil)
+      (cl-letf
+          (((symbol-function 'delete-file)
+            (lambda (path &optional trash)
+              (if (equal path source)
+                  (progn
+                    (setq unlink-attempts (1+ unlink-attempts))
+                    (signal 'file-error '("injected source unlink failure")))
+                (funcall real-delete path trash)))))
+        (setq condition
+              (should-error
+               (epi-ledger--recovery-converge-file-move
+                source target (plist-get case :device)
+                (epi-test-wave6--file-parent-identity source)
+                (epi-test-wave6--file-parent-identity target)
+                (lambda (path identity links)
+                  (epi-ledger--recovery-require-exact-file-bytes
+                   path identity bytes 'recovery-path-conflict links)))
+               :type 'epi-ledger-conflict)))
+      (should (= 1 unlink-attempts))
+      (should
+       (eq 'storage-publication-failed
+           (epi-test-ledger-io--condition-code condition)))
+      (should
+       (eq t
+           (plist-get
+            (epi-ledger--condition-plist condition) :published)))
+      (dolist (path (list source target))
+        (let ((identity (epi-ledger--raw-object-name-state path)))
+          (should
+           (epi-ledger--same-file-object-p
+            (plist-get case :source-identity) identity))
+          (should (= 2 (plist-get identity :links)))
+          (should
+           (equal bytes
+                  (epi-test-ledger-io--literal-file-bytes path))))))))
+
 (ert-deftest
     epi-ledger-recovery-publication-linked-verifiers-slice-reads-and-yield ()
   "Every production linked verifier cooperates and bounds physical reads."

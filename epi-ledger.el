@@ -17794,6 +17794,263 @@ and source unlink then run in one callback-free epoch."
           (setq final target-after))))
     final))
 
+(defun epi-ledger--recovery-converge-file-move
+    (source target device source-parent-identity target-parent-identity
+            content-verifier)
+  "Converge an authenticated interrupted file move from SOURCE to TARGET.
+DEVICE, SOURCE-PARENT-IDENTITY, and TARGET-PARENT-IDENTITY bind the admitted
+root pair.
+CONTENT-VERIFIER receives PATH, its exact identity, and the expected link
+count, and must return that same identity after complete caller-specific
+authentication.  Admit source-only, exact same-inode dual-name, or target-only
+states.  Reject every conflicting or missing state without guessed adoption."
+  (let* ((owned-source
+          (and (stringp source) (substring-no-properties source)))
+         (owned-target
+          (and (stringp target) (substring-no-properties target)))
+         (owned-source-parent
+          (condition-case nil
+              (epi-ledger--recovery-copy-directory-identity
+               source-parent-identity)
+            (error nil)))
+         (owned-target-parent
+          (condition-case nil
+              (epi-ledger--recovery-copy-directory-identity
+               target-parent-identity)
+            (error nil)))
+         (source-parent
+          (and owned-source
+               (directory-file-name
+                (file-name-directory owned-source))))
+         (target-parent
+          (and owned-target
+               (directory-file-name
+                (file-name-directory owned-target))))
+         source-state target-state)
+    (unless
+        (and owned-source owned-target
+             (not (equal owned-source owned-target))
+             (functionp content-verifier)
+             (epi-ledger--device-token-p device)
+             owned-source-parent owned-target-parent
+             (equal source-parent
+                    (plist-get owned-source-parent :path))
+             (equal target-parent
+                    (plist-get owned-target-parent :path))
+             (equal device (plist-get owned-source-parent :device))
+             (equal device (plist-get owned-target-parent :device))
+             (equal
+              owned-source
+              (condition-case nil
+                  (epi-ledger--resolve-local-write-path owned-source)
+                (error nil)))
+             (equal
+              owned-target
+              (condition-case nil
+                  (epi-ledger--resolve-local-write-path owned-target)
+                (error nil))))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (epi-ledger--recovery-require-separated-top-level-paths
+     (list owned-source owned-target)
+     (epi-ledger--recovery-path-set-case-insensitive-p
+      (list owned-source owned-target)))
+    (setq owned-source-parent
+          (epi-ledger--recovery-require-bound-directory-raw
+           source-parent owned-source-parent device)
+          owned-target-parent
+          (epi-ledger--recovery-require-bound-directory-raw
+           target-parent owned-target-parent device)
+          source-state
+          (epi-ledger--raw-object-name-state owned-source)
+          target-state
+          (epi-ledger--raw-object-name-state owned-target))
+    (cl-labels
+        ((private-mode-p
+          (path)
+          (equal
+           #o600
+           (condition-case nil
+               (epi-ledger--recovery-raw-mode path)
+             (error nil))))
+         (verify
+          (path identity links)
+          (let ((file-name-handler-alist nil)
+                (post-gc-hook nil)
+                (epi-ledger--stat-function
+                 #'epi-ledger--stat-local-file)
+                (epi-ledger--directory-stat-function
+                 #'epi-ledger--stat-local-directory)
+                (epi-ledger--read-function #'epi-ledger--read-bytes)
+                (epi-ledger--nonpreemptible-observer nil)
+                verified)
+            (setq verified
+                  (condition-case condition
+                      (epi-ledger--recovery-copy-file-identity
+                       (funcall
+                        content-verifier path
+                        (epi-ledger--recovery-copy-file-identity identity)
+                        links))
+                    (epi-limit-exceeded
+                     (signal (car condition) (cdr condition)))
+                    (quit (signal (car condition) (cdr condition)))
+                    (epi-ledger-conflict
+                     (signal (car condition) (cdr condition)))
+                    (error nil)))
+            (unless
+                (and verified
+                     (equal identity verified)
+                     (equal path (plist-get verified :path))
+                     (equal device (plist-get verified :device))
+                     (= links (or (plist-get verified :links) -1))
+                     (private-mode-p path))
+              (epi-ledger--fail
+               'epi-ledger-conflict 'recovery-path-conflict))
+            verified))
+         (close-target-only
+          (verified)
+          (let ((gc-cons-threshold most-positive-fixnum)
+                (inhibit-quit t)
+                (file-name-handler-alist nil)
+                (post-gc-hook nil)
+                (epi--yield-function #'ignore)
+                (epi--deadline-clock-function #'float-time)
+                (epi-ledger--stat-function
+                 #'epi-ledger--stat-local-file)
+                (epi-ledger--directory-stat-function
+                 #'epi-ledger--stat-local-directory))
+            (epi-ledger--recovery-require-bound-directory-raw
+             source-parent owned-source-parent device)
+            (epi-ledger--recovery-require-bound-directory-raw
+             target-parent owned-target-parent device)
+            (let ((source-now
+                   (epi-ledger--raw-object-name-state owned-source))
+                  (target-now
+                   (epi-ledger--raw-object-name-state owned-target)))
+              (unless
+                  (and (null source-now)
+                       (equal verified target-now)
+                       (= 1 (or (plist-get target-now :links) -1))
+                       (private-mode-p owned-target))
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'recovery-path-conflict))
+              target-now)))
+         (close-dual
+          (verified)
+          (let ((gc-cons-threshold most-positive-fixnum)
+                (inhibit-quit t)
+                (file-name-handler-alist nil)
+                (post-gc-hook nil)
+                (epi--yield-function #'ignore)
+                (epi--deadline-clock-function #'float-time)
+                (epi-ledger--stat-function
+                 #'epi-ledger--stat-local-file)
+                (epi-ledger--directory-stat-function
+                 #'epi-ledger--stat-local-directory)
+                final)
+            (epi-ledger--recovery-require-bound-directory-raw
+             source-parent owned-source-parent device)
+            (epi-ledger--recovery-require-bound-directory-raw
+             target-parent owned-target-parent device)
+            (let ((source-now
+                   (epi-ledger--raw-object-name-state owned-source))
+                  (target-now
+                   (epi-ledger--raw-object-name-state owned-target)))
+              (unless
+                  (and (listp source-now)
+                       (equal verified target-now)
+                       (epi-ledger--same-file-object-p
+                        source-now target-now)
+                       (equal device (plist-get source-now :device))
+                       (= (plist-get target-now :size)
+                          (or (plist-get source-now :size) -1))
+                       (= 2 (or (plist-get source-now :links) -1))
+                       (= 2 (or (plist-get target-now :links) -1))
+                       (private-mode-p owned-source)
+                       (private-mode-p owned-target))
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'recovery-path-conflict)))
+            (condition-case nil
+                (delete-file owned-source)
+              (file-error
+               (epi-ledger--fail
+                'epi-ledger-conflict
+                'storage-publication-failed :published t)))
+            (let ((source-after
+                   (epi-ledger--raw-object-name-state owned-source))
+                  (target-after
+                   (epi-ledger--raw-object-name-state owned-target)))
+              (unless
+                  (and (null source-after)
+                       (listp target-after)
+                       (epi-ledger--same-file-object-p
+                        verified target-after)
+                       (equal device (plist-get target-after :device))
+                       (= (plist-get verified :size)
+                          (or (plist-get target-after :size) -1))
+                       (= 1 (or (plist-get target-after :links) -1))
+                       (private-mode-p owned-target))
+                (epi-ledger--fail
+                 'epi-ledger-conflict
+                 'storage-publication-failed :published t))
+              (setq final target-after))
+            (epi-ledger--recovery-require-bound-directory-raw
+             source-parent owned-source-parent device)
+            (epi-ledger--recovery-require-bound-directory-raw
+             target-parent owned-target-parent device)
+            final)))
+      (cond
+       ((and source-state (null target-state))
+        (unless
+            (and
+             (equal
+              source-state
+              (epi-ledger--recovery-require-private-file-state-raw
+               owned-source source-state (plist-get source-state :size)
+               'recovery-path-conflict t 1))
+             (equal device (plist-get source-state :device))
+             (private-mode-p owned-source))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-path-conflict))
+        (setq source-state (verify owned-source source-state 1))
+        (epi-ledger--recovery-link-move-file
+         owned-source owned-target source-state device
+         owned-source-parent owned-target-parent
+         (lambda (path identity)
+           (verify path identity 2))
+         nil))
+       ((and (null source-state) target-state)
+        (unless
+            (and
+             (equal
+              target-state
+              (epi-ledger--recovery-require-private-file-state-raw
+               owned-target target-state (plist-get target-state :size)
+               'recovery-path-conflict t 1))
+             (equal device (plist-get target-state :device))
+             (private-mode-p owned-target))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-path-conflict))
+        (close-target-only (verify owned-target target-state 1)))
+       ((and source-state target-state)
+        (unless
+            (and (epi-ledger--same-file-object-p
+                  source-state target-state)
+                 (equal device (plist-get source-state :device))
+                 (equal device (plist-get target-state :device))
+                 (= (plist-get source-state :size)
+                    (or (plist-get target-state :size) -1))
+                 (= 2 (or (plist-get source-state :links) -1))
+                 (= 2 (or (plist-get target-state :links) -1))
+                 (private-mode-p owned-source)
+                 (private-mode-p owned-target))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-path-conflict))
+        (close-dual (verify owned-target target-state 2)))
+       (t
+        (epi-ledger--fail
+         'epi-ledger-conflict 'recovery-path-conflict))))))
+
 (defun epi-ledger--recovery-object-tree-shape (root items marker-path)
   "Return the expected tree shape rooted at ROOT for ITEMS and MARKER-PATH."
   (let ((sha (expand-file-name "sha256" (file-name-as-directory root)))
