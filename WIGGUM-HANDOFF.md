@@ -621,3 +621,33 @@ Task 6 progress facts:
   `/Users/johnw/dl/20260723T1551-EPI-PHASE1-HALT-REMAINING-SCOPE.md` and was
   refreshed for this stop. Run `fess` at the end of every completed resumed
   subtask.
+
+## Halt checkpoint refresh — 2026-07-23 16:21 PDT
+
+- The continuation loop restarted once more from clean documentation commit
+  `0a3130d3f48744ddcfb9c70f9a4fec64d47148dd`; the user then invoked
+  `command-halt` before the first Wave 6a.2 test or production edit. The
+  implementation tip remains `84ea7d37d8bb2034e2e448b5187ff213534ad788`.
+- Preflight passed 26/26, GPTel passed 79/79, package passed 30/30,
+  warning-as-error compilation exited zero, and Checkdoc passed over all three
+  production files. Codec/JCS was interrupted after 177/342 passing tests and
+  ledger-I/O after 193/504 passing tests, with no reported failure. These are
+  diagnostic prefixes only; restart both suites from zero on resume.
+- The two long test sessions exited with the expected interrupt status,
+  `make clean` removed the build directory, and the worktree buffer audit found
+  no modified Emacs buffer visiting this linked worktree. No Epi test or batch
+  process remains active.
+- The Wave 6a.2 implementation-map worker was interrupted and produced no
+  report. Two read-only workers completed before the halt, and their exact
+  outputs are now durable at
+  `docs/reviews/2026-07-23-wave6a2-tdd-map.md` (SHA-256
+  `1805e8810d8ff2f7810693f32464803ffe781ee690087d6517128617631381c9`) and
+  `docs/reviews/2026-07-23-wave6a2-adversarial-review.md` (SHA-256
+  `49de2dc816321eb8d4256e9565f97472c638432039f82d4a55b1c45ce17eee0f`).
+  They are implementation guidance; the frozen handoff and Task 6 execution
+  brief remain authoritative where wording differs.
+- GitHub issue #20 is returned to Todo; issue #6 remains the In Progress parent.
+  The next shared-worktree action is unchanged: add only the first source-only
+  evidence-tree ERT, demonstrate the intended missing-function red result, and
+  then implement the smallest Wave 6a.2 production surface. Run `fess` after
+  every completed resumed subtask.
