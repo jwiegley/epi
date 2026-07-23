@@ -598,3 +598,26 @@ Task 6 progress facts:
 - On resume, restart the codec/JCS and ledger-I/O baselines from zero; the
   interrupted prefixes are diagnostic evidence only, not completion evidence.
   Run `fess` at the end of every completed resumed subtask.
+
+## Halt checkpoint refresh — 2026-07-23 16:12 PDT
+
+- The continuation loop briefly restarted the frozen baseline from the clean
+  documentation checkpoint `4bf1c73`; the user repeated `command-halt` before
+  any Wave 6a.2 edit. No production, test, plan, design, or fixture file
+  changed.
+- Preflight passed 26/26, GPTel passed 79/79, package passed 30/30,
+  warning-as-error compilation exited zero, and Checkdoc passed over all three
+  production files. Codec/JCS was interrupted after 177/342 passing tests and
+  ledger-I/O after 189/504 passing tests, with no reported failure. These are
+  diagnostic prefixes only; restart both suites from zero on resume.
+- All three read-only Wave 6a.2 workers were interrupted before producing a
+  canonical report or touching the shared worktree. The two long test sessions
+  exited on interrupt, the completed sessions exited zero, and `make clean`
+  removed `.build`.
+- GitHub issue #20 records this exact evidence and is back in Todo. Issue #6
+  remains the In Progress parent. The next implementation action is still the
+  first Wave 6a.2 red evidence-tree test.
+- The comprehensive report remains
+  `/Users/johnw/dl/20260723T1551-EPI-PHASE1-HALT-REMAINING-SCOPE.md` and was
+  refreshed for this stop. Run `fess` at the end of every completed resumed
+  subtask.
