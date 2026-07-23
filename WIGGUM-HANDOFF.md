@@ -1,19 +1,20 @@
 # Epi Implementation Wiggum Handoff
 
-Status: Tasks 1–5 complete; Task 6 Waves 0–3 complete and Wave 4 is next; productization remains at its approved later integration boundary
+Status: Tasks 1–5 complete; Task 6 Waves 0–4 complete and Wave 5 is next; productization remains at its approved later integration boundary
 
-Last updated: 2026-07-22
+Last updated: 2026-07-23
 
 ## Current implementation run
 
 The active objective is to implement the approved first slice under the Wiggum
-loop. Tasks 1–5 and Task 6 Waves 0–3 are complete on the isolated feature
+loop. Tasks 1–5 and Task 6 Waves 0–4 are complete on the isolated feature
 branch. The package foundation, pinned GPTel seam, canonical ledger codec,
 semantic loader, private storage/append layer, tail inspector, recovery
-semantics, deterministic reseal, and closed recovery preparation are committed
+semantics, deterministic reseal, closed recovery preparation, and private
+object/ledger transfer are committed
 as `89a3437`, `a5b6924`, `813ea02`, `7125bfc`, `e14f9b2`, `0abdfe9`,
-`a32cad6`, `bcad789`, and `9caa866`, respectively. The separate Wave 2
-documentation checkpoint is `d49fcbd`.
+`a32cad6`, `bcad789`, `9caa866`, and `7654e76`, respectively. The separate
+Wave 2 documentation checkpoint is `d49fcbd`.
 
 Completed in this run:
 
@@ -92,12 +93,13 @@ cleanup races. All seven red/green waves and every additive review regression
 are green. Three final reviewers approved the exact source/test snapshot; the
 close gates passed 29/29 object tests, 130/130 ledger tests, 342/342 codec
 tests, the full suite, warning-as-error compilation, Checkdoc, artifact and
-process audits, and the Anvil unsaved-buffer check. Task 6 Waves 0–3 now supply
+process audits, and the Anvil unsaved-buffer check. Task 6 Waves 0–4 now supply
 exact tail inspection, recovery provenance semantics, deterministic streaming
 reseal, closed same-device preflight, verified bounded object inventory, and
-an exclusively published canonical `prepared` manifest. Wave 4 object transfer
-is next. All changes remain in the isolated feature worktree; `main` remains
-outside the implementation path.
+exclusively published canonical `prepared` and `objects-transferred` manifests,
+with exact private object and destination-ledger staging. Wave 5 publication
+and quarantine are next. All changes remain in the isolated feature worktree;
+`main` remains outside the implementation path.
 
 The user also invoked `command-productize`. Read-only reconnaissance and
 current-tool research are complete. Productization integrates after Task 15
@@ -137,11 +139,11 @@ PAL consensus tooling was not advertised in this environment. Anvil is
 available through a dedicated Emacs 30.2.50 daemon; its clean-buffer checks do
 not certify a separate interactive Emacs process.
 
-Tasks 1–4 used staged parallel contract, implementation, and review lanes while
-the coordinator owned integration, gates, and Git. Task 5 keeps that ownership
-model and owns only `epi-ledger.el` and `test/epi-ledger-io-test.el`.
+Tasks 1–6 use staged parallel contract, implementation, and review lanes while
+the coordinator owns integration, gates, and Git. Active Task 6 work owns only
+`epi-ledger.el`, `test/epi-ledger-io-test.el`, and its recovery fixtures.
 Productization remains at its later integration boundary and must not contend
-for Task 5 files.
+for Task 6 files.
 
 ## Prior planning outcome
 
@@ -149,7 +151,7 @@ The approved Pi-grade Epi architecture now has a detailed, executable,
 test-first implementation plan at
 `docs/superpowers/plans/2026-07-21-epi-first-slice.md`. The planning unit was
 documentation-only; implementation is now complete through Task 5 and Task 6
-Wave 3.
+Wave 4.
 
 The plan covers the bounded first slice in Section 16 of
 `docs/superpowers/specs/2026-07-21-epi-design.md` and the applicable Section
@@ -330,14 +332,15 @@ intermediate Wiggum work.
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
    install a dependency, enter `nix develop`, or substitute installed Pi.
-4. Resume Task 6 at Wave 4 test-first in its exact file scope: copy only the
-   manifest-bound historical and fragment objects into private destination
-   staging, reconstruct and verify the hidden destination ledger, and durably
-   advance the manifest to `objects-transferred` while retaining the source
-   lock through the phase barrier. Preserve the committed Wave 0 inspector,
-   Wave 1 provenance semantics, Wave 2 reseal, Wave 3 prepared authority, and
-   Task 5 storage/locking behavior as the regression baseline. Do not publish
-   the destination or move source evidence in this wave.
+4. Resume Task 6 at Wave 5 test-first in its exact file scope: exclusively
+   reserve, populate, verify, and complete the destination object tree; publish
+   the verified destination ledger last; then move the original ledger and
+   object tree through their manifest-bound hidden staging names into an
+   exclusively reserved quarantine and publish `complete.jcs` last. Preserve
+   the committed Wave 0 inspector, Wave 1 provenance semantics, Wave 2 reseal,
+   Wave 3 prepared authority, Wave 4 `objects-transferred` authority, and Task 5
+   storage/locking behavior as the regression baseline. Do not implement the
+   Wave 6 resume loop in this wave.
 5. Continue dependency-ready tasks numerically, one TDD/review/commit unit at
    a time, with architecture checkpoints after Tasks 2, 6, 12, and 15.
 6. Complete the separately approved productization spec and plan before
@@ -431,9 +434,43 @@ Task 6 progress facts:
   `cc3aaaed3067b0a5e29103b18b59b750868c60505b4fa760b2e9dd52301af547`;
   the committed test SHA-256 is
   `5d66c7d9d7690be2194376420cae8459a83f8402c88dabe017d73c4d2c6ab933`.
-- Wave 4 is the next boundary. Wave 3 does not transfer objects, reconstruct
-  or publish the destination, move source evidence, resume an interrupted
-  transaction, or expose the public recovery facade.
+- Wave 4 is
+  `7654e7603ff8d1fa6c0a1049df7435b1b9c28506`
+  (`feat: transfer Epi recovery objects under lock`). It extracts only typed
+  references from complete records, deduplicates and sorts the bounded object
+  set, stages every verified historical object plus the exact fragment, and
+  streams a cold-verified destination ledger under its hidden manifest-bound
+  name. It advances only from `prepared` to `objects-transferred`, executes the
+  durable phase barrier while the source lock is held, and leaves every Wave 5
+  publication and quarantine name absent.
+- Wave 4's callback authority is lexical: documented storage/lock callbacks
+  see no cleanup receipt capability, every received lock/directory/file proof
+  is copied and raw-revalidated before adoption, decoded lock-token bytes must
+  agree with both the source proof and receipt slots, and helper return graphs
+  are consistency checks rather than cleanup authority. Exact-old manifest
+  classification, rollback, and immediate prepared-state reclosure share one
+  automatic-GC-free, callback-free epoch.
+- The exact Wave 4 close sequence passed 240/240 recovery tests in 937.725
+  seconds, 370/370 ledger-I/O tests in 940.861 seconds, and 342/342 codec/JCS
+  tests in 410.452 seconds. The fresh-process `make test` matrix passed GPTel
+  79/79, codec/JCS 342/342 with independent goldens current, ledger-I/O
+  370/370, package 30/30, and preflight 26/26. Warning-as-error compilation,
+  Checkdoc, explicit preflight 26/26, Anvil parenthesis and buffer-state checks,
+  `git diff --check`, and the stray artifact/process audit also passed.
+- The committed Wave 4 source SHA-256 is
+  `d9f48b5ab4faf2181c403a3fb2562e70dad8807f303656afd624a080833bb436`;
+  the committed test SHA-256 is
+  `c778d7697caca91795655eb92d282e707c9e8a3be592900c7ca5667cc361f751`.
+  Independent production-correctness, mutation-sensitive test, and frozen
+  scope reviews are recorded under `/var/tmp/wg-epi-wave4-candidate-*`; all
+  reported ready after their findings were fixed and rerun.
+- The post-commit fess audit found no Wave 4 behavioral blocker. It identified
+  post-create/pre-receipt process-death convergence as explicit Wave 6
+  verification debt; that crash window is not represented as solved here. Its
+  two P3 test-truth findings were fixed, and both exact selectors passed 1/1.
+- Wave 5 is the next boundary. Wave 4 does not publish the destination, move
+  source evidence, resume an interrupted transaction, or expose the public
+  recovery facade.
 
 ## Stop-and-escalate counters
 
@@ -441,8 +478,8 @@ Task 6 progress facts:
 - Maximum unusable outputs from any one reviewer: 1/2; each affected reviewer
   recovered after one neutral local-quality prompt.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: none. Tasks 1–5 and Task 6 Waves 0–3 are committed;
-  Wave 4 is next and all exact source inputs remain present and validated.
+- Current stop reason: none. Tasks 1–5 and Task 6 Waves 0–4 are committed;
+  Wave 5 is next and all exact source inputs remain present and validated.
 - Terminal integration issue: none. The public remote, 18 issues, and linked
   Phase 1 project now exist; the feature branch remains intentionally unpushed
   until final landing.

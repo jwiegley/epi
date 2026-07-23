@@ -1109,19 +1109,24 @@ git commit -m "feat: append Epi ledgers under an explicit lock"
 
 **Interfaces produced:** the closed-ledger `epi-ledger-recover-tail` primitive, fragment object evidence, quarantine layout, recovery-origin records. The registry-aware public facade is added in Task 8 after the runtime registry exists.
 
-**Implementation progress (2026-07-22):** Waves 0–3 of the frozen eight-wave
+**Implementation progress (2026-07-23):** Waves 0–4 of the frozen eight-wave
 execution brief are committed. `0abdfe9` adds exact torn-tail inspection,
 `a32cad6` adds recovery-origin admission and evidence semantics, `bcad789` adds
-deterministic frame-free planning plus streaming reseal, and `9caa866` adds
-closed same-device preflight, the verified bounded object inventory, and
-exclusive durable publication of the canonical `prepared` manifest under the
-source lock. The Wave 3 close gate passed 153/153 recovery tests, 283/283 I/O
-tests, warning-as-error byte compilation, Checkdoc, parenthesis and diff checks,
-and a focused independent P1 review. Wave 4—private object transfer, hidden
-destination-ledger reconstruction, and the durable `objects-transferred`
-barrier—is the next implementation boundary. The remaining Task 6 checkboxes
-deliberately stay open until their transactional publication or resume behavior
-exists.
+deterministic frame-free planning plus streaming reseal, `9caa866` adds closed
+same-device preflight and exclusive durable publication of the canonical
+`prepared` manifest, and `7654e76` stages the exact sorted object set plus the
+verified hidden destination ledger before advancing only to
+`objects-transferred` under the source lock. Wave 4 also closes receipt
+authority around documented callbacks, binds live lock-token bytes to their
+decoded source epoch, and keeps exact-old classification, rollback, and
+prepared-state reclosure in one automatic-GC-free, callback-free epoch. Its close gate passed 240/240
+recovery tests, 370/370 ledger-I/O tests, 342/342 codec/JCS tests, the complete
+fresh-process offline matrix, warning-as-error byte compilation, Checkdoc,
+preflight, parenthesis, diff, and artifact checks, plus independent production,
+test, and frozen-scope reviews. Wave 5—destination publication followed by
+manifest-driven quarantine—is the next implementation boundary. The remaining
+Task 6 checkboxes deliberately stay open until their transactional publication
+or resume behavior exists.
 
 - [ ] Write tests for truncation after every byte class in a final record, unchanged source bytes, new session identity, semantic preservation of the valid prefix, fragment hash/object, reachable-object transfer, recovery provenance, destination collision, and refusal of interior corruption.
 
