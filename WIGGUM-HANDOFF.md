@@ -573,3 +573,28 @@ Task 6 progress facts:
 - Terminal integration issue: none. The public remote, 20 `phase1` issues,
   and linked Phase 1 project now exist; the feature branch is published at its
   exact checkpoint.
+
+## Halt checkpoint refresh — 2026-07-23 16:01 PDT
+
+- Work resumed briefly from documentation checkpoint `973f3be` to revalidate
+  the frozen roots and baseline before Wave 6a.2. No production, test, plan,
+  design, or fixture edit was made.
+- Preflight passed 26/26, GPTel passed 79/79, package passed 30/30,
+  warning-as-error compilation exited zero, and Checkdoc passed over the three
+  production files. The codec/JCS run was interrupted after 177/342 passing
+  tests and the ledger-I/O run after 196/504 passing tests when the user
+  requested `command-halt`; neither run had reported a failure.
+- All three read-only Wave 6a.2 mapping/review workers were interrupted before
+  producing a canonical artifact or touching the shared worktree. All four
+  test/compile processes were stopped, and a process audit found none left.
+- The implementation tip remains `84ea7d3`; the clean documentation parent is
+  `973f3be`, already pushed before this refreshed halt record. Wave 6a.2 still
+  begins with the first red evidence-tree test and no partial implementation
+  needs to be recovered or discarded.
+- The comprehensive remaining-scope report at
+  `/Users/johnw/dl/20260723T1551-EPI-PHASE1-HALT-REMAINING-SCOPE.md` was
+  refreshed for this stop. Its 13–23 focused-day estimate and scope boundaries
+  are unchanged.
+- On resume, restart the codec/JCS and ledger-I/O baselines from zero; the
+  interrupted prefixes are diagnostic evidence only, not completion evidence.
+  Run `fess` at the end of every completed resumed subtask.
