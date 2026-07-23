@@ -1,20 +1,22 @@
 # Epi Implementation Wiggum Handoff
 
-Status: Tasks 1–5 complete; Task 6 Waves 0–4 complete and Wave 5 is next; productization remains at its approved later integration boundary
+Status: Tasks 1–5 complete; Task 6 Waves 0–5 complete and Wave 6 is next; productization remains at its approved later integration boundary
 
 Last updated: 2026-07-23
 
 ## Current implementation run
 
 The active objective is to implement the approved first slice under the Wiggum
-loop. Tasks 1–5 and Task 6 Waves 0–4 are complete on the isolated feature
+loop. Tasks 1–5 and Task 6 Waves 0–5 are complete on the isolated feature
 branch. The package foundation, pinned GPTel seam, canonical ledger codec,
 semantic loader, private storage/append layer, tail inspector, recovery
 semantics, deterministic reseal, closed recovery preparation, and private
-object/ledger transfer are committed
+object/ledger transfer, and transactional destination/quarantine publication
+are committed
 as `89a3437`, `a5b6924`, `813ea02`, `7125bfc`, `e14f9b2`, `0abdfe9`,
-`a32cad6`, `bcad789`, `9caa866`, and `7654e76`, respectively. The separate
-Wave 2 documentation checkpoint is `d49fcbd`.
+`a32cad6`, `bcad789`, `9caa866`, `7654e76`, and `501be5b`, respectively. The
+separate Wave 2 and Wave 4 documentation checkpoints are `d49fcbd` and
+`e574033`, respectively.
 
 Completed in this run:
 
@@ -93,13 +95,15 @@ cleanup races. All seven red/green waves and every additive review regression
 are green. Three final reviewers approved the exact source/test snapshot; the
 close gates passed 29/29 object tests, 130/130 ledger tests, 342/342 codec
 tests, the full suite, warning-as-error compilation, Checkdoc, artifact and
-process audits, and the Anvil unsaved-buffer check. Task 6 Waves 0–4 now supply
+process audits, and the Anvil unsaved-buffer check. Task 6 Waves 0–5 now supply
 exact tail inspection, recovery provenance semantics, deterministic streaming
 reseal, closed same-device preflight, verified bounded object inventory, and
 exclusively published canonical `prepared` and `objects-transferred` manifests,
-with exact private object and destination-ledger staging. Wave 5 publication
-and quarantine are next. All changes remain in the isolated feature worktree;
-`main` remains outside the implementation path.
+with exact private object and destination-ledger staging. Wave 5 additionally
+publishes destination objects before the ledger and preserves the complete
+original evidence through manifest-driven staging and quarantine. Wave 6
+restart reconciliation is next. All changes remain in the isolated feature
+worktree; `main` remains outside the implementation path.
 
 The user also invoked `command-productize`. Read-only reconnaissance and
 current-tool research are complete. Productization integrates after Task 15
@@ -113,9 +117,9 @@ The user created the public GitHub destination during this run. `origin` is
 `phase1` label, completed Tasks 1–5 are closed, Task 6 remains in progress,
 and all issues are members of
 the public linked project at `https://github.com/users/jwiegley/projects/7`.
-The Wiggum loop still prohibits an intermediate push. The inherited successful
-push requirement will be satisfied only at final landing after every task and
-productization gate is complete.
+The feature branch is published at `origin/codex/epi-first-slice`; subsequent
+task checkpoints are pushed as they are committed so the GitHub issue and
+project state can point to recoverable external artifacts.
 
 Locally verified inputs that do not require substitution:
 
@@ -151,7 +155,7 @@ The approved Pi-grade Epi architecture now has a detailed, executable,
 test-first implementation plan at
 `docs/superpowers/plans/2026-07-21-epi-first-slice.md`. The planning unit was
 documentation-only; implementation is now complete through Task 5 and Task 6
-Wave 4.
+Wave 5.
 
 The plan covers the bounded first slice in Section 16 of
 `docs/superpowers/specs/2026-07-21-epi-design.md` and the applicable Section
@@ -317,12 +321,13 @@ form-hash boundaries all pass the frozen offline contract.
 
 ## Repository boundary
 
-The primary checkout remains clean on `main`. Feature implementation is in
+The primary checkout remains on `main`; its unrelated untracked
+`pi-harness-for-emacs.md` is preserved and no feature implementation occurs
+there. Feature implementation is in
 `.worktrees/epi-first-slice` on `codex/epi-first-slice`, based on
 `efc5ee1a6d41132e837c6c8f7c1daebf8fb35a31`. The repository now has the
 public GitHub remote `origin` at `git@github.com:jwiegley/epi.git`; the feature
-branch deliberately has no upstream and has not been pushed during
-intermediate Wiggum work.
+branch tracks `origin/codex/epi-first-slice` and is pushed at task checkpoints.
 
 ## Implementation resume procedure
 
@@ -332,15 +337,15 @@ intermediate Wiggum work.
    not delete the compiled files from the user's existing GPTel checkout.
 3. Export the five preflight inputs through the existing environment. Do not
    install a dependency, enter `nix develop`, or substitute installed Pi.
-4. Resume Task 6 at Wave 5 test-first in its exact file scope: exclusively
-   reserve, populate, verify, and complete the destination object tree; publish
-   the verified destination ledger last; then move the original ledger and
-   object tree through their manifest-bound hidden staging names into an
-   exclusively reserved quarantine and publish `complete.jcs` last. Preserve
-   the committed Wave 0 inspector, Wave 1 provenance semantics, Wave 2 reseal,
-   Wave 3 prepared authority, Wave 4 `objects-transferred` authority, and Task 5
-   storage/locking behavior as the regression baseline. Do not implement the
-   Wave 6 resume loop in this wave.
+4. Resume Task 6 at Wave 6 test-first in its exact file scope. First implement
+   the two-root file/evidence converger; then disk-only phase rehydration and
+   source/destination lock reacquisition; then the seven-phase iterative resume
+   loop and cleanup; finally add representative adversarial constructed states.
+   Preserve Waves 0–5 and Task 5 storage/locking behavior as the regression
+   baseline. Task 6 owns production reconciliation across every durable phase
+   with representative pre-action/post-action states. Task 15 owns actual
+   worker-process deaths, exhaustive first/middle/last interruption
+   permutations and repetitions, and census scale/counter acceptance.
 5. Continue dependency-ready tasks numerically, one TDD/review/commit unit at
    a time, with architecture checkpoints after Tasks 2, 6, 12, and 15.
 6. Complete the separately approved productization spec and plan before
@@ -468,9 +473,46 @@ Task 6 progress facts:
   post-create/pre-receipt process-death convergence as explicit Wave 6
   verification debt; that crash window is not represented as solved here. Its
   two P3 test-truth findings were fixed, and both exact selectors passed 1/1.
-- Wave 5 is the next boundary. Wave 4 does not publish the destination, move
-  source evidence, resume an interrupted transaction, or expose the public
-  recovery facade.
+- Wave 5 is
+  `501be5b77d414a7dc0ae8f0edbd8d7e8947ff704`
+  (`feat: publish recovered Epi evidence safely`). It publishes the verified
+  destination object tree before the destination ledger, preserves the
+  complete original ledger and object tree through two same-device
+  no-clobber hard-link hops, publishes `complete.jcs` last, and advances the
+  durable manifest through `quarantine-published`. Source and destination lock
+  generations remain authenticated in the frozen order through final closure.
+- The reachable-object ceiling remains 256, independently of the complete
+  quarantine-evidence census. The live census uses a process-local handle and
+  ordered proof vectors of at most 256 leaves. That chunk bound is not a claim
+  of bounded total enumeration memory: Phase 1 may materialize and
+  comparison-sort one complete prefix directory, while Task 15 owns scale
+  instrumentation and optimization. Ordinary GC remains enabled during full
+  content walks; only `post-gc-hook` is suppressed around authority epochs.
+- The exact Wave 5 close sequence passed 496/496 ledger tests in three parallel
+  shards (798.648048, 739.519616, and 660.760743 seconds), 342/342 codec/JCS
+  tests in 440.644335 seconds, GPTel 79/79, package 30/30, and preflight 26/26.
+  Warning-as-error compilation, Checkdoc over three production files,
+  parenthesis, diff, and Pandoc gates also passed. Independent correctness,
+  test, resource, and frozen-scope reviews reported no remaining blocker after
+  the automatic-GC wrapper regression was fixed and the unsupported strict
+  linear-census claim was withdrawn.
+- The committed Wave 5 source SHA-256 is
+  `481a04c6dd9307e721ed9f73a329bb26ef392299143f80d6f8608590b5b93fa0`;
+  the committed test SHA-256 is
+  `94bd4ad0e4a5e69b42b26e5c97d6b31ac1a1bff2ed214089d61c20beb040868b`.
+  The commit is published at `origin/codex/epi-first-slice`.
+- Wave 6 is the next boundary. Task 6 must implement production restart
+  reconciliation for every durable phase and prove representative constructed
+  pre-action/post-action states, including split roots and the
+  post-link/pre-unlink case. Task 15 retains actual worker-process deaths,
+  exhaustive first/middle/last interruption permutations and repetitions, and
+  census scale/counter acceptance.
+- Version one persists the required reachable-object set but not the complete
+  unreachable-evidence census. Fresh re-entry must find every persisted
+  reachable leaf, authenticate every present union leaf, and preserve valid
+  unreachable union members; it cannot prove that an unreachable leaf is
+  missing from both roots. Persisting that stronger proof would be a later
+  schema capability, not Task 6 work.
 
 ## Stop-and-escalate counters
 
@@ -478,8 +520,9 @@ Task 6 progress facts:
 - Maximum unusable outputs from any one reviewer: 1/2; each affected reviewer
   recovered after one neutral local-quality prompt.
 - Unresolved significant-decision consensus: 0/2.
-- Current stop reason: none. Tasks 1–5 and Task 6 Waves 0–4 are committed;
-  Wave 5 is next and all exact source inputs remain present and validated.
-- Terminal integration issue: none. The public remote, 18 issues, and linked
-  Phase 1 project now exist; the feature branch remains intentionally unpushed
-  until final landing.
+- Current stop reason: none. Tasks 1–5 and Task 6 Waves 0–5 are committed and
+  pushed; Wave 6 is next and all exact source inputs remain present and
+  validated.
+- Terminal integration issue: none. The public remote, 20 `phase1` issues,
+  and linked Phase 1 project now exist; the feature branch is published at its
+  exact checkpoint.

@@ -376,8 +376,14 @@ comparison of file identity and the last canonical hash, append, flush, and
 post-write verification. Every canonical write uses one private local-byte
 primitive over unibyte data with no conversion, write annotations disabled,
 and explicit exclusive-create/append/replace modes; Epi binds
-write-region-inhibit-fsync to nil at durability barriers. If the lock cannot
-be acquired or the comparison changes, the append fails without writing.
+write-region-inhibit-fsync to nil at durability barriers.  An absent file is
+first reserved with no payload, its effective mode is proven to be exactly
+0600, and only then is it populated.  The final identity/mode proof, payload
+write, and post-write proof form one post-GC- and quit-masked epoch; existing
+append and replacement targets enter the same epoch only after an exact 0600
+proof.  Newly created private directories are likewise retained only after an
+exact effective 0700 proof.  If the lock cannot be acquired or the comparison
+changes, the append fails without writing.
 This contract provides process-crash and competing
 Emacs-process safety; a torn final write remains possible after machine or
 filesystem failure and is handled as recovery rather than described as an
@@ -475,14 +481,35 @@ No extra whole-ledger digest is needed: validation already hashes each record
 into the chain head, while the bounded fragment digest covers every trailing
 byte. Re-entry revalidates those components cooperatively.
 
+Wave 5 closes the `objects-transferred` source epoch under its exact source
+lock, then acquires the destination's canonical `.epi-lock` token while the
+destination is still absent. The token is bound to expected file `absent`, end
+offset zero, and no chain head. Both canonical lock siblings must remain
+distinct from every recovery artifact under the existing-root case policy.
+Every cooperative, transition, stable, and cleanup closure re-authenticates
+both owned lock generations. The source token is released first. Destination
+exclusion remains live through source release, final cold inspection, result
+construction, and the last artifact-authority closure, and is released last.
+No artifact proof runs after destination unlock because an ordinary appender
+may then acquire the same lock and extend the recovered ledger. Cleanup
+preserves a foreign
+replacement token and, for caught error or quit conditions, selects closure,
+body, destination-unlock, then source-unlock failure in that order. Nonlocal
+throws retain normal `unwind-protect` semantics while both release attempts
+still run.
+
 The version-one `reachable_objects` set contains at most 256 historical object
 references; the current torn fragment's separate `fragment_object` is outside
 that count. This is a fixed compatibility ceiling, not a work-slice tuning
-option. Preparation verifies each admitted object cooperatively once under the
-source lock and freezes its exact file identity. After every callback boundary,
-the closing authority proof raw-restats those identities without yielding;
-yielding inside that proof would reopen the mutation race. A newly derived
-one-over set fails with
+option. Preparation verifies each admitted object cooperatively under the
+source lock and freezes its exact file identity for the staging epoch. Ordinary
+phase closures may raw-restat a previously content-authenticated identity
+without yielding. Hard-link publication is a stronger boundary: after any
+post-link receipt callback, Epi cooperatively verifies the target object's
+complete size and SHA-256, requires the verifier's final two-link identity to
+equal the post-link receipt, and only then re-proves both names and unlinks the
+source in a callback-free epoch. Yielding inside that final identity and unlink
+proof would reopen the mutation race. A newly derived one-over set fails with
 `epi-limit-exceeded(code=recovery-atomic-object-limit)` before persistent
 recovery state is created; a decoded or resumed one-over manifest is malformed
 durable input and fails `recovery-manifest-invalid`. These exact file identities
@@ -490,13 +517,59 @@ form process-local authority for one live attempt; they are not durable manifest
 fields. A resumed attempt establishes a fresh identity epoch only after
 re-verifying each manifest-bound object's complete size and content hash.
 
+That 256-entry ceiling applies only to the destination's historical reachable
+set. It is not a ceiling on the source object directory retained as quarantine
+evidence. One live attempt authenticates the complete canonical source tree,
+including unreachable leaves and empty `sha256` or prefix directories, into a
+private complete proof stored in ordered chunks of at most 256 leaves. Each
+leaf binds its hash, size, and exact file identity. The chunk bound applies to
+the proof vectors, not to total enumeration memory or comparison complexity:
+Phase 1 may materialize and comparison-sort one complete prefix directory,
+while Task 15 owns census scale instrumentation and optimization. The
+unbounded census is not copied into the generic publication projection or
+charged to its node/string budget: projections carry one uninterned,
+process-local generation handle, and raw closure resolves that handle to the
+private proof. Automatic garbage collection remains enabled while object
+contents and the complete census are verified; `post-gc-hook` alone is
+suppressed so callbacks cannot widen a metadata epoch. The proof is rebuilt
+after each verified hard-link move and is never persisted in the manifest.
+
+Wave 6 restart reconciliation treats either evidence hop as a two-root state,
+not as a repeatable directory move. A crash may leave a verified target link
+beside its source name or may split already unlinked leaves between the two
+roots. Re-entry must authenticate and reconcile the source/target union,
+including the exact same-inode two-link case, before advancing the durable
+phase; absence of either root alone is never completion evidence. Task 6 proves
+the production reconciler with representative deterministically constructed
+states for every durable phase and pre-action/post-action class. Task 15 owns
+actual worker-process death at every barrier, exhaustive first/middle/last
+interruption permutations and repetitions, and census scale/counter
+acceptance. Version one persists the required reachable-object set but not the
+complete process-local census of unreachable evidence. Fresh re-entry therefore
+requires every persisted reachable leaf, authenticates every present union
+leaf, and preserves valid unreachable union members; it does not claim to
+detect an unreachable leaf missing from both roots. Persisting that stronger
+proof requires a later schema capability.
+
 For a default-store ledger the quarantine is under the session directory; for
 a custom ledger it defaults to a sibling `.epi-quarantine`. An explicit
 quarantine override must be proven on the same filesystem device as the source
-parent before recovery creates anything. Source staging and final quarantine
-publication are therefore rename-only on one filesystem. The recovered
-destination may be elsewhere because it is built and published independently
-on its own filesystem.
+parent before recovery creates anything. Source staging and final-quarantine
+publication therefore remain on one filesystem. Each regular file moves by a
+same-device no-clobber hard link. Epi installs the target name, optionally
+delivers its post-link receipt, and then cooperatively re-authenticates the
+caller-specific target bytes: complete destination-ledger semantics, the
+original source-ledger content signature, exact marker bytes, or object size
+and SHA-256. The verifier must return the exact two-link receipt identity. With
+`post-gc-hook` suppressed from that verification through deletion, Epi then
+raw-reproves both parent bindings and both names and unlinks the source in a
+callback-free epoch, subject to Section 14's external pathname/content-ABA
+boundary. The recovered destination may be elsewhere because it is built and
+published independently on its own filesystem. The manifest retains the
+canonical RFC 3339 fixed timestamp, while the final-quarantine basename
+replaces each colon with an underscore; the mapping is deterministic and
+injective over accepted timestamps and avoids Windows-forbidden basename
+characters without changing the semantic timestamp.
 
 Schema migration reads the old ledger and writes a new ledger beside it. It
 does not rewrite the original. The migrated ledger receives a new session ID

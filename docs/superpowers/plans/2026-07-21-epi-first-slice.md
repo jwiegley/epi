@@ -1109,24 +1109,69 @@ git commit -m "feat: append Epi ledgers under an explicit lock"
 
 **Interfaces produced:** the closed-ledger `epi-ledger-recover-tail` primitive, fragment object evidence, quarantine layout, recovery-origin records. The registry-aware public facade is added in Task 8 after the runtime registry exists.
 
-**Implementation progress (2026-07-23):** Waves 0–4 of the frozen eight-wave
+**Implementation progress (2026-07-23):** Waves 0–5 of the frozen eight-wave
 execution brief are committed. `0abdfe9` adds exact torn-tail inspection,
 `a32cad6` adds recovery-origin admission and evidence semantics, `bcad789` adds
 deterministic frame-free planning plus streaming reseal, `9caa866` adds closed
 same-device preflight and exclusive durable publication of the canonical
 `prepared` manifest, and `7654e76` stages the exact sorted object set plus the
 verified hidden destination ledger before advancing only to
-`objects-transferred` under the source lock. Wave 4 also closes receipt
-authority around documented callbacks, binds live lock-token bytes to their
+`objects-transferred` under the source lock. `501be5b` publishes the verified
+destination objects and ledger, moves the complete original evidence through
+two verified hard-link hops, and advances the manifest through
+`quarantine-published` while preserving the frozen lock order. Wave 4 also
+closes receipt authority around documented callbacks, binds live lock-token bytes to their
 decoded source epoch, and keeps exact-old classification, rollback, and
 prepared-state reclosure in one automatic-GC-free, callback-free epoch. Its close gate passed 240/240
 recovery tests, 370/370 ledger-I/O tests, 342/342 codec/JCS tests, the complete
 fresh-process offline matrix, warning-as-error byte compilation, Checkdoc,
 preflight, parenthesis, diff, and artifact checks, plus independent production,
-test, and frozen-scope reviews. Wave 5—destination publication followed by
-manifest-driven quarantine—is the next implementation boundary. The remaining
-Task 6 checkboxes deliberately stay open until their transactional publication
-or resume behavior exists.
+test, and frozen-scope reviews. Wave 5's close gate passed 496/496 ledger tests
+across three parallel shards, 342/342 codec/JCS tests, 79/79 GPTel tests, 30/30
+package tests, 26/26 preflight tests, warning-as-error byte compilation,
+Checkdoc, parenthesis, diff, and Pandoc gates, plus independent production,
+test, resource, and frozen-scope reviews. Wave 6 restart reconciliation is the
+next implementation boundary. The remaining Task 6 checkboxes deliberately
+stay open until their resume and refusal behavior exists.
+
+**Wave 5 committed checkpoint (2026-07-23):** commit
+`501be5b77d414a7dc0ae8f0edbd8d7e8947ff704` advances through
+`quarantine-published`, holds source
+and destination locks in the frozen order, publishes destination objects before
+the ledger, and preserves the complete original object directory through both
+verified hard-link hops. The manifest's 256-entry `reachable_objects` ceiling
+remains independent of the quarantine census: the latter uses a private
+complete proof stored as ordered vectors of at most 256 leaves and an opaque
+process-local projection handle, so generic projection budgets do not scale
+with unreachable evidence. The proof format is chunk-bounded, but Phase 1 may
+materialize and comparison-sort one complete prefix directory while building
+or validating it; Task 15 owns census scale instrumentation and optimization.
+Normal GC remains enabled during full-object and final-authority walks while
+`post-gc-hook` is suppressed. Focused regressions cover 257 total
+source leaves with one reachable object, empty object-directory topologies,
+malformed proof fields, foreign handles, exact quarantine identity/bytes, and
+the independent reachable-object limit. The committed source SHA-256 is
+`481a04c6dd9307e721ed9f73a329bb26ef392299143f80d6f8608590b5b93fa0`;
+the committed test SHA-256 is
+`94bd4ad0e4a5e69b42b26e5c97d6b31ac1a1bff2ed214089d61c20beb040868b`.
+The branch is published at `origin/codex/epi-first-slice`.
+
+Wave 6 must reconstruct and reconcile a partially moved evidence tree after
+process death. Its restart matrix includes both source-to-stage and
+stage-to-quarantine hops, death after target link creation but before source
+unlink, and death after any proper prefix of leaves has moved. Re-entry proves
+the union of both roots and the same-inode two-link case before deciding which
+names to retain; the Wave 5 transfer helper itself is deliberately not treated
+as idempotent restart logic. Task 6 proves production reconciliation with
+representative deterministically constructed states for every durable phase
+and pre-action/post-action class. Task 15 owns actual worker-process deaths,
+exhaustive first/middle/last interruption permutations and repetitions, and
+census scale/counter acceptance. Version one persists the exact required
+reachable-object set but not its complete unreachable-evidence census. Fresh
+re-entry therefore requires every persisted reachable leaf, authenticates
+every present union leaf, and preserves valid unreachable union members; it
+does not claim to detect an unreachable leaf missing from both roots. Extending
+the durable schema to make that stronger claim is outside Task 6.
 
 - [ ] Write tests for truncation after every byte class in a final record, unchanged source bytes, new session identity, semantic preservation of the valid prefix, fragment hash/object, reachable-object transfer, recovery provenance, destination collision, and refusal of interior corruption.
 
