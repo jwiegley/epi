@@ -205,6 +205,7 @@ The capsule deliberately excludes the transient reverse record accumulator."
   (reseal-plan nil :read-only t)
   (recovery-id nil :read-only t)
   (layout nil :read-only t)
+  (source-parent-identity nil :read-only t)
   (destination-parent-identity nil :read-only t)
   (source-object-tree-state nil :read-only t)
   (source-objects-identity nil :read-only t)
@@ -252,6 +253,58 @@ The capsule deliberately excludes the transient reverse record accumulator."
   (staged-object-receipts nil :read-only t)
   (staged-ledger-identity nil :read-only t))
 
+(cl-defstruct
+    (epi-ledger--recovery-destination-ledger-authority
+     (:constructor epi-ledger--make-recovery-destination-ledger-authority)
+     (:conc-name
+      epi-ledger--recovery-destination-ledger-authority-raw-))
+  "Owned scalar authority for one completely inspected destination ledger."
+  (canonical-path nil :read-only t)
+  (file-identity nil :read-only t)
+  (source-size nil :read-only t)
+  (next-sequence nil :read-only t)
+  (session-id nil :read-only t)
+  (header-sha256 nil :read-only t)
+  (valid-prefix-head nil :read-only t))
+
+(cl-defstruct
+    (epi-ledger--recovery-publication-projection
+     (:constructor epi-ledger--make-recovery-publication-projection)
+     (:conc-name epi-ledger--recovery-publication-projection-raw-))
+  "Inert physical authority for one Wave 5 publication phase."
+  (phase nil :read-only t)
+  (destination-object-proof nil :read-only t)
+  (destination-ledger-authority nil :read-only t)
+  (source-object-proof nil :read-only t)
+  (source-stage-identity nil :read-only t)
+  (staged-source-ledger-identity nil :read-only t)
+  (quarantine-identity nil :read-only t)
+  (evidence-kind nil :read-only t)
+  (evidence-proof nil :read-only t)
+  (final-source-ledger-identity nil :read-only t)
+  (quarantine-marker-identity nil :read-only t)
+  (quarantine-marker-bytes nil :read-only t))
+
+(cl-defstruct
+    (epi-ledger--recovery-evidence-leaf
+     (:constructor epi-ledger--make-recovery-evidence-leaf)
+     (:conc-name epi-ledger--recovery-evidence-leaf-raw-))
+  "One exact source-object leaf retained only as quarantine evidence."
+  (hash nil :read-only t)
+  (size nil :read-only t)
+  (identity nil :read-only t))
+
+(cl-defstruct
+    (epi-ledger--recovery-evidence-proof
+     (:constructor epi-ledger--make-recovery-evidence-proof)
+     (:conc-name epi-ledger--recovery-evidence-proof-raw-))
+  "Chunked process-local authority for a complete source-object tree."
+  (root nil :read-only t)
+  (device nil :read-only t)
+  (directories nil :read-only t)
+  (chunks nil :read-only t)
+  (count 0 :read-only t))
+
 (defconst epi-ledger--recovery-record-proof-record-size
   (length (epi-ledger--make-recovery-record-proof))
   "Exact private record size of a recovery record proof.")
@@ -275,6 +328,37 @@ The capsule deliberately excludes the transient reverse record accumulator."
 (defconst epi-ledger--recovery-prepared-record-size
   (length (epi-ledger--make-recovery-prepared))
   "Exact private record size of a durable prepared-manifest result.")
+
+(defconst epi-ledger--recovery-phase-state-record-size
+  (length (epi-ledger--make-recovery-phase-state))
+  "Exact private record size of durable recovery phase authority.")
+
+(defconst epi-ledger--recovery-destination-ledger-authority-record-size
+  (length (epi-ledger--make-recovery-destination-ledger-authority))
+  "Exact private record size of destination-ledger scalar authority.")
+
+(defconst epi-ledger--recovery-publication-projection-record-size
+  (length (epi-ledger--make-recovery-publication-projection))
+  "Exact private record size of an inert publication projection.")
+
+(defconst epi-ledger--recovery-evidence-leaf-record-size
+  (length (epi-ledger--make-recovery-evidence-leaf))
+  "Exact private record size of one quarantine-evidence leaf.")
+
+(defconst epi-ledger--recovery-evidence-proof-record-size
+  (length (epi-ledger--make-recovery-evidence-proof))
+  "Exact private record size of one chunked quarantine-evidence proof.")
+
+(defconst epi-ledger--recovery-publication-authority-node-limit 100000
+  "Maximum graph visits in one owned publication-authority projection.")
+
+(defconst epi-ledger--recovery-publication-authority-byte-limit 16777216
+  "Maximum aggregate string bytes in one publication-authority projection.")
+
+(defconst epi-ledger--recovery-object-tree-proof-keys
+  '(:root :shape :directories :files :items :device
+    :marker-path :marker-identity :marker-bytes)
+  "Exact ordered keys in one private object-tree proof plist.")
 
 (cl-defstruct (epi-ledger--record-chunk
                (:constructor epi-ledger--make-record-chunk)
@@ -6659,47 +6743,113 @@ directory.  The returned spelling has no trailing slash."
           (epi-ledger--format-fail 'invalid-write-path))
         (directory-file-name (substring-no-properties resolved)))))))
 
+(defun epi-ledger--local-mode-exact-p (path expected)
+  "Return non-nil when local PATH has exact permission bits EXPECTED."
+  (condition-case nil
+      (let ((file-name-handler-alist nil)
+            (mode (file-modes (substring-no-properties path))))
+        (and (integerp mode)
+             (= expected (logand #o7777 mode))))
+    (file-error nil)))
+
+(defun epi-ledger--write-stat-local-file (path)
+  "Return PATH's file identity for a write proof, or nil on storage failure.
+Preserve unrelated structured Epi conditions so an enclosing storage layer can
+apply its own stable taxonomy."
+  (condition-case condition
+      (epi-ledger--stat-local-file path)
+    (epi-ledger-format-error nil)
+    (file-error nil)
+    (epi-error
+     (if (eq 'storage-stat-failed
+             (plist-get (epi-ledger--condition-plist condition) :code))
+         nil
+       (signal (car condition) (cdr condition))))
+    (error nil)))
+
 (defun epi-ledger--ensure-private-parent (path)
   "Create PATH's absent parent directories one at a time with mode 0700.
 Existing directories retain their modes.  Return PATH's canonical parent."
   (let* ((canonical (epi-ledger--resolve-local-write-path path))
          (probe (directory-file-name (file-name-directory canonical)))
-         missing)
-    (condition-case condition
-        (let ((file-name-handler-alist nil))
-          (while (not (file-exists-p probe))
-            (when (file-symlink-p probe)
-              (epi-ledger--format-fail 'invalid-write-path))
-            (push probe missing)
-            (let ((parent
-                   (directory-file-name (file-name-directory probe))))
-              (when (equal parent probe)
-                (epi-ledger--format-fail 'non-directory-parent))
-              (setq probe parent)))
-          (unless (and (file-directory-p probe)
-                       (not (file-symlink-p probe)))
-            (epi-ledger--format-fail 'non-directory-parent))
-          (dolist (directory missing)
-            (condition-case create-condition
-                (progn
-                  (with-file-modes #o700
-                    (make-directory directory nil))
-                  (set-file-modes directory #o700))
-              (file-already-exists
-               (unless (and (file-directory-p directory)
-                            (not (file-symlink-p directory)))
-                 (epi-ledger--fail
-                  'epi-ledger-conflict 'storage-write-failed)))
-              (file-error
-               (ignore create-condition)
-               (epi-ledger--fail
-                'epi-ledger-conflict 'storage-write-failed)))))
-      (file-error
-       (ignore condition)
-       (epi-ledger--fail 'epi-ledger-conflict 'storage-write-failed)))
-    (file-name-as-directory
-     (substring-no-properties
-      (directory-file-name (file-name-directory canonical))))))
+         missing created complete result)
+    (unwind-protect
+        (progn
+          (condition-case condition
+              (let ((file-name-handler-alist nil))
+                (while (not (file-exists-p probe))
+                  (when (file-symlink-p probe)
+                    (epi-ledger--format-fail 'invalid-write-path))
+                  (push probe missing)
+                  (let ((parent
+                         (directory-file-name (file-name-directory probe))))
+                    (when (equal parent probe)
+                      (epi-ledger--format-fail 'non-directory-parent))
+                    (setq probe parent)))
+                (unless (and (file-directory-p probe)
+                             (not (file-symlink-p probe)))
+                  (epi-ledger--format-fail 'non-directory-parent))
+                (dolist (directory missing)
+                  (condition-case create-condition
+                      (let (identity observed)
+                        (with-file-modes #o700
+                          (make-directory directory nil))
+                        (setq identity
+                              (condition-case nil
+                                  (epi-ledger--stat-local-directory directory)
+                                (error nil)))
+                        (unless identity
+                          (epi-ledger--fail
+                           'epi-ledger-conflict 'storage-write-failed))
+                        (push (cons directory identity) created)
+                        (set-file-modes directory #o700)
+                        (setq observed
+                              (condition-case nil
+                                  (epi-ledger--stat-local-directory directory)
+                                (error nil)))
+                        (unless
+                            (and observed
+                                 (epi-ledger--same-file-object-p
+                                  identity observed)
+                                 (epi-ledger--local-mode-exact-p
+                                  directory #o700))
+                          (epi-ledger--fail
+                           'epi-ledger-conflict 'storage-write-failed)))
+                    (file-already-exists
+                     (unless (and (file-directory-p directory)
+                                  (not (file-symlink-p directory)))
+                       (epi-ledger--fail
+                        'epi-ledger-conflict 'storage-write-failed)))
+                    (file-error
+                     (ignore create-condition)
+                     (epi-ledger--fail
+                      'epi-ledger-conflict 'storage-write-failed)))))
+            (file-error
+             (ignore condition)
+             (epi-ledger--fail
+              'epi-ledger-conflict 'storage-write-failed)))
+          (setq result
+                (file-name-as-directory
+                 (substring-no-properties
+                  (directory-file-name (file-name-directory canonical))))
+                complete t)
+          result)
+      (unless complete
+        ;; Remove only directories that still match the captured object
+        ;; immediately before deletion, deepest first.  Portable Emacs cannot
+        ;; close an external pathname ABA between this proof and
+        ;; `delete-directory' (the Section 14 boundary).
+        (dolist (entry created)
+          (condition-case nil
+              (let ((actual
+                     (epi-ledger--stat-local-directory (car entry))))
+                (when (and actual
+                           (epi-ledger--same-file-object-p
+                            (cdr entry) actual))
+                  (let ((file-name-handler-alist nil))
+                    (delete-directory
+                     (substring-no-properties (car entry)) nil))))
+            ((error quit) nil)))))))
 
 (defun epi-ledger--hidden-sibling (path &optional suffix)
   "Return a hidden sibling of canonical PATH using optional SUFFIX.
@@ -6735,39 +6885,98 @@ MODE is `exclusive-create', `append', or `replace'.  DURABLEP enables the
   ;; operations, while direct low-level callers can still close an injected
   ;; `write-region' race against the exact name they supplied.
   (let* ((_proven (epi-ledger--resolve-local-write-path path))
-         (local (substring-no-properties path)))
-    (condition-case condition
-        (let ((newp
-               (or (eq mode 'exclusive-create)
-                   (let ((file-name-handler-alist nil))
-                     (not (file-exists-p local)))))
-              (coding-system-for-write 'no-conversion)
-              (buffer-file-coding-system 'no-conversion)
-              (buffer-file-format nil)
-              (file-coding-system-alist nil)
-              (format-alist nil)
-              (write-region-annotate-functions nil)
-              (write-region-post-annotation-function nil)
-              (write-region-inhibit-fsync (not durablep))
-              (create-lockfiles nil)
-              (file-name-handler-alist nil))
-          (with-file-modes #o600
-            (pcase mode
-              ('exclusive-create
-               (write-region bytes nil local nil 'silent nil 'excl))
-              ('append
-               (write-region bytes nil local t 'silent nil nil))
-              ('replace
-               (write-region bytes nil local nil 'silent nil nil))))
-          (when newp
-            (set-file-modes local #o600))
-          nil)
-      (file-already-exists
-       (ignore condition)
-       (epi-ledger--fail 'epi-ledger-conflict 'destination-exists))
-      (file-error
-       (ignore condition)
-       (epi-ledger--fail 'epi-ledger-conflict 'storage-write-failed)))))
+         (local (substring-no-properties path))
+         newp prior-identity created-identity complete result)
+    (unwind-protect
+        (setq result
+              (condition-case condition
+                  (let* ((file-name-handler-alist nil)
+                         ;; Keep the private-mode proof, payload write, and
+                         ;; post-write proof in one callback-masked epoch.  A
+                         ;; post-GC hook must never broaden the empty reserved
+                         ;; name before sensitive bytes are populated.
+                         (gc-cons-threshold most-positive-fixnum)
+                         (post-gc-hook nil)
+                         (inhibit-quit t)
+                         (coding-system-for-write 'no-conversion)
+                         (buffer-file-coding-system 'no-conversion)
+                         (buffer-file-format nil)
+                         (file-coding-system-alist nil)
+                         (format-alist nil)
+                         (write-region-annotate-functions nil)
+                         (write-region-post-annotation-function nil)
+                         (write-region-inhibit-fsync (not durablep))
+                         (create-lockfiles nil))
+                    (setq newp
+                          (or (eq mode 'exclusive-create)
+                              (not (file-exists-p local))))
+                    (if newp
+                        (progn
+                          ;; Reserve only an empty name until its effective
+                          ;; private mode is proven.  A mode-less filesystem
+                          ;; therefore never receives sensitive payload bytes.
+                          (let ((write-region-inhibit-fsync t))
+                            (with-file-modes #o600
+                              (write-region
+                               "" nil local nil 'silent nil 'excl)))
+                          (setq created-identity
+                                (epi-ledger--write-stat-local-file local))
+                          (unless created-identity
+                            (epi-ledger--fail
+                             'epi-ledger-conflict 'storage-write-failed))
+                          (set-file-modes local #o600)
+                          (let ((observed
+                                 (epi-ledger--write-stat-local-file local)))
+                            (unless
+                                (and observed
+                                     (epi-ledger--same-file-object-p
+                                      created-identity observed)
+                                     (epi-ledger--local-mode-exact-p
+                                      local #o600))
+                              (epi-ledger--fail
+                               'epi-ledger-conflict
+                               'storage-write-failed))))
+                      (setq prior-identity
+                            (epi-ledger--write-stat-local-file local))
+                      (unless
+                          (and prior-identity
+                               (epi-ledger--local-mode-exact-p local #o600))
+                        (epi-ledger--fail
+                         'epi-ledger-conflict 'storage-write-failed)))
+                    (with-file-modes #o600
+                      (pcase mode
+                        ('exclusive-create
+                         (write-region bytes nil local nil 'silent nil nil))
+                        ('append
+                         (write-region bytes nil local t 'silent nil nil))
+                        ('replace
+                         (write-region bytes nil local nil 'silent nil nil))))
+                    (let ((observed
+                           (epi-ledger--write-stat-local-file local)))
+                      (unless
+                          (and observed
+                               (epi-ledger--same-file-object-p
+                                (or created-identity prior-identity)
+                                observed)
+                               (epi-ledger--local-mode-exact-p local #o600))
+                        (epi-ledger--fail
+                         'epi-ledger-conflict 'storage-write-failed)))
+                    (setq complete t)
+                    nil)
+                (file-already-exists
+                 (ignore condition)
+                 (epi-ledger--fail
+                  'epi-ledger-conflict 'destination-exists))
+                (file-error
+                 (ignore condition)
+                 (epi-ledger--fail
+                  'epi-ledger-conflict 'storage-write-failed))))
+      (when (and newp created-identity (not complete))
+        (condition-case nil
+            (epi-ledger--delete-owned-object-name
+             local created-identity nil)
+          ((error quit) nil))))
+    result))
 
 (defun epi-ledger--read-bytes (path begin end)
   "Return a fresh unibyte copy of PATH's bytes from BEGIN through END.
@@ -7053,6 +7262,54 @@ the caller owns postpublication removal of the source name."
     (epi-ledger--format-fail 'invalid-unsigned-decimal :field field))
   (string-to-number value))
 
+(defun epi-ledger--device-token-p (value)
+  "Return non-nil when VALUE is a closed portable device token."
+  (let ((component-p
+         (lambda (component)
+           (and (integerp component)
+                (<= 0 component 18446744073709551615)))))
+    (or (funcall component-p value)
+        (and (consp value)
+             (funcall component-p (car value))
+             (funcall component-p (cdr value))))))
+
+(defun epi-ledger--copy-device-token (value &optional field)
+  "Return an ownership copy of portable device token VALUE for FIELD."
+  (unless (epi-ledger--device-token-p value)
+    (epi-ledger--format-fail
+     'invalid-unsigned-decimal :field (or field 'device)))
+  (if (consp value) (cons (car value) (cdr value)) value))
+
+(defun epi-ledger--device-token-string (value field)
+  "Return portable device token VALUE in canonical string form for FIELD."
+  (setq value (epi-ledger--copy-device-token value field))
+  (if (consp value)
+      (concat "pair:"
+              (epi-ledger--unsigned-decimal-string (car value) field)
+              ":"
+              (epi-ledger--unsigned-decimal-string (cdr value) field))
+    (epi-ledger--unsigned-decimal-string value field)))
+
+(defun epi-ledger--parse-device-token (value field)
+  "Parse canonical portable device token string VALUE for FIELD."
+  (unless (and (stringp value) (<= (length value) 46))
+    (epi-ledger--format-fail 'invalid-unsigned-decimal :field field))
+  (let ((case-fold-search nil))
+    (cond
+     ((string-match-p "\\`\\(?:0\\|[1-9][0-9]*\\)\\'" value)
+      (epi-ledger--copy-device-token
+       (epi-ledger--parse-unsigned-decimal value field) field))
+     ((string-match
+       "\\`pair:\\(0\\|[1-9][0-9]*\\):\\(0\\|[1-9][0-9]*\\)\\'"
+       value)
+      (epi-ledger--copy-device-token
+       (cons
+        (epi-ledger--parse-unsigned-decimal (match-string 1 value) field)
+        (epi-ledger--parse-unsigned-decimal (match-string 2 value) field))
+       field))
+     (t
+      (epi-ledger--format-fail 'invalid-unsigned-decimal :field field)))))
+
 (defun epi-ledger--lock-file-identity-object (identity)
   "Return the closed lock-token file object for plist IDENTITY."
   (unless (and (listp identity)
@@ -7061,7 +7318,7 @@ the caller owns postpublication removal of the source name."
   (list
    (cons "path" (substring-no-properties (plist-get identity :path)))
    (cons "device"
-         (epi-ledger--unsigned-decimal-string
+         (epi-ledger--device-token-string
           (plist-get identity :device) 'device))
    (cons "inode"
          (epi-ledger--unsigned-decimal-string
@@ -7144,8 +7401,8 @@ EXPECTED-FILE, EXPECTED-END, and EXPECTED-HEAD bind the ledger state."
          (changed (epi-ledger--object-value object "changed")))
     (unless (and (stringp path) (equal path ledger-path))
       (epi-ledger--format-fail 'invalid-lock-file-path))
-    (dolist (entry `((,device . device) (,inode . inode)
-                     (,links . links) (,size . size)))
+    (epi-ledger--parse-device-token device 'device)
+    (dolist (entry `((,inode . inode) (,links . links) (,size . size)))
       (epi-ledger--parse-unsigned-decimal (car entry) (cdr entry)))
     (unless (= (epi-ledger--parse-unsigned-decimal size 'size)
                expected-end)
@@ -7596,7 +7853,7 @@ verified proof to RECEIPT-RECEIVER before returning when it is non-nil."
   (list
    :path (substring-no-properties
           (epi-ledger--object-value object "path"))
-   :device (epi-ledger--parse-unsigned-decimal
+   :device (epi-ledger--parse-device-token
             (epi-ledger--object-value object "device") 'device)
    :inode (epi-ledger--parse-unsigned-decimal
            (epi-ledger--object-value object "inode") 'inode)
@@ -10200,49 +10457,37 @@ repair, recovery, Org evaluation, rendering, or write occurs on this path."
       capsule)
       t))))
 
+(defun epi-ledger--recovery-source-content-signature (proof)
+  "Return path- and identity-independent recovery fields from PROOF."
+  (list
+   (epi-ledger--recovery-source-proof-source-size proof)
+   (epi-ledger--recovery-source-proof-header-title proof)
+   (epi-ledger--recovery-source-proof-header-format proof)
+   (epi-ledger--recovery-source-proof-header-session-id proof)
+   (epi-ledger--recovery-source-proof-header-created-at proof)
+   (epi-ledger--recovery-source-proof-header-project-root proof)
+   (epi-ledger--recovery-source-proof-header-coding-system proof)
+   (epi-ledger--recovery-source-proof-header-hash proof)
+   (epi-ledger--recovery-source-proof-validated-end proof)
+   (epi-ledger--recovery-source-proof-valid-prefix-head proof)
+   (epi-ledger--recovery-source-proof-next-sequence proof)
+   (epi-ledger--recovery-source-proof-fragment-offset proof)
+   (epi-ledger--recovery-source-proof-fragment-size proof)
+   (epi-ledger--recovery-source-proof-fragment-hash proof)
+   (epi-ledger--recovery-source-proof-record-count proof)))
+
 (defun epi-ledger--recovery-source-proof-equal-p (left right)
   "Return non-nil when LEFT and RIGHT bind the same recovery source.
 Per-record dry-run proofs are deliberately excluded from this comparison."
   (and
    (epi-ledger--recovery-source-proof-p left)
    (epi-ledger--recovery-source-proof-p right)
-   (equal
-    (list
-     (epi-ledger--recovery-source-proof-canonical-path left)
-     (epi-ledger--recovery-source-proof-file-identity left)
-     (epi-ledger--recovery-source-proof-source-size left)
-     (epi-ledger--recovery-source-proof-header-title left)
-     (epi-ledger--recovery-source-proof-header-format left)
-     (epi-ledger--recovery-source-proof-header-session-id left)
-     (epi-ledger--recovery-source-proof-header-created-at left)
-     (epi-ledger--recovery-source-proof-header-project-root left)
-     (epi-ledger--recovery-source-proof-header-coding-system left)
-     (epi-ledger--recovery-source-proof-header-hash left)
-     (epi-ledger--recovery-source-proof-validated-end left)
-     (epi-ledger--recovery-source-proof-valid-prefix-head left)
-     (epi-ledger--recovery-source-proof-next-sequence left)
-     (epi-ledger--recovery-source-proof-fragment-offset left)
-     (epi-ledger--recovery-source-proof-fragment-size left)
-     (epi-ledger--recovery-source-proof-fragment-hash left)
-     (epi-ledger--recovery-source-proof-record-count left))
-    (list
-     (epi-ledger--recovery-source-proof-canonical-path right)
-     (epi-ledger--recovery-source-proof-file-identity right)
-     (epi-ledger--recovery-source-proof-source-size right)
-     (epi-ledger--recovery-source-proof-header-title right)
-     (epi-ledger--recovery-source-proof-header-format right)
-     (epi-ledger--recovery-source-proof-header-session-id right)
-     (epi-ledger--recovery-source-proof-header-created-at right)
-     (epi-ledger--recovery-source-proof-header-project-root right)
-     (epi-ledger--recovery-source-proof-header-coding-system right)
-     (epi-ledger--recovery-source-proof-header-hash right)
-     (epi-ledger--recovery-source-proof-validated-end right)
-     (epi-ledger--recovery-source-proof-valid-prefix-head right)
-     (epi-ledger--recovery-source-proof-next-sequence right)
-     (epi-ledger--recovery-source-proof-fragment-offset right)
-     (epi-ledger--recovery-source-proof-fragment-size right)
-     (epi-ledger--recovery-source-proof-fragment-hash right)
-     (epi-ledger--recovery-source-proof-record-count right)))))
+   (equal (epi-ledger--recovery-source-proof-canonical-path left)
+          (epi-ledger--recovery-source-proof-canonical-path right))
+   (equal (epi-ledger--recovery-source-proof-file-identity left)
+          (epi-ledger--recovery-source-proof-file-identity right))
+   (equal (epi-ledger--recovery-source-content-signature left)
+          (epi-ledger--recovery-source-content-signature right))))
 
 (defun epi-ledger--recovery-snapshot-source-proof (inspection)
   "Return owned scalar and fragment evidence for INSPECTION."
@@ -11086,12 +11331,14 @@ Charge its bounded scalar fields through WORK."
               (inode (nth 2 values))
               (links (nth 3 values))
               (size (nth 4 values)))
-          (unless (and (epi-ledger--recovery-bounded-unsigned-p device)
+          (unless (and (epi-ledger--device-token-p device)
                        (epi-ledger--recovery-bounded-unsigned-p inode)
                        (epi-ledger--recovery-bounded-unsigned-p links)
                        (epi-ledger--recovery-bounded-unsigned-p size))
             (epi-ledger--recovery-reseal-plan-changed))
-          (list :path path :device device :inode inode :links links :size size
+          (list :path path
+                :device (epi-ledger--copy-device-token device)
+                :inode inode :links links :size size
                 :modified
                 (append (epi-ledger--recovery-copy-time (nth 5 values)) nil)
                 :changed
@@ -11118,11 +11365,13 @@ Charge its bounded scalar fields through WORK."
               (device (nth 1 values))
               (inode (nth 2 values))
               (links (nth 3 values)))
-          (unless (and (epi-ledger--recovery-bounded-unsigned-p device)
+          (unless (and (epi-ledger--device-token-p device)
                        (epi-ledger--recovery-bounded-unsigned-p inode)
                        (epi-ledger--recovery-bounded-unsigned-p links))
             (epi-ledger--recovery-reseal-plan-changed))
-          (list :path path :device device :inode inode :links links
+          (list :path path
+                :device (epi-ledger--copy-device-token device)
+                :inode inode :links links
                 :modified
                 (append (epi-ledger--recovery-copy-time (nth 4 values)) nil)
                 :changed
@@ -11651,6 +11900,15 @@ data and is not published until the source pass has matched the same plan."
 (defconst epi-ledger--recovery-atomic-object-limit 256
   "Maximum reachable objects in one version-one atomic recovery proof.")
 
+(defconst epi-ledger--recovery-evidence-chunk-limit 256
+  "Maximum leaves in one private quarantine-evidence proof chunk.")
+
+(defvar epi-ledger--recovery-publication-evidence-handle nil
+  "Dynamically bound opaque handle for one live publication's evidence.")
+
+(defvar epi-ledger--recovery-publication-evidence-proof nil
+  "Dynamically bound chunked proof behind the live evidence handle.")
+
 (defvar epi-ledger--recovery-phase-barrier-function #'ignore
   "Dynamically bindable callback after one durable recovery phase.")
 
@@ -11727,6 +11985,20 @@ Trusted orchestration passes a lexical receiver and masks this special.")
        (not (directory-name-p path))
        (let ((file-name-handler-alist nil))
          (equal path (directory-file-name (expand-file-name path))))))
+
+(defun epi-ledger--recovery-quarantine-basename
+    (source-session-id fixed-timestamp)
+  "Return a deterministic portable quarantine basename.
+SOURCE-SESSION-ID remains literal.  Colons in canonical FIXED-TIMESTAMP become
+underscores, a byte outside the accepted timestamp alphabet, so the mapping is
+injective while avoiding Windows-forbidden basename characters."
+  (epi-ledger--require-uuid source-session-id "source_session_id")
+  (unless (epi-ledger--timestamp-p fixed-timestamp)
+    (epi-ledger--format-fail
+     'invalid-timestamp :field "fixed_timestamp"))
+  (substring-no-properties
+   (concat source-session-id "-"
+           (string-replace ":" "_" fixed-timestamp))))
 
 (defun epi-ledger--recovery-layout
     (source-proof plan recovery-id destination quarantine-directory)
@@ -11868,30 +12140,37 @@ override their deterministic defaults."
          (final-quarantine
           (epi-ledger--resolve-local-directory-path
            (expand-file-name
-            (concat source-session-id "-"
-                    (epi-ledger--recovery-reseal-plan-origin-at plan))
+            (epi-ledger--recovery-quarantine-basename
+             source-session-id
+             (epi-ledger--recovery-reseal-plan-origin-at plan))
             (file-name-as-directory quarantine-root))))
          (exclusive-paths
           (list destination-path destination-objects
                 staged-destination-ledger staged-destination-objects
                 transaction manifest manifest-temporary source-stage
                 staged-source-ledger staged-source-objects absent-marker
-                final-quarantine)))
+                final-quarantine))
+         (artifact-paths
+          (append
+           (list source source-objects quarantine-root control-directory)
+           exclusive-paths)))
     (unless (and source-parent-identity
                  (stringp quarantine-anchor-path)
-                 (integerp source-device)
-                 (integerp parent-device)
-                 (integerp quarantine-device))
+                 (epi-ledger--device-token-p source-device)
+                 (epi-ledger--device-token-p parent-device)
+                 (epi-ledger--device-token-p quarantine-device))
       (epi-ledger--fail
        'epi-ledger-conflict 'quarantine-device-unknown))
-    (unless (and (= source-device parent-device)
-                 (= source-device quarantine-device))
+    (unless (and (equal source-device parent-device)
+                 (equal source-device quarantine-device))
       (epi-ledger--fail 'epi-ledger-conflict 'quarantine-cross-device))
     (epi-ledger--recovery-require-separated-top-level-paths
      (list source source-objects destination-path destination-objects
            staged-destination-ledger staged-destination-objects
            quarantine-root)
      fold-case)
+    (epi-ledger--recovery-require-lock-artifact-separation
+     source destination-path artifact-paths fold-case)
     (when (or (equal source destination-path)
               (equal source source-objects))
       (epi-ledger--fail 'epi-ledger-conflict 'recovery-path-conflict))
@@ -11909,7 +12188,7 @@ override their deterministic defaults."
      :staged-destination-ledger-path staged-destination-ledger
      :staged-destination-objects-path staged-destination-objects
      :quarantine-root quarantine-root
-     :quarantine-device quarantine-device
+     :quarantine-device (epi-ledger--copy-device-token quarantine-device)
      :quarantine-anchor-path
      (substring-no-properties quarantine-anchor-path)
      :quarantine-anchor-identity quarantine-anchor
@@ -11954,10 +12233,40 @@ override their deterministic defaults."
          (second (epi-ledger--recovery-owned-directory-stat path)))
     (unless (and first second (equal first second)
                  (equal path (plist-get second :path))
-                 (integerp (plist-get second :device))
+                 (epi-ledger--device-token-p (plist-get second :device))
                  (plist-member second :inode))
       (epi-ledger--fail 'epi-ledger-conflict 'recovery-path-conflict))
     (epi-ledger--copy-tree-and-strings second)))
+
+(defun epi-ledger--recovery-source-parent-path (layout)
+  "Return the canonical parent of LAYOUT's source ledger."
+  (directory-file-name
+   (file-name-directory
+    (epi-ledger--recovery-layout-raw-source-path layout))))
+
+(defun epi-ledger--recovery-capture-source-parent (layout)
+  "Capture LAYOUT's stable source-parent identity through public seams."
+  (let* ((path (epi-ledger--recovery-source-parent-path layout))
+         (device (epi-ledger--recovery-layout-raw-quarantine-device layout))
+         (first (epi-ledger--recovery-owned-directory-stat path))
+         (second (epi-ledger--recovery-owned-directory-stat path)))
+    (unless (and first second (equal first second)
+                 (equal path (plist-get second :path))
+                 (equal device (plist-get second :device))
+                 (plist-member second :inode))
+      (epi-ledger--fail 'epi-ledger-conflict 'recovery-path-conflict))
+    (epi-ledger--copy-tree-and-strings second)))
+
+(defun epi-ledger--recovery-close-source-parent-raw (layout expected)
+  "Raw-close LAYOUT's source parent against caller-held EXPECTED."
+  (let* ((path (epi-ledger--recovery-source-parent-path layout))
+         (owned (epi-ledger--recovery-copy-directory-identity expected))
+         (device (epi-ledger--recovery-layout-raw-quarantine-device layout)))
+    (unless (and (equal path (plist-get owned :path))
+                 (equal device (plist-get owned :device)))
+      (epi-ledger--fail 'epi-ledger-conflict 'recovery-path-conflict))
+    (epi-ledger--recovery-require-bound-directory-raw
+     path owned device)))
 
 (defun epi-ledger--recovery-close-destination-parent-raw
     (layout expected)
@@ -11965,7 +12274,7 @@ override their deterministic defaults."
   (let* ((path (epi-ledger--recovery-destination-parent-path layout))
          (owned (epi-ledger--recovery-copy-directory-identity expected))
          (device (and (listp owned) (plist-get owned :device))))
-    (unless (and (integerp device)
+    (unless (and (epi-ledger--device-token-p device)
                  (equal path (plist-get owned :path)))
       (epi-ledger--fail 'epi-ledger-conflict 'recovery-path-conflict))
     (epi-ledger--recovery-require-bound-directory-raw
@@ -11989,10 +12298,12 @@ override their deterministic defaults."
                 (epi-ledger--recovery-owned-directory-stat
                  (epi-ledger--recovery-layout-raw-source-objects-path layout))
               (error nil))))
-       (unless (and identity
-                    (= (or (plist-get identity :device) -1)
-                       (epi-ledger--recovery-layout-raw-quarantine-device
-                        layout)))
+       (unless
+           (and
+            identity
+            (equal
+             (plist-get identity :device)
+             (epi-ledger--recovery-layout-raw-quarantine-device layout)))
          (epi-ledger--fail
           'epi-ledger-conflict 'quarantine-cross-device))
        (list :state 'present :identity identity)))
@@ -12195,7 +12506,7 @@ REACHABLE is the verified historical-object reference vector."
      (cons "quarantine_root"
            (epi-ledger--recovery-layout-raw-quarantine-root layout))
      (cons "quarantine_device"
-           (epi-ledger--unsigned-decimal-string
+           (epi-ledger--device-token-string
             (epi-ledger--recovery-layout-raw-quarantine-device layout)
             'quarantine-device))
      (cons "final_quarantine_path"
@@ -12316,6 +12627,19 @@ FOLD-CASE is non-nil on a case-insensitive filesystem."
           (setq right-tail (cdr right-tail))))
       (setq left-tail (cdr left-tail)))))
 
+(defun epi-ledger--recovery-require-lock-artifact-separation
+    (source destination artifacts fold-case)
+  "Require SOURCE and DESTINATION lock siblings to miss ARTIFACTS.
+All paths are already canonical.  FOLD-CASE is non-nil on a case-insensitive
+filesystem.  Derive the lock names purely so manifest validation does not
+cross a filesystem observation seam."
+  (epi-ledger--recovery-require-distinct-paths
+   (append
+    (list (concat source ".epi-lock")
+          (concat destination ".epi-lock"))
+    artifacts)
+   fold-case))
+
 (defun epi-ledger--recovery-path-set-case-insensitive-p (paths)
   "Return non-nil when an existing parent volume for PATHS folds case."
   (seq-some
@@ -12350,6 +12674,8 @@ FOLD-CASE is non-nil on a case-insensitive filesystem."
            (file-name-as-directory
             (expand-file-name ".epi-recovery"
                               (file-name-as-directory quarantine)))))
+         (control
+          (directory-file-name (file-name-directory transaction)))
          (manifest-path
           (expand-file-name "manifest.jcs"
                             (file-name-as-directory transaction)))
@@ -12378,7 +12704,7 @@ FOLD-CASE is non-nil on a case-insensitive filesystem."
            staged-destination-objects
            :quarantine-root quarantine
            :quarantine-device
-           (epi-ledger--recovery-parse-bounded-unsigned-decimal
+           (epi-ledger--parse-device-token
             (funcall get "quarantine_device") 'quarantine-device)
            :transaction-directory transaction
            :manifest-path manifest-path
@@ -12393,8 +12719,9 @@ FOLD-CASE is non-nil on a case-insensitive filesystem."
                              (file-name-as-directory source-stage))
            :final-quarantine-path
            (expand-file-name
-            (concat (funcall get "source_session_id") "-"
-                    (funcall get "fixed_timestamp"))
+            (epi-ledger--recovery-quarantine-basename
+             (funcall get "source_session_id")
+             (funcall get "fixed_timestamp"))
             (file-name-as-directory quarantine)))))
     (dolist (binding
              `(("destination_objects_path" .
@@ -12430,7 +12757,7 @@ FOLD-CASE is non-nil on a case-insensitive filesystem."
                   layout)
                  (epi-ledger--recovery-layout-raw-staged-destination-objects-path
                   layout)
-                 transaction manifest-path
+                 quarantine control transaction manifest-path
                  (epi-ledger--recovery-layout-raw-manifest-temporary-path
                   layout)
                  source-stage staged-source-ledger
@@ -12440,7 +12767,9 @@ FOLD-CASE is non-nil on a case-insensitive filesystem."
                   layout)
                  (epi-ledger--recovery-layout-raw-final-quarantine-path
                   layout))))
-      (epi-ledger--recovery-require-distinct-paths paths fold-case))
+      (epi-ledger--recovery-require-distinct-paths paths fold-case)
+      (epi-ledger--recovery-require-lock-artifact-separation
+       source destination paths fold-case))
     layout))
 
 (defun epi-ledger--recovery-validate-prepared-manifest-1
@@ -12529,8 +12858,11 @@ FOLD-CASE is non-nil on a case-insensitive filesystem."
            (quarantine-device
             (funcall get "quarantine_device"))
            (device
-            (epi-ledger--recovery-parse-bounded-unsigned-decimal
+            (epi-ledger--parse-device-token
              quarantine-device 'quarantine-device))
+           (source-device
+            (epi-ledger--parse-device-token
+             (epi-ledger--object-value identity "device") 'device))
            (fragment-object
             (epi-ledger--recovery-manifest-object-reference
              (funcall get "fragment_object") "fragment_object"))
@@ -12545,12 +12877,10 @@ FOLD-CASE is non-nil on a case-insensitive filesystem."
                      (lambda (field)
                        (epi-ledger--recovery-parse-bounded-unsigned-decimal
                         (epi-ledger--object-value identity field) field))
-                     '("device" "inode" "links" "size")))
+                     '("inode" "links" "size")))
                    (= 1 (epi-ledger--recovery-parse-bounded-unsigned-decimal
                           (epi-ledger--object-value identity "links") 'links))
-                   (= device
-                      (epi-ledger--recovery-parse-bounded-unsigned-decimal
-                       (epi-ledger--object-value identity "device") 'device))
+                   (equal device source-device)
                    (equal quarantine-device
                           (epi-ledger--object-value identity "device"))
                    (member state '("present" "absent"))
@@ -12658,6 +12988,9 @@ Every malformed value maps to the stable recovery-manifest conflict."
          (epi-ledger--recovery-copy-reachable-object-identities
           identities)
          (epi-ledger--recovery-copy-directory-identity
+          (epi-ledger--recovery-preflight-raw-source-parent-identity
+           preflight))
+         (epi-ledger--recovery-copy-directory-identity
           (epi-ledger--recovery-preflight-raw-destination-parent-identity
            preflight))))
     (error (epi-ledger--recovery-manifest-invalid))))
@@ -12676,7 +13009,8 @@ CAPTURED-AUTHORITY, when non-nil, is a prior private entry snapshot."
          (plan-input (nth 2 captured))
          (source-objects-identity-input (nth 3 captured))
          (reachable-identities-input (nth 4 captured))
-         (destination-parent-identity-input (nth 5 captured)))
+         (source-parent-identity-input (nth 5 captured))
+         (destination-parent-identity-input (nth 6 captured)))
     (condition-case nil
         (epi-ledger--with-operation-work-state
           (let* ((plan
@@ -12691,6 +13025,9 @@ CAPTURED-AUTHORITY, when non-nil, is a prior private entry snapshot."
                  (source-proof
                   (epi-ledger--recovery-reseal-plan-source-proof plan))
                  (layout (epi-ledger--recovery-manifest-layout manifest))
+                 (source-parent-identity
+                  (epi-ledger--recovery-close-source-parent-raw
+                   layout source-parent-identity-input))
                  (destination-parent-identity
                   (epi-ledger--recovery-close-destination-parent-raw
                    layout destination-parent-identity-input))
@@ -12721,9 +13058,10 @@ CAPTURED-AUTHORITY, when non-nil, is a prior private entry snapshot."
                                (plist-get source-objects-identity :path)
                                (epi-ledger--recovery-layout-raw-source-objects-path
                                 layout))
-                              (= (plist-get source-objects-identity :device)
-                                 (epi-ledger--recovery-layout-raw-quarantine-device
-                                  layout)))
+                              (equal
+                               (plist-get source-objects-identity :device)
+                               (epi-ledger--recovery-layout-raw-quarantine-device
+                                layout)))
                        (null source-objects-identity))
                      (equal encoded
                             (epi-ledger--jcs-encode
@@ -12736,6 +13074,7 @@ CAPTURED-AUTHORITY, when non-nil, is a prior private entry snapshot."
              :reseal-plan plan
              :recovery-id recovery-id
              :layout layout
+             :source-parent-identity source-parent-identity
              :destination-parent-identity destination-parent-identity
              :source-object-tree-state state
              :source-objects-identity source-objects-identity
@@ -12810,6 +13149,8 @@ override their deterministic defaults."
                 (epi-ledger--recovery-layout
                  source-proof owned-plan owned-recovery-id
                  owned-destination owned-quarantine))
+               (source-parent-identity
+                (epi-ledger--recovery-capture-source-parent layout))
                (tree-proof
                 (epi-ledger--recovery-source-object-tree-state layout))
                (destination-parent-identity
@@ -12833,6 +13174,7 @@ override their deterministic defaults."
            :reseal-plan owned-plan
            :recovery-id owned-recovery-id
            :layout layout
+           :source-parent-identity source-parent-identity
            :destination-parent-identity destination-parent-identity
            :source-object-tree-state tree-state
            :source-objects-identity tree-identity
@@ -12906,12 +13248,12 @@ Return a fresh stable identity snapshot."
     (unless (and first (equal first second)
                  (epi-ledger--recovery-same-directory-object-p
                   path expected second)
-                 (= device (or (plist-get second :device) -1))
+                 (equal device (plist-get second :device))
                  (or (null mode) (= mode permissions)))
       (epi-ledger--fail
        'epi-ledger-conflict
        (if (and second
-                (/= device (or (plist-get second :device) -1)))
+                (not (equal device (plist-get second :device))))
            'quarantine-cross-device
          'recovery-path-conflict)))
     second))
@@ -13754,9 +14096,7 @@ bytes.  Every proof bypasses injectable storage seams and callback hooks."
   "Return sorted owned entry names from local directory PATH.
 Read at most one name beyond EXPECTED-COUNT so unexpected membership remains
 detectable without an unbounded directory allocation."
-  (unless (and (epi-ledger--recovery-bounded-unsigned-p expected-count)
-               (<= expected-count
-                   (+ 2 epi-ledger--recovery-atomic-object-limit)))
+  (unless (epi-ledger--recovery-bounded-unsigned-p expected-count)
     (epi-ledger--fail
      'epi-ledger-conflict 'recovery-path-conflict))
   (condition-case condition
@@ -14626,9 +14966,9 @@ closed plan authority."
             (push
              (if (= index 7)
                  (let ((device (nth index fields)))
-                   (unless (epi-ledger--recovery-bounded-unsigned-p device)
+                   (unless (epi-ledger--device-token-p device)
                      (error "Invalid recovery device"))
-                   device)
+                   (epi-ledger--copy-device-token device))
                (epi-ledger--recovery-copy-plan-string
                 (nth index fields) epi-header-value-byte-limit))
              owned))
@@ -14812,7 +15152,7 @@ normalizes the runtime anchor to the quarantine root and retains no receipts."
        :staged-destination-ledger-path (path 4)
        :staged-destination-objects-path (path 5)
        :quarantine-root (path 6)
-       :quarantine-device (nth 7 fields)
+       :quarantine-device (epi-ledger--copy-device-token (nth 7 fields))
        :quarantine-anchor-path (path 6)
        :quarantine-anchor-identity
        (epi-ledger--copy-tree-and-strings root)
@@ -14897,7 +15237,7 @@ ENTRY-SNAPSHOT, when non-nil, is prior private callback-free entry authority."
                 manifest-path oracle)
                1))
              (_manifest-device
-              (unless (= device (or (plist-get manifest :device) -1))
+              (unless (equal device (plist-get manifest :device))
                 (epi-ledger--fail
                  'epi-ledger-conflict 'quarantine-cross-device)))
              (_temporary-absent
@@ -14956,6 +15296,51 @@ ENTRY-SNAPSHOT, when non-nil, is prior private callback-free entry authority."
           (epi-ledger--recovery-validate-manifest manifest phase))
     (list manifest
           (epi-ledger--jcs-encode manifest epi-record-json-byte-limit))))
+
+(defconst epi-ledger--recovery-phase-byte-cache-tag
+  'epi-ledger--recovery-phase-byte-cache
+  "Private tag for one recovery publication's canonical phase-byte cache.")
+
+(defconst epi-ledger--recovery-phase-byte-cache-missing
+  (make-symbol "epi-ledger--recovery-phase-byte-cache-missing")
+  "Private sentinel for a canonical phase-byte cache miss.")
+
+(defun epi-ledger--recovery-make-phase-byte-cache (preflight)
+  "Return a private, initially empty canonical byte cache for PREFLIGHT."
+  (vector epi-ledger--recovery-phase-byte-cache-tag
+          preflight
+          (make-hash-table :test #'eq)))
+
+(defun epi-ledger--recovery-cached-phase-bytes (preflight cache phase)
+  "Return CACHE's private canonical bytes for PREFLIGHT and symbol PHASE.
+Each phase is validated and JCS-encoded at most once in this cache.  Callers
+must not expose or mutate the returned string; copy it before placing it in
+evidence reachable by a callback or caller."
+  (unless
+      (and (vectorp cache)
+           (= 3 (length cache))
+           (eq epi-ledger--recovery-phase-byte-cache-tag (aref cache 0))
+           (eq preflight (aref cache 1))
+           (hash-table-p (aref cache 2))
+           (eq (hash-table-test (aref cache 2)) #'eq)
+           (symbolp phase)
+           (member (symbol-name phase) epi-ledger--recovery-manifest-phases))
+    (epi-ledger--recovery-manifest-invalid))
+  (let* ((table (aref cache 2))
+         (cached
+          (gethash phase table
+                   epi-ledger--recovery-phase-byte-cache-missing)))
+    (if (not (eq cached epi-ledger--recovery-phase-byte-cache-missing))
+        cached
+      (let ((bytes
+             (nth 1
+                  (epi-ledger--recovery-manifest-for-phase
+                   preflight (symbol-name phase)))))
+        (unless (and (stringp bytes) (not (multibyte-string-p bytes)))
+          (epi-ledger--recovery-manifest-invalid))
+        (setq bytes (substring-no-properties bytes))
+        (puthash phase bytes table)
+        bytes))))
 
 (defun epi-ledger--recovery-object-path-under-root (root hash)
   "Return HASH's immutable object pathname below existing ROOT."
@@ -15104,10 +15489,13 @@ Deliver each exact new-directory receipt to RECEIPT-RECEIVER when non-nil."
          (nreverse receipts))))))
 
 (defun epi-ledger--recovery-require-private-file-state-raw
-    (path expected expected-size code &optional exact-identity-p)
+    (path expected expected-size code &optional exact-identity-p expected-links)
   "Raw-require PATH as private EXPECTED with EXPECTED-SIZE or fail CODE.
 When EXACT-IDENTITY-P is non-nil, require the complete identity epoch rather
-than only the same file object."
+than only the same file object.  EXPECTED-LINKS defaults to one."
+  (setq expected-links (or expected-links 1))
+  (unless (and (integerp expected-links) (> expected-links 0))
+    (epi-ledger--fail 'epi-ledger-conflict code))
   (let* ((first (epi-ledger--raw-object-name-state path))
          (mode (and first (epi-ledger--recovery-raw-mode path)))
          (second (epi-ledger--raw-object-name-state path)))
@@ -15117,7 +15505,7 @@ than only the same file object."
                  (epi-ledger--same-file-object-p expected second)
                  (or (not exact-identity-p) (equal expected second))
                  (= expected-size (or (plist-get second :size) -1))
-                 (= 1 (or (plist-get second :links) -1))
+                 (= expected-links (or (plist-get second :links) -1))
                  (= #o600 mode))
       (epi-ledger--fail 'epi-ledger-conflict code))
     second))
@@ -15169,9 +15557,10 @@ remains a direct-call fallback."
            owned-path identity))))))
 
 (defun epi-ledger--recovery-copy-object-bytes
-    (path bytes size hash &optional receipt-receiver)
+    (path bytes size hash &optional receipt-receiver role)
   "Copy BYTES to new staged PATH and return its verified identity.
-Deliver the exact empty-file reservation to RECEIPT-RECEIVER before writes."
+Deliver the exact empty-file reservation to RECEIPT-RECEIVER before writes.
+ROLE defaults to `staged-object'."
   (unless (and (stringp bytes) (not (multibyte-string-p bytes))
                (= size (length bytes))
                (equal hash
@@ -15198,7 +15587,7 @@ Deliver the exact empty-file reservation to RECEIPT-RECEIVER before writes."
           (progn
             (setq created
                   (epi-ledger--recovery-reserve-private-file-raw
-                   owned-path 'staged-object receiver))
+                   owned-path (or role 'staged-object) receiver))
             (while (< cursor size)
               (let* ((end (min size (+ cursor limit)))
                      (amount (- end cursor)))
@@ -15370,7 +15759,7 @@ receipts."
                     'recovery-object-content-changed t))))
         (unless (and receipt identity
                      (equal (cdr receipt) identity)
-                     (= device (or (plist-get identity :device) -1))
+                     (equal device (plist-get identity :device))
                      (= 1 (or (plist-get identity :links) -1)))
           (epi-ledger--fail
            'epi-ledger-conflict 'recovery-object-content-changed))
@@ -15489,8 +15878,8 @@ Deliver the exact empty-file reservation to RECEIPT-RECEIVER before writes."
                               (epi-ledger--recovery-reseal-plan-byte-size
                                plan))
                            (= total (or (plist-get final :size) -1))
-                           (= destination-device
-                              (or (plist-get final :device) -1))
+                           (equal destination-device
+                                  (plist-get final :device))
                            (= 1 (or (plist-get final :links) -1))
                            (= #o600 (epi-ledger--recovery-raw-mode path)))
                 (epi-ledger--fail
@@ -15594,8 +15983,8 @@ Deliver the exact empty-file reservation to RECEIPT-RECEIVER before writes."
                  (=
                   (epi-ledger--recovery-reseal-plan-byte-size plan)
                   (or (plist-get identity :size) -1))
-                 (= destination-device
-                    (or (plist-get identity :device) -1))
+                 (equal destination-device
+                        (plist-get identity :device))
                  (= 1 (or (plist-get identity :links) -1)))
       (epi-ledger--fail
        'epi-ledger-conflict 'recovery-staged-ledger-invalid))
@@ -15628,13 +16017,19 @@ Deliver the exact empty-file reservation to RECEIPT-RECEIVER before writes."
          'recovery-path-conflict)))))
 
 (defun epi-ledger--recovery-phase-transaction-entry-names
-    (layout temporaryp)
-  "Return sorted transaction entry names for LAYOUT and TEMPORARYP."
+    (layout temporaryp &optional source-stage-p)
+  "Return sorted transaction entries for LAYOUT's current phase topology.
+TEMPORARYP includes the manifest temporary.  SOURCE-STAGE-P includes the
+manifest-bound source staging directory."
   (sort
    (append
     (list
      (file-name-nondirectory
       (epi-ledger--recovery-layout-raw-manifest-path layout)))
+    (when source-stage-p
+      (list
+       (file-name-nondirectory
+        (epi-ledger--recovery-layout-raw-source-stage-path layout))))
     (when temporaryp
       (list
        (file-name-nondirectory
@@ -15642,10 +16037,11 @@ Deliver the exact empty-file reservation to RECEIPT-RECEIVER before writes."
    #'string<))
 
 (defun epi-ledger--recovery-prepare-phase-manifest-temporary
-    (prepared new-bytes &optional receipt-receiver)
+    (prepared new-bytes &optional receipt-receiver source-stage-p)
   "Write PREPARED's NEW-BYTES phase temporary while old state remains exact.
-Return its exact identity and the original transaction's two-entry state.
-Deliver the exact empty-file reservation to RECEIPT-RECEIVER before writes."
+Return its exact identity and the temporary-inclusive transaction entry state.
+Deliver the exact empty-file reservation to RECEIPT-RECEIVER before writes.
+SOURCE-STAGE-P includes the source staging directory in transaction closure."
   (let* ((receiver
           (or receipt-receiver epi-ledger--recovery-file-receipt-receiver))
          (epi-ledger--recovery-file-receipt-receiver nil)
@@ -15724,7 +16120,7 @@ Deliver the exact empty-file reservation to RECEIPT-RECEIVER before writes."
                 (epi-ledger--recovery-capture-transaction-entry-state-core-raw
                  layout transaction-identity
                  (epi-ledger--recovery-phase-transaction-entry-names
-                  layout t))
+                  layout t source-stage-p))
                 complete t)
           (list temporary-identity transaction-state))
       (unless complete
@@ -15978,7 +16374,7 @@ is unavoidable even if temporary cleanup exits abnormally."
                              (plist-get destination-parent-identity :device))))
                   (unless
                       (and remaining-directory-paths
-                           (integerp device)
+                           (epi-ledger--device-token-p device)
                            (equal owned-path
                                   (car remaining-directory-paths))
                            (equal owned-path
@@ -16496,6 +16892,4578 @@ is unavoidable even if temporary cleanup exits abnormally."
          (unlock-condition
           (signal (car unlock-condition) (cdr unlock-condition)))
          (t result))))))
+
+(defun epi-ledger--recovery-snapshot-phase-locator (state)
+  "Return STATE's bounded canonical manifest locator without trusting state."
+  (condition-case nil
+      (let ((gc-cons-threshold most-positive-fixnum))
+        (unless (epi-ledger--recovery-exact-record-p
+                 state #'epi-ledger--recovery-phase-state-p
+                 epi-ledger--recovery-phase-state-record-size)
+          (error "Invalid recovery phase state"))
+        (let ((layout
+               (epi-ledger--recovery-phase-state-raw-path-layout state)))
+          (unless (epi-ledger--recovery-exact-record-p
+                   layout #'epi-ledger--recovery-layout-p
+                   epi-ledger--recovery-layout-record-size)
+            (error "Invalid recovery phase layout"))
+          (let ((path
+                 (epi-ledger--recovery-layout-raw-manifest-path layout)))
+            (unless (and (stringp path)
+                         (<= (length path) epi-header-value-byte-limit)
+                         (<= (string-bytes path) epi-header-value-byte-limit)
+                         (equal path
+                                (epi-ledger--resolve-local-write-path path)))
+              (error "Invalid recovery manifest locator"))
+            (substring-no-properties path))))
+    (error
+     (epi-ledger--format-fail 'recovery-preflight-required))))
+
+(defun epi-ledger--recovery-read-canonical-manifest
+    (path expected-phase)
+  "Read PATH as one exact canonical recovery manifest at EXPECTED-PHASE.
+Return its normalized object, owned canonical bytes, and exact file identity."
+  (condition-case nil
+      (let* ((owned-path (substring-no-properties path))
+             (initial
+              (epi-ledger--recovery-capture-manifest-epoch-raw owned-path))
+             (size (plist-get initial :size)))
+        (unless (and (integerp size) (> size 0)
+                     (<= size epi-record-json-byte-limit)
+                     (= 1 (or (plist-get initial :links) -1)))
+          (error "Invalid recovery manifest size"))
+        (let* ((read
+                (epi-ledger--recovery-read-exact-bytes-raw
+                 owned-path initial size 'recovery-manifest-invalid))
+               (bytes (car read))
+               (decoded (epi-ledger--decode-json bytes))
+               (manifest
+                (epi-ledger--recovery-validate-manifest
+                 decoded expected-phase))
+               (canonical
+                (epi-ledger--jcs-encode
+                 manifest epi-record-json-byte-limit))
+               (final
+                (epi-ledger--recovery-verify-manifest-epoch
+                 owned-path bytes initial t)))
+          (unless (and (equal bytes canonical)
+                       (= 1 (or (plist-get final :links) -1)))
+            (error "Noncanonical recovery manifest"))
+          (list
+           (epi-ledger--copy-tree-and-strings manifest)
+           (substring-no-properties bytes)
+           (epi-ledger--recovery-copy-file-identity final))))
+    (error
+     (epi-ledger--recovery-manifest-invalid))))
+
+(defun epi-ledger--recovery-read-exact-bytes-raw
+    (path expected size code &optional expected-links)
+  "Read exact private PATH bytes while retaining EXPECTED epoch authority.
+SIZE bounds the cooperative direct-local read.  Signal CODE if any identity,
+mode, link-count, size, ownership, or byte-read invariant fails.  Return the
+owned unibyte bytes and the exact final identity.  EXPECTED-LINKS defaults to
+one."
+  (unless (and (stringp path)
+               (listp expected)
+               (integerp size)
+               (<= 0 size epi-record-json-byte-limit))
+    (epi-ledger--fail 'epi-ledger-conflict code))
+  (let* ((owned-path (substring-no-properties path))
+         (identity
+          (epi-ledger--recovery-require-private-file-state-raw
+           owned-path expected size code t expected-links))
+         (work (epi-ledger--make-work-state))
+         (limit (max 1 epi-ledger-work-byte-limit))
+         (cursor 0)
+         chunks)
+    (while (< cursor size)
+      (let* ((end (min size (+ cursor limit)))
+             (amount (- end cursor)))
+        ;; `epi-ledger--work-charge' may yield.  Exact raw reproof therefore
+        ;; brackets every physical read rather than merely the whole loop.
+        (epi-ledger--work-charge work amount)
+        (epi-ledger--recovery-require-private-file-state-raw
+         owned-path identity size code t expected-links)
+        (let ((chunk
+               (condition-case nil
+                   (epi-ledger--read-bytes owned-path cursor end)
+                 (error nil))))
+          (unless (and (stringp chunk)
+                       (not (multibyte-string-p chunk))
+                       (not (epi-ledger--string-has-properties-p chunk))
+                       (= amount (length chunk)))
+            (epi-ledger--fail 'epi-ledger-conflict code))
+          (push (substring-no-properties chunk) chunks))
+        (epi-ledger--recovery-require-private-file-state-raw
+         owned-path identity size code t expected-links)
+        (setq cursor end)))
+    (setq chunks (nreverse chunks))
+    (let* ((bytes
+            (if chunks
+                (epi-ledger--work-concat-chunks
+                 chunks size work 'recovery-exact-read)
+              ""))
+           (final
+            (epi-ledger--recovery-require-private-file-state-raw
+             owned-path identity size code t expected-links)))
+      (unless (and (= size (length bytes))
+                   (not (multibyte-string-p bytes))
+                   (not (epi-ledger--string-has-properties-p bytes)))
+        (epi-ledger--fail 'epi-ledger-conflict code))
+      (list (substring-no-properties bytes) final))))
+
+(defun epi-ledger--recovery-inspect-path-raw (path policy)
+  "Inspect local PATH under POLICY without caller-injectable storage seams."
+  (let ((file-name-handler-alist nil)
+        (epi-ledger--stat-function #'epi-ledger--stat-local-file)
+        (epi-ledger--read-function #'epi-ledger--read-bytes)
+        (epi-ledger--open-identity-reader #'epi-ledger--file-identity)
+        (epi-ledger--open-source-inserter #'insert-file-contents-literally)
+        (epi-ledger--open-head-inserter #'insert-file-contents-literally))
+    (epi-ledger--inspect-path-core
+     (substring-no-properties path) policy)))
+
+(defun epi-ledger--recovery-capture-object-stage
+    (preflight layout items destination-parent)
+  "Freshly content-prove PREFLIGHT and LAYOUT's hidden stage for ITEMS.
+DESTINATION-PARENT binds its parent directory.  Return the stage's root
+identity, ordered directory receipts, and file receipts."
+  (let* ((paths
+          (epi-ledger--recovery-object-stage-directory-paths layout items))
+         (device (plist-get destination-parent :device))
+         directory-receipts file-receipts)
+    (unless
+        (equal
+         destination-parent
+         (epi-ledger--recovery-reprove-destination-parent-raw
+          preflight layout))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (epi-ledger--recovery-close-destination-parent-raw
+     layout destination-parent)
+    (dolist (path paths)
+      (let* ((initial (epi-ledger--recovery-raw-directory-stat path))
+             (identity
+              (epi-ledger--recovery-require-bound-directory-raw
+               path initial device #o700)))
+        (push
+         (cons (substring-no-properties path)
+               (epi-ledger--copy-tree-and-strings identity))
+         directory-receipts)))
+    (setq directory-receipts (nreverse directory-receipts))
+    (dotimes (index (length items))
+      (let* ((item (aref items index))
+             (hash (plist-get item :hash))
+             (size (plist-get item :size))
+             (path
+              (epi-ledger--recovery-object-path-under-root
+               (epi-ledger--recovery-layout-raw-staged-destination-objects-path
+                layout)
+               hash))
+             (verified
+              (let ((epi-ledger--stat-function
+                     #'epi-ledger--stat-local-file)
+                    (epi-ledger--read-function #'epi-ledger--read-bytes))
+                (epi-ledger--object-read-verified-state
+                 path size hash 'proof)))
+             (identity
+              (epi-ledger--recovery-copy-file-identity
+               (plist-get verified :identity))))
+        (unless (and (equal device (plist-get identity :device))
+                     (= 1 (or (plist-get identity :links) -1))
+                     (= #o600 (epi-ledger--recovery-raw-mode path)))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+        (push (cons path identity) file-receipts)))
+    (setq file-receipts (nreverse file-receipts))
+    (let ((closed
+           (epi-ledger--recovery-require-object-stage-raw
+            layout items directory-receipts file-receipts
+            destination-parent t)))
+      (list
+       (epi-ledger--copy-tree-and-strings (nth 0 closed))
+       (epi-ledger--copy-tree-and-strings (nth 1 closed))
+       (epi-ledger--copy-tree-and-strings (nth 2 closed))))))
+
+(defun epi-ledger--recovery-inspect-complete-destination
+    (preflight path &optional expected)
+  "Cold-inspect complete destination PATH against PREFLIGHT.
+When non-nil, EXPECTED binds the destination's file identity."
+  (let* ((inspection
+          (epi-ledger--recovery-inspect-path-raw path 'complete))
+         (_verified
+          (epi-ledger--recovery-require-destination-inspection
+           inspection preflight path))
+         (identity
+          (epi-ledger--recovery-copy-file-identity
+           (epi-ledger--inspection-raw-file-identity inspection))))
+    (unless (or (null expected) (equal expected identity))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-staged-ledger-invalid))
+    (setq identity
+          (epi-ledger--recovery-require-private-file-state-raw
+           path identity
+           (epi-ledger--inspection-raw-source-size inspection)
+           'recovery-staged-ledger-invalid t))
+    (list
+     inspection
+     (epi-ledger--recovery-copy-file-identity identity)
+     (epi-ledger--recovery-destination-ledger-authority-from-inspection
+      inspection preflight path identity))))
+
+(defun epi-ledger--recovery-acquire-phase-lock (preflight source-last-record)
+  "Acquire and return PREFLIGHT's exact source lock for SOURCE-LAST-RECORD."
+  (let* ((proof (epi-ledger--recovery-preflight-raw-source-proof preflight))
+         (source (epi-ledger--recovery-source-proof-canonical-path proof))
+         received returned lock handed-off)
+    (unwind-protect
+        (progn
+          (let ((epi-ledger--lock-acquisition-receiver nil)
+                (receiver
+                 (lambda (receipt)
+                   (when received
+                     (epi-ledger--fail
+                      'epi-ledger-conflict 'lock-token-changed))
+                   (setq received
+                         (epi-ledger--recovery-verify-lock-receipt-raw
+                          receipt source
+                          (epi-ledger--recovery-source-proof-file-identity
+                           proof)
+                          (epi-ledger--recovery-source-proof-source-size proof)
+                          (epi-ledger--recovery-source-proof-valid-prefix-head
+                           proof))))))
+            (setq returned
+                  (epi-ledger--acquire-lock
+                   source
+                   (epi-ledger--recovery-source-proof-file-identity proof)
+                   (epi-ledger--recovery-source-proof-source-size proof)
+                   (epi-ledger--recovery-source-proof-valid-prefix-head proof)
+                   receiver)))
+          (unless (and received returned
+                       (epi-ledger--lock-p returned)
+                       (equal received returned))
+            (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+          (setq lock (epi-ledger--recovery-copy-lock received))
+          (epi-ledger--verify-prewrite-authority-raw
+           source
+           (epi-ledger--recovery-source-proof-file-identity proof)
+           (epi-ledger--recovery-source-proof-source-size proof)
+           (epi-ledger--recovery-source-proof-valid-prefix-head proof)
+           source-last-record lock)
+          (setq handed-off t)
+          lock)
+      (unless handed-off
+        (let ((owned
+               (cond
+                ((epi-ledger--lock-p lock) lock)
+                ((epi-ledger--lock-p received)
+                 (epi-ledger--recovery-copy-lock received))
+                ((epi-ledger--lock-p returned)
+                 (epi-ledger--recovery-copy-lock returned)))))
+          (when owned
+            (epi-ledger--recovery-release-phase-lock-raw owned)))))))
+
+(defun epi-ledger--recovery-release-lock-raw (lock)
+  "Release owned recovery LOCK and raw-prove its exact name absent.
+The absence closure runs even when the unlock callback signals or throws."
+  (unwind-protect
+      (let ((epi-ledger--stat-function #'epi-ledger--stat-local-file)
+            (epi-ledger--read-function #'epi-ledger--read-bytes)
+            (epi--yield-function #'ignore)
+            (epi--deadline-clock-function #'float-time)
+            (epi-ledger--nonpreemptible-observer nil))
+        (funcall epi-ledger--unlock-function
+                 (epi-ledger--recovery-copy-lock lock)))
+    (epi-ledger--recovery-require-lock-absent-raw lock)))
+
+(defun epi-ledger--recovery-release-phase-lock-raw (lock)
+  "Release the exact source phase LOCK and prove its name absent."
+  (epi-ledger--recovery-release-lock-raw lock))
+
+(defun epi-ledger--recovery-release-destination-lock-raw (lock)
+  "Release the exact destination publication LOCK and prove its name absent."
+  (epi-ledger--recovery-release-lock-raw lock))
+
+(defun epi-ledger--recovery-close-phase-input
+    (state expected-phase)
+  "Reconstruct STATE from its canonical manifest at EXPECTED-PHASE.
+Return a fresh phase-state and one separately owned exact source lock."
+  (let* ((manifest-path
+          (epi-ledger--recovery-snapshot-phase-locator state))
+         (read
+          (epi-ledger--recovery-read-canonical-manifest
+           manifest-path expected-phase))
+         (manifest (nth 0 read))
+         (manifest-bytes (nth 1 read))
+         (manifest-identity (nth 2 read))
+         (authoritative-layout
+          (epi-ledger--recovery-manifest-layout manifest))
+         (_locator-bound
+          (unless
+              (equal manifest-path
+                     (epi-ledger--recovery-layout-raw-manifest-path
+                      authoritative-layout))
+            (epi-ledger--recovery-manifest-invalid)))
+         (device
+          (epi-ledger--recovery-layout-raw-quarantine-device
+           authoritative-layout))
+         (root-path
+          (epi-ledger--recovery-layout-raw-quarantine-root
+           authoritative-layout))
+         (transaction-path
+          (epi-ledger--recovery-layout-raw-transaction-directory
+           authoritative-layout))
+         (control-path
+          (directory-file-name (file-name-directory transaction-path)))
+         (root
+          (epi-ledger--recovery-require-bound-directory-raw
+           root-path
+           (epi-ledger--recovery-raw-directory-stat root-path)
+           device))
+         (control
+          (epi-ledger--recovery-require-bound-directory-raw
+           control-path
+           (epi-ledger--recovery-raw-directory-stat control-path)
+           device #o700))
+         (transaction
+          (epi-ledger--recovery-require-bound-directory-raw
+           transaction-path
+           (epi-ledger--recovery-raw-directory-stat transaction-path)
+           device #o700))
+         (layout
+          (epi-ledger--recovery-close-operational-layout
+           (epi-ledger--recovery-manifest-layout-signature
+            authoritative-layout)
+           control-path authoritative-layout root control))
+         (source-parent
+          (epi-ledger--recovery-capture-source-parent layout))
+         (_names-bound
+          (epi-ledger--recovery-require-final-name-separation layout))
+         (transaction-state
+          (epi-ledger--recovery-capture-transaction-entry-state-core-raw
+           layout transaction
+           (epi-ledger--recovery-phase-transaction-entry-names
+            layout nil)))
+         (source
+          (epi-ledger--recovery-layout-raw-source-path layout))
+         (source-objects
+          (epi-ledger--recovery-layout-raw-source-objects-path layout))
+         (inspection
+          (epi-ledger--recovery-inspect-path-raw
+           source 'allow-one-incomplete-final-frame))
+         (plan
+          (epi-ledger--recovery-plan-reseal
+           inspection
+           (epi-ledger--object-value manifest "destination_session_id")
+           (epi-ledger--object-value manifest "origin_id")
+           (epi-ledger--object-value manifest "fixed_timestamp")))
+         (proof (epi-ledger--recovery-reseal-plan-source-proof plan))
+         (tree-proof
+          (let ((epi-ledger--directory-stat-function
+                 #'epi-ledger--stat-local-directory))
+            (epi-ledger--recovery-source-object-tree-state layout)))
+         (tree-state (plist-get tree-proof :state))
+         (tree-identity (plist-get tree-proof :identity))
+         (reachable-proof
+          (let ((epi-ledger--stat-function #'epi-ledger--stat-local-file)
+                (epi-ledger--read-function #'epi-ledger--read-bytes))
+            (epi-ledger--recovery-reachable-objects
+             inspection proof layout tree-state)))
+         (reachable (nth 0 reachable-proof))
+         (reachable-identities (nth 1 reachable-proof))
+         (destination-parent-path
+          (epi-ledger--recovery-destination-parent-path layout))
+         (destination-parent-initial
+          (epi-ledger--recovery-raw-directory-stat
+           destination-parent-path))
+         (destination-parent
+          (epi-ledger--recovery-require-bound-directory-raw
+           destination-parent-path
+           destination-parent-initial
+           (plist-get destination-parent-initial :device)))
+         (prepared-manifest
+          (epi-ledger--recovery-manifest-object
+           proof plan
+           (epi-ledger--object-value manifest "recovery_id")
+           layout tree-state reachable))
+         (provisional
+          (epi-ledger--make-recovery-preflight
+           :inspection inspection :source-proof proof :reseal-plan plan
+           :recovery-id
+           (epi-ledger--object-value manifest "recovery_id")
+           :layout layout :source-parent-identity source-parent
+           :destination-parent-identity destination-parent
+           :source-object-tree-state tree-state
+           :source-objects-identity tree-identity
+           :reachable-objects reachable
+           :reachable-object-identities reachable-identities
+           :manifest-object prepared-manifest
+           :manifest-bytes
+           (epi-ledger--recovery-manifest-encode prepared-manifest)))
+         (expected
+          (epi-ledger--recovery-manifest-for-phase
+           provisional expected-phase))
+         (_manifest-bound
+          (unless (equal manifest-bytes (nth 1 expected))
+            (epi-ledger--recovery-manifest-invalid)))
+         (preflight
+          (epi-ledger--make-recovery-preflight
+           :inspection inspection :source-proof proof :reseal-plan plan
+           :recovery-id
+           (epi-ledger--object-value manifest "recovery_id")
+           :layout layout :source-parent-identity source-parent
+           :destination-parent-identity destination-parent
+           :source-object-tree-state tree-state
+           :source-objects-identity tree-identity
+           :reachable-objects reachable
+           :reachable-object-identities reachable-identities
+           :manifest-object (nth 0 expected)
+           :manifest-bytes manifest-bytes))
+         (complete-source-object-proof
+          (when (eq tree-state 'present)
+            (epi-ledger--recovery-source-object-proof-at
+             preflight source-objects tree-identity)))
+         (items (epi-ledger--recovery-transfer-items preflight))
+         (stage
+          (epi-ledger--recovery-capture-object-stage
+           preflight layout items destination-parent))
+         (staged-ledger-path
+          (epi-ledger--recovery-layout-raw-staged-destination-ledger-path
+           layout))
+         (staged-ledger
+          (epi-ledger--recovery-inspect-complete-destination
+           preflight staged-ledger-path))
+         (source-last-record
+          (epi-ledger--recovery-snapshot-complete-record
+           (epi-ledger--inspection-raw-last-record inspection)))
+         (prepared
+          (epi-ledger--make-recovery-prepared
+           :preflight preflight
+           :quarantine-anchor-identity root
+           :quarantine-root-identity root
+           :control-identity control
+           :directory-receipts nil
+           :transaction-identity transaction
+           :manifest-identity manifest-identity
+           :transaction-entry-state transaction-state
+           :source-last-record source-last-record
+           :path-layout layout))
+         lock refreshed-inspection refreshed-last handed-off)
+    (epi-ledger--recovery-require-transferred-absences-raw layout)
+    (setq source-last-record
+          (epi-ledger--recovery-require-complete-source-record
+           source-last-record preflight)
+          lock
+          (epi-ledger--recovery-acquire-phase-lock
+           preflight source-last-record))
+    (unwind-protect
+        (progn
+          (setq refreshed-inspection
+                (epi-ledger--recovery-inspect-path-raw
+                 source 'allow-one-incomplete-final-frame))
+          (unless
+              (epi-ledger--recovery-source-proof-equal-p
+               proof
+               (epi-ledger--recovery-snapshot-source-proof
+                refreshed-inspection))
+            (epi-ledger--fail
+             'epi-ledger-conflict 'recovery-preflight-changed))
+          (setq refreshed-last
+                (epi-ledger--recovery-snapshot-complete-record
+                 (epi-ledger--inspection-raw-last-record
+                  refreshed-inspection)))
+          (setq refreshed-last
+                (epi-ledger--recovery-require-complete-source-record
+                 refreshed-last preflight))
+          (when complete-source-object-proof
+            (epi-ledger--recovery-require-source-object-proof-raw
+             complete-source-object-proof device))
+          (epi-ledger--recovery-require-transfer-authority-raw
+           prepared items (nth 1 stage) (nth 2 stage) (nth 1 staged-ledger)
+           destination-parent refreshed-last lock manifest-identity
+           transaction-state)
+          (let ((result
+                 (list
+                  (epi-ledger--make-recovery-phase-state
+                   :phase 'objects-transferred
+                   :preflight preflight
+                   :path-layout layout
+                   :source-last-record
+                   (epi-ledger--copy-record refreshed-last)
+                   :quarantine-anchor-identity
+                   (epi-ledger--copy-tree-and-strings root)
+                   :quarantine-root-identity
+                   (epi-ledger--copy-tree-and-strings root)
+                   :control-identity
+                   (epi-ledger--copy-tree-and-strings control)
+                   :directory-receipts nil
+                   :transaction-identity
+                   (epi-ledger--copy-tree-and-strings transaction)
+                   :manifest-identity
+                   (epi-ledger--recovery-copy-file-identity
+                    manifest-identity)
+                   :manifest-bytes
+                   (substring-no-properties manifest-bytes)
+                   :transaction-entry-state
+                   (epi-ledger--copy-tree-and-strings transaction-state)
+                   :destination-parent-identity
+                   (epi-ledger--copy-tree-and-strings destination-parent)
+                   :staged-object-root-identity
+                   (epi-ledger--copy-tree-and-strings (nth 0 stage))
+                   :staged-directory-receipts
+                   (epi-ledger--copy-tree-and-strings (nth 1 stage))
+                   :staged-object-receipts
+                   (epi-ledger--copy-tree-and-strings (nth 2 stage))
+                   :staged-ledger-identity
+                   (epi-ledger--recovery-copy-file-identity
+                    (nth 1 staged-ledger)))
+                  (epi-ledger--recovery-copy-lock lock)
+                  (and complete-source-object-proof
+                       (epi-ledger--copy-tree-and-strings
+                        complete-source-object-proof)))))
+            (setq handed-off t)
+            result))
+      (unless handed-off
+        (epi-ledger--recovery-release-phase-lock-raw lock)))))
+
+(defun epi-ledger--recovery-destination-complete-path (layout)
+  "Return LAYOUT's canonical destination-object completion marker path."
+  (expand-file-name
+   "complete.jcs"
+   (file-name-as-directory
+    (epi-ledger--recovery-layout-raw-destination-objects-path layout))))
+
+(defun epi-ledger--recovery-quarantine-complete-path (layout)
+  "Return LAYOUT's canonical final-quarantine completion marker path."
+  (expand-file-name
+   "complete.jcs"
+   (file-name-as-directory
+    (epi-ledger--recovery-layout-raw-final-quarantine-path layout))))
+
+(defun epi-ledger--recovery-final-source-ledger-path (layout)
+  "Return the final quarantined source-ledger path for LAYOUT."
+  (expand-file-name
+   (file-name-nondirectory
+    (epi-ledger--recovery-layout-raw-source-path layout))
+   (file-name-as-directory
+    (epi-ledger--recovery-layout-raw-final-quarantine-path layout))))
+
+(defun epi-ledger--recovery-final-source-objects-path (layout)
+  "Return the final quarantined source-object path for LAYOUT."
+  (concat (epi-ledger--recovery-final-source-ledger-path layout) ".objects"))
+
+(defun epi-ledger--recovery-final-absent-marker-path (layout)
+  "Return the final absent-source-object marker path for LAYOUT."
+  (expand-file-name
+   (file-name-nondirectory
+    (epi-ledger--recovery-layout-raw-absent-source-objects-marker-path
+     layout))
+   (file-name-as-directory
+    (epi-ledger--recovery-layout-raw-final-quarantine-path layout))))
+
+(defun epi-ledger--recovery-require-final-name-separation (layout)
+  "Require LAYOUT's phase-publication names and temporaries to be distinct."
+  (let* ((recovery-id
+          (file-name-nondirectory
+           (directory-file-name
+            (epi-ledger--recovery-layout-raw-transaction-directory layout))))
+         (suffix (concat "epi-recovery-" recovery-id))
+         (destination-marker
+          (epi-ledger--recovery-destination-complete-path layout))
+         (quarantine-marker
+          (epi-ledger--recovery-quarantine-complete-path layout))
+         (destination-paths
+          (list
+           (expand-file-name
+            "sha256"
+            (file-name-as-directory
+             (epi-ledger--recovery-layout-raw-destination-objects-path
+              layout)))
+           destination-marker
+           (epi-ledger--recovery-manifest-pure-hidden-sibling
+            destination-marker suffix)))
+         (source-stage-paths
+          (list
+           (epi-ledger--recovery-layout-raw-staged-source-ledger-path
+            layout)
+           (epi-ledger--recovery-layout-raw-staged-source-objects-path
+            layout)
+           (epi-ledger--recovery-layout-raw-absent-source-objects-marker-path
+            layout)
+           (epi-ledger--recovery-manifest-pure-hidden-sibling
+            (epi-ledger--recovery-layout-raw-absent-source-objects-marker-path
+             layout)
+            suffix)))
+         (quarantine-paths
+          (list
+           (epi-ledger--recovery-final-source-ledger-path layout)
+           (epi-ledger--recovery-final-source-objects-path layout)
+           (epi-ledger--recovery-final-absent-marker-path layout)
+           quarantine-marker
+           (epi-ledger--recovery-manifest-pure-hidden-sibling
+            quarantine-marker suffix))))
+    (dolist
+        (binding
+         `((,(epi-ledger--recovery-destination-parent-path layout)
+            ,@destination-paths)
+           (,(epi-ledger--recovery-layout-raw-transaction-directory layout)
+            ,@source-stage-paths)
+           (,(epi-ledger--recovery-layout-raw-quarantine-root layout)
+            ,@quarantine-paths)))
+      (let ((fold-case
+             (condition-case nil
+                 (let ((file-name-handler-alist nil))
+                   (file-name-case-insensitive-p (car binding)))
+               (file-error nil))))
+        (epi-ledger--recovery-require-distinct-paths
+         (cdr binding) fold-case))))
+  t)
+
+(defun epi-ledger--recovery-require-directory-entries-raw
+    (path expected &optional mismatch-code)
+  "Raw-require PATH to contain exactly the sorted EXPECTED entry names.
+Signal MISMATCH-CODE, or `recovery-path-conflict', on a mismatch."
+  (setq mismatch-code (or mismatch-code 'recovery-path-conflict))
+  (let ((owned
+         (mapcar
+          (lambda (name)
+            (unless (and (stringp name)
+                         (not (string-match-p "[\0/\r\n]" name)))
+              (epi-ledger--fail
+               'epi-ledger-conflict mismatch-code))
+            (substring-no-properties name))
+          expected)))
+    (setq owned (sort owned #'string<))
+    (unless (equal owned
+                   (epi-ledger--recovery-raw-directory-entry-names
+                    path (length owned)))
+      (epi-ledger--fail
+       'epi-ledger-conflict mismatch-code))
+    owned))
+
+(defun epi-ledger--recovery-require-exact-file-bytes
+    (path identity bytes code &optional expected-links)
+  "Require PATH as exact private IDENTITY containing unibyte BYTES.
+Signal CODE on any identity, mode, size, or byte mismatch.  EXPECTED-LINKS
+defaults to one."
+  (unless (and (stringp bytes) (not (multibyte-string-p bytes)))
+    (epi-ledger--fail 'epi-ledger-conflict code))
+  (let ((first
+         (epi-ledger--recovery-require-private-file-state-raw
+          path identity (length bytes) code t expected-links))
+        read observed)
+    (setq read
+          (epi-ledger--recovery-read-exact-bytes-raw
+           path first (length bytes) code expected-links)
+          observed (car read))
+    (unless (equal bytes observed)
+      (epi-ledger--fail 'epi-ledger-conflict code))
+    (let ((second (nth 1 read)))
+      (unless (equal first second)
+        (epi-ledger--fail 'epi-ledger-conflict code))
+      second)))
+
+(defun epi-ledger--recovery-publish-marker
+    (preflight path bytes role)
+  "Publish canonical phase BYTES as private marker PATH for PREFLIGHT.
+ROLE identifies the private temporary reservation to lexical receipt code."
+  (let* ((recovery-id
+          (epi-ledger--recovery-preflight-raw-recovery-id preflight))
+         (temporary
+          (epi-ledger--hidden-sibling
+           path (concat "epi-recovery-" recovery-id)))
+         (hash (epi-ledger--hash bytes 'recovery-marker))
+         temporary-receipt publication-receipt returned complete)
+    (when (or (epi-ledger--raw-object-name-state path)
+              (epi-ledger--raw-object-name-state temporary))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (let ((epi-ledger--recovery-file-receipt-receiver nil)
+          (epi-ledger--publication-receipt-receiver nil))
+      (setq returned
+            (epi-ledger--recovery-copy-object-bytes
+             temporary bytes (length bytes) hash
+             (lambda (received-role received-path identity)
+               (unless (and (eq received-role role)
+                            (equal received-path temporary)
+                            (null temporary-receipt))
+                 (epi-ledger--fail
+                  'epi-ledger-conflict 'recovery-path-conflict))
+               (setq temporary-receipt
+                     (epi-ledger--recovery-copy-file-identity identity)))
+             role))
+      (unless (and temporary-receipt
+                   (epi-ledger--same-file-object-p
+                    temporary-receipt returned))
+        (epi-ledger--fail
+         'epi-ledger-conflict 'recovery-path-conflict))
+      (setq temporary-receipt
+            (epi-ledger--recovery-copy-file-identity returned))
+      (epi-ledger--publish-object
+       temporary path temporary-receipt
+       (lambda (received-path identity)
+         (unless (and (equal received-path path)
+                      (null publication-receipt))
+           (epi-ledger--fail
+            'epi-ledger-conflict 'recovery-path-conflict))
+         (setq publication-receipt
+               (epi-ledger--recovery-copy-file-identity identity))))
+      (unless (and publication-receipt
+                   (epi-ledger--same-file-object-p
+                    temporary-receipt publication-receipt))
+        (epi-ledger--fail
+         'epi-ledger-conflict 'storage-publication-failed :published t))
+      (epi-ledger--delete-owned-object-name
+       temporary temporary-receipt t)
+      (when (epi-ledger--raw-object-name-state temporary)
+        (epi-ledger--fail
+         'epi-ledger-conflict 'storage-publication-failed :published t))
+      (setq complete
+            (epi-ledger--recovery-require-exact-file-bytes
+             path
+             (epi-ledger--recovery-capture-manifest-epoch-raw
+              path (length bytes) publication-receipt)
+             bytes 'recovery-manifest-invalid)))
+    complete))
+
+(defun epi-ledger--recovery-link-move-file
+    (source target expected device source-parent-identity
+            target-parent-identity content-verifier receipt-receiver)
+  "No-clobber move exact regular SOURCE to TARGET on DEVICE.
+EXPECTED binds SOURCE's file identity.  The move is a hard link, exact
+verification, and a source-name unlink performed in the callback-masked epoch.
+As with other portable pathname deletion, an external ABA between proof and
+delete remains the Section 14 boundary.  SOURCE-PARENT-IDENTITY and
+TARGET-PARENT-IDENTITY bind both containing directory objects.  After
+optionally delivering TARGET's post-link identity to RECEIPT-RECEIVER,
+CONTENT-VERIFIER must cooperatively re-authenticate TARGET's caller-specific
+bytes and return the same exact two-link identity.  The final identity proof
+and source unlink then run in one callback-free epoch."
+  (let ((owned-source (substring-no-properties source))
+        (owned-target (substring-no-properties target))
+        (owned-expected
+         (epi-ledger--recovery-copy-file-identity expected))
+        (owned-source-parent
+         (epi-ledger--recovery-copy-directory-identity
+          source-parent-identity))
+        (owned-target-parent
+         (epi-ledger--recovery-copy-directory-identity
+          target-parent-identity))
+        source-parent target-parent
+        linked-condition linked-source linked-target linked-target-receipt
+        verified-target final)
+    (setq source-parent
+          (directory-file-name (file-name-directory owned-source))
+          target-parent
+          (directory-file-name (file-name-directory owned-target)))
+    (unless
+        (and (functionp content-verifier)
+             (equal source-parent (plist-get owned-source-parent :path))
+             (equal target-parent (plist-get owned-target-parent :path))
+             (equal device (plist-get owned-source-parent :device))
+             (equal device (plist-get owned-target-parent :device)))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (epi-ledger--recovery-require-bound-directory-raw
+     source-parent owned-source-parent device)
+    (epi-ledger--recovery-require-bound-directory-raw
+     target-parent owned-target-parent device)
+    (epi-ledger--recovery-require-private-file-state-raw
+     owned-source owned-expected (plist-get owned-expected :size)
+     'recovery-path-conflict t)
+    (when (epi-ledger--raw-object-name-state owned-target)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (condition-case condition
+        (let ((file-name-handler-alist nil))
+          (add-name-to-file owned-source owned-target nil))
+      ((error quit) (setq linked-condition condition)))
+    (setq linked-source (epi-ledger--raw-object-name-state owned-source)
+          linked-target (epi-ledger--raw-object-name-state owned-target))
+    (unless
+        (and (listp linked-source) (listp linked-target)
+             (epi-ledger--same-file-object-p owned-expected linked-source)
+             (epi-ledger--same-file-object-p linked-source linked-target)
+             (equal device (plist-get linked-target :device))
+             (= 2 (or (plist-get linked-source :links) -1))
+             (= 2 (or (plist-get linked-target :links) -1))
+             (= #o600 (epi-ledger--recovery-raw-mode owned-target)))
+      (if linked-target
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-path-conflict)
+        (if linked-condition
+            (signal (car linked-condition) (cdr linked-condition))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'storage-publication-failed))))
+    (setq linked-target-receipt
+          (epi-ledger--recovery-copy-file-identity linked-target))
+    (when receipt-receiver
+      (funcall
+       receipt-receiver owned-target
+       (epi-ledger--recovery-copy-file-identity linked-target-receipt)))
+    (when linked-condition
+      (signal (car linked-condition) (cdr linked-condition)))
+    ;; A receipt may allocate or run arbitrary callback code.  Suppress GC
+    ;; callbacks while the caller cooperatively re-authenticates the linked
+    ;; bytes, then re-enter a smaller nonpreemptible epoch for the final exact
+    ;; proof and unlink.  The cooperative scan deliberately retains normal GC,
+    ;; quit, deadline, and yield behavior.
+    (let ((file-name-handler-alist nil)
+          (post-gc-hook nil)
+          (epi-ledger--stat-function #'epi-ledger--stat-local-file)
+          (epi-ledger--directory-stat-function
+           #'epi-ledger--stat-local-directory)
+          (epi-ledger--read-function #'epi-ledger--read-bytes)
+          (epi-ledger--nonpreemptible-observer nil))
+      (setq verified-target
+            (epi-ledger--recovery-copy-file-identity
+             (funcall
+              content-verifier owned-target
+              (epi-ledger--recovery-copy-file-identity
+               linked-target-receipt))))
+      (unless (and (equal linked-target-receipt verified-target)
+                   (equal owned-target (plist-get verified-target :path))
+                   (equal device (plist-get verified-target :device))
+                   (= (plist-get owned-expected :size)
+                      (or (plist-get verified-target :size) -1))
+                   (= 2 (or (plist-get verified-target :links) -1))
+                   (= #o600 (epi-ledger--recovery-raw-mode owned-target)))
+        (epi-ledger--fail
+         'epi-ledger-conflict 'recovery-path-conflict))
+      (let ((gc-cons-threshold most-positive-fixnum)
+            (inhibit-quit t)
+            (epi--yield-function #'ignore)
+            (epi--deadline-clock-function #'float-time))
+        (epi-ledger--recovery-require-bound-directory-raw
+         source-parent owned-source-parent device)
+        (epi-ledger--recovery-require-bound-directory-raw
+         target-parent owned-target-parent device)
+        (setq linked-source
+              (epi-ledger--raw-object-name-state owned-source)
+              linked-target
+              (epi-ledger--raw-object-name-state owned-target))
+        (unless
+            (and (listp linked-source) (listp linked-target)
+                 (equal linked-target-receipt linked-target)
+                 (equal verified-target linked-target)
+                 (epi-ledger--same-file-object-p
+                  owned-expected linked-source)
+                 (epi-ledger--same-file-object-p
+                  linked-source linked-target)
+                 (equal device (plist-get linked-source :device))
+                 (equal device (plist-get linked-target :device))
+                 (= (plist-get owned-expected :size)
+                    (or (plist-get linked-source :size) -1))
+                 (= (plist-get owned-expected :size)
+                    (or (plist-get linked-target :size) -1))
+                 (= 2 (or (plist-get linked-source :links) -1))
+                 (= 2 (or (plist-get linked-target :links) -1))
+                 (= #o600 (epi-ledger--recovery-raw-mode owned-source))
+                 (= #o600 (epi-ledger--recovery-raw-mode owned-target)))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-path-conflict))
+        (epi-ledger--recovery-require-bound-directory-raw
+         source-parent owned-source-parent device)
+        (epi-ledger--recovery-require-bound-directory-raw
+         target-parent owned-target-parent device)
+        (condition-case nil
+            (delete-file owned-source)
+          (file-error
+           (epi-ledger--fail
+            'epi-ledger-conflict 'storage-publication-failed :published t)))
+        (let ((source-after
+               (epi-ledger--raw-object-name-state owned-source))
+              (target-after
+               (epi-ledger--raw-object-name-state owned-target)))
+          (unless
+              (and (null source-after)
+                   (listp target-after)
+                   (epi-ledger--same-file-object-p
+                    owned-expected target-after)
+                   (equal device (plist-get target-after :device))
+                   (= (plist-get owned-expected :size)
+                      (or (plist-get target-after :size) -1))
+                   (= 1 (or (plist-get target-after :links) -1))
+                   (= #o600 (epi-ledger--recovery-raw-mode owned-target)))
+            (epi-ledger--fail
+             'epi-ledger-conflict 'storage-publication-failed :published t))
+          (epi-ledger--recovery-require-bound-directory-raw
+           source-parent owned-source-parent device)
+          (epi-ledger--recovery-require-bound-directory-raw
+           target-parent owned-target-parent device)
+          (setq final target-after))))
+    final))
+
+(defun epi-ledger--recovery-object-tree-shape (root items marker-path)
+  "Return the expected tree shape rooted at ROOT for ITEMS and MARKER-PATH."
+  (let ((sha (expand-file-name "sha256" (file-name-as-directory root)))
+        prefixes files)
+    (dotimes (index (length items))
+      (let ((hash (plist-get (aref items index) :hash)))
+        (cl-pushnew (substring hash 0 2) prefixes :test #'equal)
+        (push
+         (cons hash
+               (epi-ledger--recovery-object-path-under-root root hash))
+         files)))
+    (setq prefixes (sort prefixes #'string<)
+          files (sort files (lambda (left right)
+                              (string< (car left) (car right)))))
+    (list
+     (append
+      (list (cons root
+                  (sort
+                   (append (list "sha256")
+                           (when marker-path
+                             (list (file-name-nondirectory marker-path))))
+                   #'string<))
+            (cons sha prefixes))
+      (mapcar
+       (lambda (prefix)
+         (cons
+          (expand-file-name prefix (file-name-as-directory sha))
+          (mapcar
+           #'car
+           (seq-filter
+            (lambda (entry)
+              (equal prefix (substring (car entry) 0 2)))
+            files))))
+       prefixes))
+     files)))
+
+(defun epi-ledger--recovery-rebase-object-tree-path
+    (path source-root target-root)
+  "Rebase canonical object-tree PATH from SOURCE-ROOT below TARGET-ROOT."
+  (if (equal path source-root)
+      (substring-no-properties target-root)
+    (let ((prefix (file-name-as-directory source-root)))
+      (unless (string-prefix-p prefix path)
+        (epi-ledger--fail
+         'epi-ledger-conflict 'recovery-object-content-changed))
+      (expand-file-name
+       (substring path (length prefix))
+       (file-name-as-directory target-root)))))
+
+(defun epi-ledger--recovery-object-tree-proof-from-receipts
+    (root items device directory-receipts file-receipts)
+  "Build markerless object-tree authority from already proven receipts.
+ROOT and ITEMS determine every accepted path.  DEVICE, DIRECTORY-RECEIPTS,
+and FILE-RECEIPTS must describe exactly that tree; no object bytes are read."
+  (let* ((owned-root
+          (directory-file-name (substring-no-properties root)))
+         (owned-items (epi-ledger--copy-tree-and-strings items))
+         (shape
+          (epi-ledger--recovery-object-tree-shape
+           owned-root owned-items nil))
+         (directories (nth 0 shape))
+         (files (nth 1 shape))
+         (directory-paths (mapcar #'car directories))
+         (receipt-directory-paths (mapcar #'car directory-receipts))
+         (file-paths (sort (mapcar #'cdr files) #'string<))
+         (receipt-file-paths
+          (sort (mapcar #'car file-receipts) #'string<))
+         owned-directories owned-files)
+    (unless (and (vectorp owned-items)
+                 (equal directory-paths receipt-directory-paths)
+                 (equal file-paths receipt-file-paths)
+                 (epi-ledger--device-token-p device))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-object-content-changed))
+    (dolist (entry directories)
+      (let ((receipt (assoc (car entry) directory-receipts)))
+        (unless (and receipt (listp (cdr receipt)))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+        (push
+         (cons
+          (substring-no-properties (car entry))
+          (epi-ledger--recovery-copy-directory-identity (cdr receipt)))
+         owned-directories)))
+    (setq owned-directories (nreverse owned-directories))
+    (dolist (entry files)
+      (let ((receipt (assoc (cdr entry) file-receipts)))
+        (unless (and receipt (listp (cdr receipt)))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+        (push
+         (cons
+          (substring-no-properties (cdr entry))
+          (epi-ledger--recovery-copy-file-identity (cdr receipt)))
+         owned-files)))
+    (setq owned-files (nreverse owned-files))
+    (let ((proof
+           (list :root owned-root
+                 :shape (epi-ledger--copy-tree-and-strings directories)
+                 :directories owned-directories
+                 :files owned-files
+                 :items owned-items
+                 :device (epi-ledger--copy-device-token device)
+                 :marker-path nil :marker-identity nil :marker-bytes nil)))
+      (epi-ledger--recovery-require-object-tree-proof-raw proof)
+      (epi-ledger--copy-tree-and-strings proof))))
+
+(defun epi-ledger--recovery-transfer-object-tree-no-clobber
+    (source-proof target-root target-parent-identity)
+  "Move exact markerless SOURCE-PROOF below absent TARGET-ROOT.
+Every target directory is exclusively reserved.  Each object leaf is installed
+by a no-clobber hard link, re-authenticated against its proof-bound size and
+SHA-256 while both names remain, and only then removed at its source name after
+exact receipt reproof.  Return the fully rebased authority proof.
+TARGET-PARENT-IDENTITY binds the target root's parent directory."
+  (let* ((proof (epi-ledger--copy-tree-and-strings source-proof))
+         (source-root (plist-get proof :root))
+         (items (plist-get proof :items))
+         (device (plist-get proof :device))
+         (owned-target
+          (directory-file-name (substring-no-properties target-root)))
+         (target-parent
+          (directory-file-name (file-name-directory owned-target)))
+         (source-parent
+          (directory-file-name (file-name-directory source-root)))
+         (source-parent-identity
+          (epi-ledger--recovery-raw-directory-stat source-parent))
+         (source-directories (plist-get proof :directories))
+         (source-files (plist-get proof :files))
+         target-shape
+         target-directory-receipts target-file-receipts target-proof)
+    (unless (and (stringp source-root)
+                 (vectorp items)
+                 (epi-ledger--device-token-p device)
+                 (null (plist-get proof :marker-path))
+                 (null (plist-get proof :marker-identity))
+                 (null (plist-get proof :marker-bytes))
+                 (equal owned-target
+                        (epi-ledger--resolve-local-write-path owned-target))
+                 (equal target-parent
+                        (plist-get target-parent-identity :path)))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (epi-ledger--recovery-require-separated-top-level-paths
+     (list source-root owned-target)
+     (epi-ledger--recovery-path-set-case-insensitive-p
+      (list source-root owned-target)))
+    (epi-ledger--recovery-require-object-tree-proof-raw proof)
+    (setq source-parent-identity
+          (epi-ledger--recovery-require-bound-directory-raw
+           source-parent source-parent-identity device))
+    (setq target-shape
+          (mapcar
+           (lambda (entry)
+             (cons
+              (epi-ledger--recovery-rebase-object-tree-path
+               (car entry) source-root owned-target)
+              (mapcar #'substring-no-properties (cdr entry))))
+           (plist-get proof :shape)))
+    (epi-ledger--recovery-require-bound-directory-raw
+     target-parent target-parent-identity device)
+    (when (epi-ledger--recovery-name-kind owned-target)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (dolist (entry target-shape)
+      (push
+       (cons
+        (substring-no-properties (car entry))
+        (epi-ledger--recovery-reserve-publication-directory
+         (car entry) device))
+       target-directory-receipts)
+      (epi-ledger--recovery-require-bound-directory-raw
+       target-parent target-parent-identity device)
+      (epi-ledger--recovery-require-bound-directory-raw
+       source-parent source-parent-identity device))
+    (setq target-directory-receipts
+          (nreverse target-directory-receipts))
+    (dolist (source-entry source-files)
+      (let* ((source-path (car source-entry))
+             (hash (file-name-nondirectory source-path))
+             (target
+              (epi-ledger--recovery-rebase-object-tree-path
+               source-path source-root owned-target))
+             (source-leaf-parent
+              (directory-file-name (file-name-directory source-path)))
+             (target-leaf-parent
+              (directory-file-name (file-name-directory target)))
+             (source-parent-receipt
+              (assoc source-leaf-parent source-directories))
+             (target-parent-receipt
+              (assoc target-leaf-parent target-directory-receipts))
+             (item
+              (seq-find
+               (lambda (candidate)
+                 (equal hash (plist-get candidate :hash)))
+               items))
+             (moved
+              (and source-entry item source-parent-receipt
+                   target-parent-receipt
+                   (epi-ledger--recovery-link-move-file
+                    source-path target (cdr source-entry) device
+                    (cdr source-parent-receipt)
+                    (cdr target-parent-receipt)
+                    (lambda (path identity)
+                      (epi-ledger--recovery-verify-linked-object
+                       path identity (plist-get item :size) hash))
+                    nil))))
+        (unless (and moved
+                     (equal target (plist-get moved :path))
+                     (epi-ledger--same-file-object-p
+                      (cdr source-entry) moved)
+                     (= (plist-get item :size)
+                        (or (plist-get moved :size) -1))
+                     (= 1 (or (plist-get moved :links) -1))
+                     (= #o600 (epi-ledger--recovery-raw-mode target)))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+        (push
+         (cons
+          (substring-no-properties target)
+          (epi-ledger--recovery-copy-file-identity moved))
+         target-file-receipts)
+        (epi-ledger--recovery-require-bound-directory-raw
+         target-parent target-parent-identity device)
+        (epi-ledger--recovery-require-bound-directory-raw
+         source-parent source-parent-identity device)))
+    (setq target-file-receipts (nreverse target-file-receipts))
+    (let (closed-directories)
+      (dolist (entry target-shape)
+        (let* ((path (car entry))
+               (receipt (assoc path target-directory-receipts)))
+          (epi-ledger--recovery-require-directory-entries-raw
+           path (cdr entry))
+          (push
+           (cons
+            (substring-no-properties path)
+            (epi-ledger--recovery-require-bound-directory-raw
+             path (cdr receipt) device #o700))
+           closed-directories)))
+      (setq target-proof
+            (list
+             :root owned-target
+             :shape (epi-ledger--copy-tree-and-strings target-shape)
+             :directories (nreverse closed-directories)
+             :files (epi-ledger--copy-tree-and-strings target-file-receipts)
+             :items (epi-ledger--copy-tree-and-strings items)
+             :device (epi-ledger--copy-device-token device)
+             :marker-path nil :marker-identity nil :marker-bytes nil)))
+    (epi-ledger--recovery-require-object-tree-proof-raw target-proof)
+    (dolist (entry (reverse (copy-sequence (plist-get proof :shape))))
+      (let* ((path (car entry))
+             (receipt (assoc path source-directories))
+             (actual
+              (and receipt
+                   (epi-ledger--recovery-require-bound-directory-raw
+                    path (cdr receipt) device #o700))))
+        (unless actual
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+        (epi-ledger--recovery-require-directory-entries-raw path nil)
+        (epi-ledger--recovery-delete-exact-empty-directory path actual)
+        (epi-ledger--recovery-require-bound-directory-raw
+         target-parent target-parent-identity device)
+        (epi-ledger--recovery-require-bound-directory-raw
+         source-parent source-parent-identity device)))
+    (when (epi-ledger--recovery-name-kind source-root)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-object-content-changed))
+    (epi-ledger--recovery-require-object-tree-proof-raw target-proof)
+    (epi-ledger--recovery-require-bound-directory-raw
+     target-parent target-parent-identity device)
+    (epi-ledger--recovery-require-bound-directory-raw
+     source-parent source-parent-identity device)
+    (epi-ledger--copy-tree-and-strings target-proof)))
+
+(defun epi-ledger--recovery-object-tree-proof-add-marker
+    (proof marker-path marker-identity marker-bytes)
+  "Attach exact MARKER-PATH authority to markerless object-tree PROOF.
+Only marker bytes are read; object leaf receipts and content hashes are reused."
+  (let* ((owned (epi-ledger--copy-tree-and-strings proof))
+         (root (plist-get owned :root))
+         (device (plist-get owned :device))
+         (owned-marker (substring-no-properties marker-path))
+         (root-receipt (assoc root (plist-get owned :directories)))
+         (old-shape (plist-get owned :shape))
+         (shape
+          (and old-shape
+               (cons
+                (cons
+                 (substring-no-properties root)
+                 (sort
+                  (cons
+                   (file-name-nondirectory owned-marker)
+                   (mapcar #'substring-no-properties
+                           (cdar old-shape)))
+                  #'string<))
+                (epi-ledger--copy-tree-and-strings (cdr old-shape)))))
+         root-identity result)
+    (unless (and (stringp root)
+                 root-receipt
+                 (equal root (caar old-shape))
+                 (null (plist-get owned :marker-path))
+                 (null (plist-get owned :marker-identity))
+                 (null (plist-get owned :marker-bytes))
+                 (equal root
+                        (directory-file-name
+                         (file-name-directory owned-marker)))
+                 (stringp marker-bytes)
+                 (not (multibyte-string-p marker-bytes)))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-manifest-invalid))
+    (epi-ledger--recovery-require-directory-entries-raw
+     root (cdar shape))
+    (setq root-identity
+          (epi-ledger--recovery-require-bound-directory-raw
+           root (cdr root-receipt) device #o700))
+    (setq marker-identity
+          (epi-ledger--recovery-require-exact-file-bytes
+           owned-marker marker-identity marker-bytes
+           'recovery-manifest-invalid))
+    (setq root-identity
+          (epi-ledger--recovery-require-bound-directory-raw
+           root root-identity device #o700)
+          result
+          (list
+           :root (substring-no-properties root)
+           :shape (epi-ledger--copy-tree-and-strings shape)
+           :directories
+           (mapcar
+            (lambda (entry)
+              (if (equal root (car entry))
+                  (cons
+                   (substring-no-properties root)
+                   (epi-ledger--recovery-copy-directory-identity
+                    root-identity))
+                (epi-ledger--copy-tree-and-strings entry)))
+            (plist-get owned :directories))
+           :files (epi-ledger--copy-tree-and-strings (plist-get owned :files))
+           :items (epi-ledger--copy-tree-and-strings (plist-get owned :items))
+           :device (epi-ledger--copy-device-token device)
+           :marker-path owned-marker
+           :marker-identity
+           (epi-ledger--recovery-copy-file-identity marker-identity)
+           :marker-bytes (substring-no-properties marker-bytes)))
+    (epi-ledger--recovery-require-object-tree-proof-raw result)
+    (epi-ledger--copy-tree-and-strings result)))
+
+(defun epi-ledger--recovery-require-object-tree-proof-raw
+    (proof &optional metadata-only)
+  "Raw-require exact object-tree authority in PROOF.
+Directories and object leaves are always metadata-restated against receipts
+derived from earlier content authentication.  METADATA-ONLY does not weaken
+that closure; when non-nil, it only recloses an optional marker by exact epoch
+without rereading its already authenticated bytes."
+  (let* ((root (plist-get proof :root))
+         (device (plist-get proof :device))
+         (items (plist-get proof :items))
+         (marker-path (plist-get proof :marker-path))
+         (shape (plist-get proof :shape))
+         (directories (plist-get proof :directories))
+         (files (plist-get proof :files))
+         (sha-path
+          (and (stringp root)
+               (expand-file-name "sha256" (file-name-as-directory root))))
+         expected-file-paths expected-hashes)
+    (unless (and (stringp root) (vectorp items)
+                 (epi-ledger--device-token-p device)
+                 (consp shape) (listp directories) (listp files)
+                 (equal root (caar shape))
+                 (equal (mapcar #'car directories) (mapcar #'car shape)))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-object-content-changed))
+    (let* ((root-names (cdar shape))
+           (tail (cdr shape))
+           (sha-present (member "sha256" root-names))
+           (marker-name
+            (and marker-path (file-name-nondirectory marker-path)))
+           (expected-root-names
+            (sort
+             (append (and sha-present (list "sha256"))
+                     (and marker-name (list marker-name)))
+             #'string<)))
+      (unless (and (equal root-names expected-root-names)
+                   (or (null marker-path)
+                       (equal root
+                              (directory-file-name
+                               (file-name-directory marker-path)))))
+        (epi-ledger--fail
+         'epi-ledger-conflict 'recovery-object-content-changed))
+      (if sha-present
+          (let* ((sha-entry (car tail))
+                 (prefix-entries (cdr tail))
+                 (prefixes (mapcar
+                            (lambda (entry)
+                              (file-name-nondirectory (car entry)))
+                            prefix-entries)))
+            (unless (and sha-entry
+                         (equal sha-path (car sha-entry))
+                         (equal (cdr sha-entry) prefixes)
+                         (equal prefixes
+                                (sort (delete-dups (copy-sequence prefixes))
+                                      #'string<)))
+              (epi-ledger--fail
+               'epi-ledger-conflict 'recovery-object-content-changed))
+            (dolist (entry prefix-entries)
+              (let ((prefix (file-name-nondirectory (car entry)))
+                    (hashes (cdr entry)))
+                (unless
+                    (and
+                     (let ((case-fold-search nil))
+                       (string-match-p "\\`[0-9a-f]\\{2\\}\\'" prefix))
+                     (equal
+                      (car entry)
+                      (expand-file-name prefix
+                                        (file-name-as-directory sha-path)))
+                     (equal hashes
+                            (sort (delete-dups (copy-sequence hashes))
+                                  #'string<)))
+                  (epi-ledger--fail
+                   'epi-ledger-conflict 'recovery-object-content-changed))
+                (dolist (hash hashes)
+                  (unless (and (epi-ledger--hash-p hash)
+                               (string-prefix-p prefix hash))
+                    (epi-ledger--fail
+                     'epi-ledger-conflict 'recovery-object-content-changed))
+                  (push hash expected-hashes)
+                  (push
+                   (expand-file-name hash
+                                     (file-name-as-directory (car entry)))
+                   expected-file-paths)))))
+        (when tail
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))))
+    (setq expected-hashes (sort expected-hashes #'string<)
+          expected-file-paths (sort expected-file-paths #'string<))
+    (let (item-hashes)
+      (dotimes (index (length items))
+        (let* ((item (aref items index))
+               (hash (plist-get item :hash))
+               (size (plist-get item :size))
+               (path
+                (seq-find
+                 (lambda (candidate)
+                   (equal hash (file-name-nondirectory candidate)))
+                 expected-file-paths))
+               (receipt (and path (assoc path files))))
+          (unless (and (epi-ledger--hash-p hash)
+                       (epi-ledger--recovery-bounded-unsigned-p size)
+                       (<= size epi-object-byte-limit)
+                       receipt
+                       (= size (or (plist-get (cdr receipt) :size) -1)))
+            (epi-ledger--fail
+             'epi-ledger-conflict 'recovery-object-content-changed))
+          (push hash item-hashes)))
+      (unless (and (equal expected-hashes (sort item-hashes #'string<))
+                   (equal expected-file-paths
+                          (sort (mapcar #'car files) #'string<)))
+        (epi-ledger--fail
+         'epi-ledger-conflict 'recovery-object-content-changed)))
+    (dolist (entry shape)
+      (epi-ledger--recovery-require-directory-entries-raw
+       (car entry) (cdr entry) 'recovery-object-content-changed))
+    (dolist (entry directories)
+      (unless
+          (equal
+           (cdr entry)
+           (epi-ledger--recovery-require-bound-directory-raw
+            (car entry) (cdr entry) device #o700))
+        (epi-ledger--fail
+         'epi-ledger-conflict 'recovery-object-content-changed)))
+    (dolist (entry files)
+      (let* ((path (car entry))
+             (hash (file-name-nondirectory path))
+             (item
+              (seq-find
+               (lambda (candidate)
+                 (equal hash (plist-get candidate :hash)))
+               items)))
+        (unless item
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+        (epi-ledger--recovery-require-private-file-state-raw
+         path (cdr entry) (plist-get item :size)
+         'recovery-object-content-changed t)))
+    (if marker-path
+        (unless
+            (equal
+             (plist-get proof :marker-identity)
+             (if metadata-only
+                 (epi-ledger--recovery-require-private-file-state-raw
+                  marker-path
+                  (plist-get proof :marker-identity)
+                  (length (plist-get proof :marker-bytes))
+                  'recovery-manifest-invalid t)
+               (epi-ledger--recovery-require-exact-file-bytes
+                marker-path
+                (plist-get proof :marker-identity)
+                (plist-get proof :marker-bytes)
+                'recovery-manifest-invalid)))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-manifest-invalid))
+      (when (or (plist-get proof :marker-identity)
+                (plist-get proof :marker-bytes))
+        (epi-ledger--fail
+         'epi-ledger-conflict 'recovery-manifest-invalid)))
+    t))
+
+(defun epi-ledger--recovery-require-destination-inspection
+    (inspection preflight path &optional expected-links)
+  "Require complete destination INSPECTION for PREFLIGHT at PATH.
+EXPECTED-LINKS defaults to one."
+  (setq expected-links (or expected-links 1))
+  (let* ((plan (epi-ledger--recovery-preflight-raw-reseal-plan preflight))
+         (header (epi-ledger--inspection-raw-header inspection))
+         (identity (epi-ledger--inspection-raw-file-identity inspection)))
+    (unless
+        (and (epi-ledger--inspection-p inspection)
+             (eq 'complete (epi-ledger--inspection-raw-state inspection))
+             (equal path
+                    (epi-ledger--inspection-raw-canonical-path inspection))
+             (= (epi-ledger--recovery-reseal-plan-byte-size plan)
+                (epi-ledger--inspection-raw-source-size inspection))
+             (= (1+ (epi-ledger--recovery-reseal-plan-output-record-count plan))
+                (epi-ledger--inspection-raw-next-sequence inspection))
+             (equal
+              (epi-ledger--recovery-reseal-plan-destination-session-id plan)
+              (epi-header--raw-session-id header))
+             (equal
+              (epi-ledger--recovery-reseal-plan-destination-header-sha256 plan)
+              (epi-header--raw-hash header))
+             (equal
+              (epi-ledger--recovery-reseal-plan-final-head plan)
+              (epi-ledger--inspection-raw-valid-prefix-head inspection))
+             (= expected-links (or (plist-get identity :links) -1))
+             (= #o600 (epi-ledger--recovery-raw-mode path)))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-staged-ledger-invalid))
+    inspection))
+
+(defun epi-ledger--recovery-destination-ledger-authority-from-inspection
+    (inspection preflight path identity)
+  "Project complete destination INSPECTION into owned scalar authority.
+PREFLIGHT and PATH define the expected ledger; IDENTITY is its exact closed
+post-inspection file generation."
+  (epi-ledger--recovery-require-destination-inspection
+   inspection preflight path)
+  (unless
+      (equal identity (epi-ledger--inspection-raw-file-identity inspection))
+    (epi-ledger--fail
+     'epi-ledger-conflict 'recovery-staged-ledger-invalid))
+  (let ((header (epi-ledger--inspection-raw-header inspection)))
+    (epi-ledger--make-recovery-destination-ledger-authority
+     :canonical-path (substring-no-properties path)
+     :file-identity
+     (epi-ledger--recovery-copy-file-identity identity)
+     :source-size (epi-ledger--inspection-raw-source-size inspection)
+     :next-sequence (epi-ledger--inspection-raw-next-sequence inspection)
+     :session-id
+     (substring-no-properties (epi-header--raw-session-id header))
+     :header-sha256
+     (substring-no-properties (epi-header--raw-hash header))
+     :valid-prefix-head
+     (substring-no-properties
+      (epi-ledger--inspection-raw-valid-prefix-head inspection)))))
+
+(defun epi-ledger--recovery-require-destination-ledger-authority
+    (authority preflight path staged-identity)
+  "Require scalar destination-ledger AUTHORITY for PREFLIGHT at PATH.
+STAGED-IDENTITY binds the content-authenticated file object before its move."
+  (let* ((plan (epi-ledger--recovery-preflight-raw-reseal-plan preflight))
+         (identity
+          (and
+           (epi-ledger--recovery-exact-record-p
+            authority #'epi-ledger--recovery-destination-ledger-authority-p
+            epi-ledger--recovery-destination-ledger-authority-record-size)
+           (epi-ledger--recovery-destination-ledger-authority-raw-file-identity
+            authority)))
+         (source-size
+          (and identity
+               (epi-ledger--recovery-destination-ledger-authority-raw-source-size
+                authority)))
+         (next-sequence
+          (and identity
+               (epi-ledger--recovery-destination-ledger-authority-raw-next-sequence
+                authority))))
+    (unless
+        (and
+         identity
+         (epi-ledger--same-file-object-p staged-identity identity)
+         (stringp
+          (epi-ledger--recovery-destination-ledger-authority-raw-canonical-path
+           authority))
+         (equal
+          path
+          (epi-ledger--recovery-destination-ledger-authority-raw-canonical-path
+           authority))
+         (integerp source-size)
+         (integerp next-sequence)
+         (= (epi-ledger--recovery-reseal-plan-byte-size plan) source-size)
+         (= (1+ (epi-ledger--recovery-reseal-plan-output-record-count plan))
+            next-sequence)
+         (equal
+          (epi-ledger--recovery-reseal-plan-destination-session-id plan)
+          (epi-ledger--recovery-destination-ledger-authority-raw-session-id
+           authority))
+         (equal
+          (epi-ledger--recovery-reseal-plan-destination-header-sha256 plan)
+          (epi-ledger--recovery-destination-ledger-authority-raw-header-sha256
+           authority))
+         (equal
+          (epi-ledger--recovery-reseal-plan-final-head plan)
+          (epi-ledger--recovery-destination-ledger-authority-raw-valid-prefix-head
+           authority))
+         (= 1 (or (plist-get identity :links) -1))
+         (= #o600 (epi-ledger--recovery-raw-mode path))
+         (equal
+          identity
+          (epi-ledger--recovery-require-private-file-state-raw
+           path identity source-size 'recovery-staged-ledger-invalid t)))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-staged-ledger-invalid))
+    authority))
+
+(defun epi-ledger--recovery-require-destination-object-origin-raw
+    (state proof)
+  "Bind destination object PROOF to STATE's authenticated staged file objects."
+  (let* ((preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (expected-items (epi-ledger--recovery-transfer-items preflight))
+         (expected-files
+          (epi-ledger--recovery-phase-state-raw-staged-object-receipts state))
+         (actual-files (plist-get proof :files))
+         (expected-by-hash
+          (sort
+           (mapcar
+            (lambda (entry)
+              (cons (file-name-nondirectory (car entry)) (cdr entry)))
+            expected-files)
+           (lambda (left right) (string< (car left) (car right)))))
+         (actual-by-hash
+          (sort
+           (mapcar
+            (lambda (entry)
+              (cons (file-name-nondirectory (car entry)) (cdr entry)))
+            actual-files)
+           (lambda (left right) (string< (car left) (car right))))))
+    (unless
+        (and
+         (equal expected-items (plist-get proof :items))
+         (equal (mapcar #'car expected-by-hash)
+                (mapcar #'car actual-by-hash))
+         (cl-every
+          (lambda (expected actual)
+            (and (equal (car expected) (car actual))
+                 (epi-ledger--same-file-object-p
+                  (cdr expected) (cdr actual))))
+          expected-by-hash actual-by-hash))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-object-content-changed))
+    proof))
+
+(defun epi-ledger--recovery-require-moved-source
+    (path original &optional expected-links)
+  "Inspect moved source PATH and require ORIGINAL content authority.
+EXPECTED-LINKS defaults to one."
+  (setq expected-links (or expected-links 1))
+  (let* ((inspection
+          (epi-ledger--recovery-inspect-path-raw
+           path 'allow-one-incomplete-final-frame))
+         (observed (epi-ledger--recovery-snapshot-source-proof inspection))
+         (original-identity
+          (epi-ledger--recovery-source-proof-file-identity original))
+         (observed-identity
+          (epi-ledger--recovery-source-proof-file-identity observed)))
+    (unless
+        (and (equal
+              (epi-ledger--recovery-source-content-signature original)
+              (epi-ledger--recovery-source-content-signature observed))
+             (epi-ledger--same-file-object-p
+              original-identity observed-identity)
+             (= expected-links
+                (or (plist-get observed-identity :links) -1))
+             (= #o600 (epi-ledger--recovery-raw-mode path)))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-preflight-changed))
+    (list inspection observed-identity)))
+
+(defun epi-ledger--recovery-verify-linked-object
+    (path expected size hash)
+  "Re-authenticate linked object PATH against SIZE, HASH, and EXPECTED.
+Return PATH's exact two-link identity.  Preserve cooperative quit and limit
+signals while classifying every other verification failure as changed object
+content."
+  (condition-case condition
+      (let* ((verified
+              (epi-ledger--object-read-verified-state
+               path size hash 'proof))
+             (identity
+              (epi-ledger--recovery-copy-file-identity
+               (plist-get verified :identity))))
+        (unless (equal expected identity)
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+        (epi-ledger--recovery-require-private-file-state-raw
+         path identity size 'recovery-object-content-changed t 2))
+    (epi-limit-exceeded
+     (signal (car condition) (cdr condition)))
+    (quit
+     (signal (car condition) (cdr condition)))
+    (error
+     (epi-ledger--fail
+      'epi-ledger-conflict 'recovery-object-content-changed))))
+
+(defun epi-ledger--recovery-verify-linked-destination-ledger
+    (path expected preflight)
+  "Re-authenticate linked destination ledger PATH for PREFLIGHT and EXPECTED.
+Return PATH's exact two-link identity while preserving cooperative quit and
+limit signals."
+  (condition-case condition
+      (let* ((inspection
+              (epi-ledger--recovery-inspect-path-raw path 'complete))
+             (_verified
+              (epi-ledger--recovery-require-destination-inspection
+               inspection preflight path 2))
+             (identity
+              (epi-ledger--recovery-copy-file-identity
+               (epi-ledger--inspection-raw-file-identity inspection))))
+        (unless (equal expected identity)
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-staged-ledger-invalid))
+        (epi-ledger--recovery-require-private-file-state-raw
+         path identity
+         (epi-ledger--inspection-raw-source-size inspection)
+         'recovery-staged-ledger-invalid t 2))
+    (epi-limit-exceeded
+     (signal (car condition) (cdr condition)))
+    (quit
+     (signal (car condition) (cdr condition)))
+    (error
+     (epi-ledger--fail
+      'epi-ledger-conflict 'recovery-staged-ledger-invalid))))
+
+(defun epi-ledger--recovery-verify-linked-source-ledger
+    (path expected proof)
+  "Re-authenticate linked source ledger PATH against EXPECTED and PROOF.
+Return PATH's exact two-link identity while preserving cooperative quit and
+limit signals."
+  (condition-case condition
+      (let* ((moved
+              (epi-ledger--recovery-require-moved-source path proof 2))
+             (identity
+              (epi-ledger--recovery-copy-file-identity (nth 1 moved))))
+        (unless (equal expected identity)
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-preflight-changed))
+        identity)
+    (epi-limit-exceeded
+     (signal (car condition) (cdr condition)))
+    (quit
+     (signal (car condition) (cdr condition)))
+    (error
+     (epi-ledger--fail
+      'epi-ledger-conflict 'recovery-preflight-changed))))
+
+(defun epi-ledger--recovery-evidence-directory-names (path)
+  "Return every sorted exact name below the local evidence directory PATH."
+  (condition-case condition
+      (let ((file-name-handler-alist nil)
+            names)
+        (dolist (name
+                 (directory-files
+                  path nil directory-files-no-dot-files-regexp t))
+          (unless (and (stringp name)
+                       (not (member name '("." "..")))
+                       (not (string-match-p "[\0/\r\n]" name)))
+            (epi-ledger--fail
+             'epi-ledger-conflict 'recovery-object-content-changed))
+          (push (substring-no-properties name) names))
+        (sort names #'string<))
+    ((error quit)
+     (ignore condition)
+     (epi-ledger--fail
+      'epi-ledger-conflict 'recovery-object-content-changed))))
+
+(defun epi-ledger--recovery-evidence-chunk-leaves (leaves)
+  "Return canonical bounded vectors of the ordered entries.
+LEAVES supplies the complete entry list."
+  (let (chunks)
+    (while leaves
+      (let ((count 0)
+            chunk)
+        (while (and leaves
+                    (< count epi-ledger--recovery-evidence-chunk-limit))
+          (push (pop leaves) chunk)
+          (setq count (1+ count)))
+        (push (vconcat (nreverse chunk)) chunks)))
+    (nreverse chunks)))
+
+(defun epi-ledger--recovery-publication-evidence-handle-p (handle)
+  "Return non-nil when HANDLE resolves to this publication's exact proof."
+  (and handle
+       (eq handle epi-ledger--recovery-publication-evidence-handle)
+       (epi-ledger--recovery-exact-record-p
+        epi-ledger--recovery-publication-evidence-proof
+        #'epi-ledger--recovery-evidence-proof-p
+        epi-ledger--recovery-evidence-proof-record-size)))
+
+(defun epi-ledger--recovery-publication-evidence-resolve (handle)
+  "Return the private evidence proof named by opaque HANDLE."
+  (unless (epi-ledger--recovery-publication-evidence-handle-p handle)
+    (epi-ledger--recovery-manifest-invalid))
+  epi-ledger--recovery-publication-evidence-proof)
+
+(defun epi-ledger--recovery-publication-evidence-replace
+    (handle old-proof new-proof)
+  "Replace HANDLE's exact OLD-PROOF generation with NEW-PROOF."
+  (unless (and (epi-ledger--recovery-publication-evidence-handle-p handle)
+               (eq old-proof epi-ledger--recovery-publication-evidence-proof)
+               (epi-ledger--recovery-exact-record-p
+                new-proof #'epi-ledger--recovery-evidence-proof-p
+                epi-ledger--recovery-evidence-proof-record-size))
+    (epi-ledger--recovery-manifest-invalid))
+  (setq epi-ledger--recovery-publication-evidence-proof new-proof))
+
+(defun epi-ledger--recovery-source-object-proof-at
+    (preflight root expected-directory)
+  "Capture the complete present source-object tree below ROOT.
+PREFLIGHT supplies its immutable recovery authority.  EXPECTED-DIRECTORY binds
+the original root object.  Return private chunked quarantine evidence."
+  (let* ((layout (epi-ledger--recovery-preflight-raw-layout preflight))
+         (device (epi-ledger--recovery-layout-raw-quarantine-device layout))
+         (actual (epi-ledger--recovery-raw-directory-stat root))
+         (references
+          (epi-ledger--recovery-preflight-raw-reachable-objects preflight))
+         (expected-identities
+          (epi-ledger--recovery-preflight-raw-reachable-object-identities
+           preflight))
+         directories files
+         (reachable-by-hash (make-hash-table :test #'equal))
+         (files-by-hash (make-hash-table :test #'equal))
+         ;; Automatic GC remains enabled while large object bodies are read.
+         ;; Suppress only its user callback so metadata epochs cannot be
+         ;; widened by `post-gc-hook'.
+         (post-gc-hook nil))
+    (unless (and actual
+                 (epi-ledger--same-file-object-p expected-directory actual)
+                 (equal expected-directory actual)
+                 (equal device (plist-get actual :device))
+                 (= #o700 (epi-ledger--recovery-raw-mode root))
+                 (vectorp references)
+                 (vectorp expected-identities)
+                 (= (length references) (length expected-identities)))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (cl-labels
+        ((capture-directory
+          (relative path)
+          (ignore relative)
+          (let* ((identity
+                  (epi-ledger--recovery-require-bound-directory-raw
+                   path (epi-ledger--recovery-raw-directory-stat path)
+                   device #o700))
+                 (names
+                  (epi-ledger--recovery-evidence-directory-names
+                   path)))
+            (push
+             (cons
+              (substring-no-properties path)
+              (epi-ledger--recovery-copy-directory-identity identity))
+             directories)
+            names))
+         (capture-file
+          (relative path hash)
+          (ignore relative)
+          (let* ((identity (epi-ledger--raw-object-name-state path))
+                 (size (and (listp identity) (plist-get identity :size))))
+            (unless (and (listp identity)
+                         (epi-ledger--recovery-bounded-unsigned-p size)
+                         (<= size epi-object-byte-limit)
+                         (equal device (plist-get identity :device))
+                         (= 1 (or (plist-get identity :links) -1))
+                         (= #o600 (epi-ledger--recovery-raw-mode path)))
+              (epi-ledger--fail
+               'epi-ledger-conflict 'recovery-object-content-changed))
+            (let ((leaf
+                   (epi-ledger--make-recovery-evidence-leaf
+                    :hash (substring-no-properties hash)
+                    :size size
+                    :identity
+                    (epi-ledger--recovery-copy-file-identity identity))))
+              (puthash hash leaf files-by-hash)
+              (push leaf files)))))
+      (let ((root-names (capture-directory "." root)))
+        (unless (or (null root-names) (equal root-names '("sha256")))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+        (when root-names
+          (let* ((sha-path
+                  (expand-file-name "sha256" (file-name-as-directory root)))
+                 (prefixes (capture-directory "sha256" sha-path)))
+            (dolist (prefix prefixes)
+              (unless
+                  (let ((case-fold-search nil))
+                    (string-match-p "\\`[0-9a-f]\\{2\\}\\'" prefix))
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'recovery-object-content-changed))
+              (let* ((prefix-relative (concat "sha256/" prefix))
+                     (prefix-path
+                      (expand-file-name prefix
+                                        (file-name-as-directory sha-path)))
+                     (hashes
+                      (capture-directory prefix-relative prefix-path)))
+                (dolist (hash hashes)
+                  (unless
+                      (and
+                       (epi-ledger--hash-p hash)
+                       (string-prefix-p prefix hash))
+                    (epi-ledger--fail
+                     'epi-ledger-conflict
+                     'recovery-object-content-changed))
+                  (capture-file
+                   (concat prefix-relative "/" hash)
+                   (expand-file-name hash
+                                     (file-name-as-directory prefix-path))
+                   hash))))))))
+    (setq directories (nreverse directories)
+          files (nreverse files))
+    (dotimes (index (length references))
+      (puthash
+       (epi-ledger--object-value (aref references index) "hash")
+       index reachable-by-hash))
+    ;; The complete metadata census above is callback-free.  Only after every
+    ;; relative name and identity is frozen may content verification yield.
+    (dolist (leaf files)
+      (let* ((identity
+              (epi-ledger--recovery-evidence-leaf-raw-identity leaf))
+             (path (plist-get identity :path))
+             (size (epi-ledger--recovery-evidence-leaf-raw-size leaf))
+             (hash (epi-ledger--recovery-evidence-leaf-raw-hash leaf))
+             (reachable-index (gethash hash reachable-by-hash)))
+        (if (integerp reachable-index)
+            (let ((reference (aref references reachable-index))
+                  (observed (aref expected-identities reachable-index)))
+              (unless (and (= size
+                              (epi-ledger--object-value reference "size"))
+                           (equal identity observed))
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'recovery-object-content-changed)))
+          (let* ((verified
+                  (let ((epi-ledger--stat-function
+                         #'epi-ledger--stat-local-file)
+                        (epi-ledger--read-function #'epi-ledger--read-bytes))
+                    (epi-ledger--object-read-verified-state
+                     path size hash 'proof)))
+                 (observed
+                  (epi-ledger--recovery-copy-file-identity
+                   (plist-get verified :identity))))
+            (unless (equal identity observed)
+              (epi-ledger--fail
+               'epi-ledger-conflict 'recovery-object-content-changed))))))
+    (dotimes (index (length references))
+      (let* ((reference (aref references index))
+             (hash (epi-ledger--object-value reference "hash"))
+             (size (epi-ledger--object-value reference "size"))
+             (relative
+              (concat "sha256/" (substring hash 0 2) "/" hash))
+             (leaf (gethash hash files-by-hash))
+             (identity
+              (and leaf
+                   (epi-ledger--recovery-evidence-leaf-raw-identity leaf))))
+        (unless (and leaf identity
+                     (equal
+                      (expand-file-name relative (file-name-as-directory root))
+                      (plist-get identity :path))
+                     (= size
+                        (epi-ledger--recovery-evidence-leaf-raw-size leaf))
+                     (epi-ledger--same-file-object-p
+                      (aref expected-identities index) identity))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))))
+    (let* ((count (length files))
+           (chunks (epi-ledger--recovery-evidence-chunk-leaves files))
+           (proof
+            (epi-ledger--make-recovery-evidence-proof
+             :root (directory-file-name (substring-no-properties root))
+             :device (epi-ledger--copy-device-token device)
+             :directories directories
+             :chunks chunks
+             :count count)))
+      (clrhash reachable-by-hash)
+      (clrhash files-by-hash)
+      (setq files nil)
+      (epi-ledger--recovery-require-source-object-proof-raw proof device)
+      proof)))
+
+(defun epi-ledger--recovery-require-evidence-proof-raw (proof device)
+  "Raw-require complete chunked quarantine-evidence PROOF on DEVICE."
+  (unless
+      (epi-ledger--recovery-exact-record-p
+       proof #'epi-ledger--recovery-evidence-proof-p
+       epi-ledger--recovery-evidence-proof-record-size)
+    (epi-ledger--fail
+     'epi-ledger-conflict 'recovery-object-content-changed))
+  (let* ((root (epi-ledger--recovery-evidence-proof-raw-root proof))
+         (proof-device
+          (epi-ledger--recovery-evidence-proof-raw-device proof))
+         (directories
+          (epi-ledger--recovery-evidence-proof-raw-directories proof))
+         (chunks (epi-ledger--recovery-evidence-proof-raw-chunks proof))
+         (expected-count
+          (epi-ledger--recovery-evidence-proof-raw-count proof))
+         (sha-path
+          (and (stringp root)
+               (expand-file-name "sha256" (file-name-as-directory root))))
+         (directory-table (make-hash-table :test #'equal))
+         (hashes-by-prefix (make-hash-table :test #'equal))
+         (missing (make-symbol "missing"))
+         prefixes previous-hash
+         (observed-count 0)
+         expected-directories)
+    (unless (and (stringp root)
+                 (equal root (directory-file-name root))
+                 (equal
+                  root
+                  (condition-case nil
+                      (epi-ledger--resolve-local-directory-path root)
+                    (error nil)))
+                 (equal device proof-device)
+                 (epi-ledger--device-token-p proof-device)
+                 (proper-list-p directories)
+                 (proper-list-p chunks)
+                 (epi-ledger--recovery-bounded-unsigned-p expected-count))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-object-content-changed))
+    (dolist (entry directories)
+      (let ((identity
+             (and (consp entry) (listp (cdr entry))
+                  (condition-case nil
+                      (epi-ledger--recovery-copy-directory-identity
+                       (cdr entry))
+                    (error nil)))))
+        (unless (and (consp entry) (stringp (car entry)) identity
+                     (equal identity (cdr entry))
+                     (eq missing
+                         (gethash (car entry) directory-table missing)))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+        (puthash (car entry) identity directory-table)))
+    (let ((tail chunks))
+      (while tail
+        (let ((chunk (car tail)))
+          (unless (and (vectorp chunk) (> (length chunk) 0)
+                       (<= (length chunk)
+                           epi-ledger--recovery-evidence-chunk-limit)
+                       (or (null (cdr tail))
+                           (= (length chunk)
+                              epi-ledger--recovery-evidence-chunk-limit)))
+            (epi-ledger--fail
+             'epi-ledger-conflict 'recovery-object-content-changed))
+          (dotimes (index (length chunk))
+            (let* ((leaf (aref chunk index))
+                   (hash
+                    (and
+                     (epi-ledger--recovery-exact-record-p
+                      leaf #'epi-ledger--recovery-evidence-leaf-p
+                      epi-ledger--recovery-evidence-leaf-record-size)
+                     (epi-ledger--recovery-evidence-leaf-raw-hash leaf)))
+                   (valid-hash (epi-ledger--hash-p hash))
+                   (size
+                    (and valid-hash
+                         (epi-ledger--recovery-evidence-leaf-raw-size leaf)))
+                   (identity
+                    (and valid-hash
+                         (epi-ledger--recovery-evidence-leaf-raw-identity leaf)))
+                   (owned-identity
+                    (and (listp identity)
+                         (condition-case nil
+                             (epi-ledger--recovery-copy-file-identity identity)
+                           (error nil))))
+                   (prefix (and valid-hash (substring hash 0 2)))
+                   (path
+                    (and valid-hash
+                         (epi-ledger--recovery-object-path-under-root
+                          root hash))))
+              (unless
+                  (and valid-hash
+                       (or (null previous-hash)
+                           (string< previous-hash hash))
+                       (epi-ledger--recovery-bounded-unsigned-p size)
+                       (<= size epi-object-byte-limit)
+                       owned-identity
+                       (equal identity owned-identity)
+                       (equal path (plist-get owned-identity :path))
+                       (equal proof-device
+                              (plist-get owned-identity :device))
+                       (= 1 (plist-get owned-identity :links))
+                       (= size (plist-get owned-identity :size))
+                       (equal
+                        owned-identity
+                        (epi-ledger--recovery-require-private-file-state-raw
+                         path owned-identity size
+                         'recovery-object-content-changed t)))
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'recovery-object-content-changed))
+              (unless (gethash prefix hashes-by-prefix)
+                (push prefix prefixes))
+              (puthash
+               prefix
+               (cons hash (gethash prefix hashes-by-prefix))
+               hashes-by-prefix)
+              (setq previous-hash hash
+                    observed-count (1+ observed-count))))
+          (setq tail (cdr tail)))))
+    (unless (= expected-count observed-count)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-object-content-changed))
+    (setq prefixes (sort prefixes #'string<))
+    (let* ((directory-paths (mapcar #'car directories))
+           (tail (cdr directory-paths))
+           (sha-present (and tail (equal sha-path (car tail))))
+           (prefix-paths (and sha-present (cdr tail)))
+           (directory-prefixes
+            (mapcar #'file-name-nondirectory prefix-paths)))
+      (unless
+          (and
+           (consp directory-paths)
+           (equal root (car directory-paths))
+           (if tail
+               (and
+                sha-present
+                (equal
+                 directory-prefixes
+                 (sort (delete-dups (copy-sequence directory-prefixes))
+                       #'string<))
+                (seq-every-p
+                 (lambda (prefix)
+                   (let ((case-fold-search nil))
+                     (string-match-p "\\`[0-9a-f]\\{2\\}\\'" prefix)))
+                 directory-prefixes)
+                (equal
+                 prefix-paths
+                 (mapcar
+                  (lambda (prefix)
+                    (expand-file-name
+                     prefix (file-name-as-directory sha-path)))
+                  directory-prefixes))
+                (seq-every-p
+                 (lambda (prefix) (member prefix directory-prefixes))
+                 prefixes))
+             (and (= observed-count 0) (null prefixes))))
+        (epi-ledger--fail
+         'epi-ledger-conflict 'recovery-object-content-changed))
+      (setq expected-directories
+            (if tail
+                (append
+                 (list (cons root '("sha256"))
+                       (cons sha-path directory-prefixes))
+                 (mapcar
+                  (lambda (prefix)
+                    (cons
+                     (expand-file-name
+                      prefix (file-name-as-directory sha-path))
+                     (nreverse (gethash prefix hashes-by-prefix))))
+                  directory-prefixes))
+              (list (cons root nil)))))
+    (unless (equal (mapcar #'car directories)
+                   (mapcar #'car expected-directories))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-object-content-changed))
+    (dolist (entry expected-directories)
+      (let ((identity (gethash (car entry) directory-table)))
+        (unless identity
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+        (epi-ledger--recovery-require-directory-entries-raw
+         (car entry) (cdr entry) 'recovery-object-content-changed)
+        (unless
+            (equal
+             identity
+             (epi-ledger--recovery-require-bound-directory-raw
+              (car entry) identity proof-device #o700))
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))))
+    t))
+
+(defun epi-ledger--recovery-require-source-object-proof-raw
+    (proof device &optional _metadata-only)
+  "Raw-require every directory and regular leaf in PROOF on DEVICE.
+Object leaves are metadata-restated from prior content-authenticated authority
+in every mode.  _METADATA-ONLY is a compatibility argument retained for the
+shared final-verifier call shape."
+  (epi-ledger--recovery-require-evidence-proof-raw proof device))
+
+(defun epi-ledger--recovery-transfer-evidence-tree-no-clobber
+    (source-proof target-root target-parent-identity)
+  "Move exact chunked SOURCE-PROOF below absent TARGET-ROOT.
+TARGET-PARENT-IDENTITY binds the target root's parent directory.
+Every leaf is installed by verified no-clobber hard link before its source
+name is removed.  Return fresh chunked authority rooted at TARGET-ROOT."
+  (unless
+      (epi-ledger--recovery-exact-record-p
+       source-proof #'epi-ledger--recovery-evidence-proof-p
+       epi-ledger--recovery-evidence-proof-record-size)
+    (epi-ledger--fail
+     'epi-ledger-conflict 'recovery-object-content-changed))
+  (unless (and (stringp target-root) (listp target-parent-identity))
+    (epi-ledger--fail 'epi-ledger-conflict 'recovery-path-conflict))
+  (epi-ledger--recovery-require-source-object-proof-raw
+   source-proof
+   (epi-ledger--recovery-evidence-proof-raw-device source-proof))
+  (let* ((source-root
+          (epi-ledger--recovery-evidence-proof-raw-root source-proof))
+         (device
+          (epi-ledger--recovery-evidence-proof-raw-device source-proof))
+         (source-directories
+          (epi-ledger--recovery-evidence-proof-raw-directories source-proof))
+         (source-chunks
+          (epi-ledger--recovery-evidence-proof-raw-chunks source-proof))
+         (count (epi-ledger--recovery-evidence-proof-raw-count source-proof))
+         (owned-target
+          (directory-file-name (substring-no-properties target-root)))
+         (source-parent
+          (directory-file-name (file-name-directory source-root)))
+         (target-parent
+          (directory-file-name (file-name-directory owned-target)))
+         (source-parent-identity
+          (epi-ledger--recovery-raw-directory-stat source-parent))
+         (source-directory-table (make-hash-table :test #'equal))
+         (target-directory-table (make-hash-table :test #'equal))
+         target-directory-receipts target-chunks target-proof)
+    (unless (and (equal owned-target
+                        (epi-ledger--resolve-local-write-path owned-target))
+                 (equal target-parent
+                        (plist-get target-parent-identity :path)))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (epi-ledger--recovery-require-separated-top-level-paths
+     (list source-root owned-target)
+     (epi-ledger--recovery-path-set-case-insensitive-p
+      (list source-root owned-target)))
+    (setq source-parent-identity
+          (epi-ledger--recovery-require-bound-directory-raw
+           source-parent source-parent-identity device))
+    (epi-ledger--recovery-require-bound-directory-raw
+     target-parent target-parent-identity device)
+    (when (epi-ledger--recovery-name-kind owned-target)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (dolist (entry source-directories)
+      (puthash (car entry) (cdr entry) source-directory-table)
+      (let* ((target-path
+              (epi-ledger--recovery-rebase-object-tree-path
+               (car entry) source-root owned-target))
+             (receipt
+              (epi-ledger--recovery-reserve-publication-directory
+               target-path device)))
+        (puthash target-path receipt target-directory-table)
+        (push (cons (substring-no-properties target-path) receipt)
+              target-directory-receipts))
+      (epi-ledger--recovery-require-bound-directory-raw
+       target-parent target-parent-identity device)
+      (epi-ledger--recovery-require-bound-directory-raw
+       source-parent source-parent-identity device))
+    (setq target-directory-receipts (nreverse target-directory-receipts))
+    (dolist (chunk source-chunks)
+      (let ((target-chunk (make-vector (length chunk) nil)))
+        (dotimes (index (length chunk))
+          (let* ((leaf (aref chunk index))
+                 (hash (epi-ledger--recovery-evidence-leaf-raw-hash leaf))
+                 (size (epi-ledger--recovery-evidence-leaf-raw-size leaf))
+                 (source-identity
+                  (epi-ledger--recovery-evidence-leaf-raw-identity leaf))
+                 (source-path (plist-get source-identity :path))
+                 (target
+                  (epi-ledger--recovery-object-path-under-root
+                   owned-target hash))
+                 (source-leaf-parent
+                  (directory-file-name (file-name-directory source-path)))
+                 (target-leaf-parent
+                  (directory-file-name (file-name-directory target)))
+                 (source-parent-receipt
+                  (gethash source-leaf-parent source-directory-table))
+                 (target-parent-receipt
+                  (gethash target-leaf-parent target-directory-table))
+                 (moved
+                  (and source-parent-receipt target-parent-receipt
+                       (epi-ledger--recovery-link-move-file
+                        source-path target source-identity device
+                        source-parent-receipt target-parent-receipt
+                        (lambda (path identity)
+                          (epi-ledger--recovery-verify-linked-object
+                           path identity size hash))
+                        nil))))
+            (unless (and moved
+                         (equal target (plist-get moved :path))
+                         (epi-ledger--same-file-object-p source-identity moved)
+                         (= size (or (plist-get moved :size) -1))
+                         (= 1 (or (plist-get moved :links) -1))
+                         (= #o600 (epi-ledger--recovery-raw-mode target)))
+              (epi-ledger--fail
+               'epi-ledger-conflict 'recovery-object-content-changed))
+            (aset
+             target-chunk index
+             (epi-ledger--make-recovery-evidence-leaf
+              :hash (substring-no-properties hash)
+              :size size
+              :identity (epi-ledger--recovery-copy-file-identity moved)))
+            (epi-ledger--recovery-require-bound-directory-raw
+             target-parent target-parent-identity device)
+            (epi-ledger--recovery-require-bound-directory-raw
+             source-parent source-parent-identity device)))
+        (push target-chunk target-chunks)))
+    (setq target-chunks (nreverse target-chunks)
+          target-directory-receipts
+          (mapcar
+           (lambda (entry)
+             (cons
+              (substring-no-properties (car entry))
+              (epi-ledger--recovery-require-bound-directory-raw
+               (car entry) (cdr entry) device #o700)))
+           target-directory-receipts)
+          target-proof
+          (epi-ledger--make-recovery-evidence-proof
+           :root owned-target
+           :device (epi-ledger--copy-device-token device)
+           :directories target-directory-receipts
+           :chunks target-chunks
+           :count count))
+    (epi-ledger--recovery-require-source-object-proof-raw target-proof device)
+    (dolist (entry (reverse (copy-sequence source-directories)))
+      (let ((actual
+             (epi-ledger--recovery-require-bound-directory-raw
+              (car entry) (cdr entry) device #o700)))
+        (epi-ledger--recovery-require-directory-entries-raw (car entry) nil)
+        (epi-ledger--recovery-delete-exact-empty-directory
+         (car entry) actual)
+        (epi-ledger--recovery-require-bound-directory-raw
+         target-parent target-parent-identity device)
+        (epi-ledger--recovery-require-bound-directory-raw
+         source-parent source-parent-identity device)))
+    (when (epi-ledger--recovery-name-kind source-root)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-object-content-changed))
+    (epi-ledger--recovery-require-source-object-proof-raw target-proof device)
+    (epi-ledger--recovery-require-bound-directory-raw
+     target-parent target-parent-identity device)
+    (epi-ledger--recovery-require-bound-directory-raw
+     source-parent source-parent-identity device)
+    target-proof))
+
+(defun epi-ledger--recovery-require-empty-directory-raw
+    (path identity device)
+  "Raw-require exact private directory PATH as empty IDENTITY on DEVICE."
+  (epi-ledger--recovery-require-directory-entries-raw path nil)
+  (let ((actual
+         (epi-ledger--recovery-require-bound-directory-raw
+          path identity device #o700)))
+    (unless (equal identity actual)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    actual))
+
+(defun epi-ledger--recovery-require-live-source-raw
+    (preflight source-last-record lock)
+  "Raw-close PREFLIGHT's original source at SOURCE-LAST-RECORD and LOCK."
+  (let* ((layout (epi-ledger--recovery-preflight-raw-layout preflight))
+         (proof (epi-ledger--recovery-preflight-raw-source-proof preflight)))
+    (if lock
+        (epi-ledger--verify-prewrite-authority-raw
+         (epi-ledger--recovery-layout-raw-source-path layout)
+         (epi-ledger--recovery-source-proof-file-identity proof)
+         (epi-ledger--recovery-source-proof-source-size proof)
+         (epi-ledger--recovery-source-proof-valid-prefix-head proof)
+         source-last-record lock)
+      (epi-ledger--verify-source-authority-raw
+       (epi-ledger--recovery-layout-raw-source-path layout)
+       (epi-ledger--recovery-source-proof-file-identity proof)
+       (epi-ledger--recovery-source-proof-source-size proof)
+       (epi-ledger--recovery-source-proof-valid-prefix-head proof)
+       source-last-record))
+    (epi-ledger--recovery-reprove-source-object-state-raw preflight layout)
+    (epi-ledger--recovery-reprove-reachable-objects-raw preflight layout)
+    t))
+
+(defun epi-ledger--recovery-require-published-destination-raw
+    (state object-proof ledger-authority)
+  "Raw-close STATE's published destination authority.
+OBJECT-PROOF binds its objects; LEDGER-AUTHORITY binds its scalar ledger facts."
+  (let* ((preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (layout (epi-ledger--recovery-preflight-raw-layout preflight))
+         (destination
+          (epi-ledger--recovery-layout-raw-destination-path layout)))
+    (epi-ledger--recovery-require-destination-object-origin-raw
+     state object-proof)
+    (epi-ledger--recovery-require-object-tree-proof-raw object-proof)
+    (epi-ledger--recovery-require-destination-ledger-authority
+     ledger-authority preflight destination
+     (epi-ledger--recovery-phase-state-raw-staged-ledger-identity state))
+    t))
+
+(defun epi-ledger--recovery-require-staged-source-ledger-raw
+    (preflight path identity)
+  "Raw-close PREFLIGHT source evidence now named by PATH and IDENTITY."
+  (let* ((proof (epi-ledger--recovery-preflight-raw-source-proof preflight))
+         (original
+          (epi-ledger--recovery-source-proof-file-identity proof)))
+    (unless (epi-ledger--same-file-object-p original identity)
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-preflight-changed))
+    (epi-ledger--recovery-require-private-file-state-raw
+     path identity
+     (epi-ledger--recovery-source-proof-source-size proof)
+     'recovery-preflight-changed t)))
+
+(defun epi-ledger--recovery-require-quarantine-raw
+    (preflight quarantine-identity ledger-path ledger-identity
+               evidence-kind evidence-proof marker-identity marker-bytes
+               &optional metadata-only)
+  "Raw-close PREFLIGHT's final quarantine at QUARANTINE-IDENTITY.
+LEDGER-PATH and LEDGER-IDENTITY bind the source ledger.  EVIDENCE-KIND is
+`present' with an object-tree proof or `absent' with an exact marker
+identity/bytes pair in EVIDENCE-PROOF.  MARKER-IDENTITY and MARKER-BYTES bind
+the optional completion marker.  When METADATA-ONLY is non-nil, reclose absence
+and completion markers by exact epoch instead of rereading their already
+authenticated bytes.  Present object leaves remain metadata-restated from
+prior content-authenticated authority in either mode."
+  (let* ((layout (epi-ledger--recovery-preflight-raw-layout preflight))
+         (device
+          (epi-ledger--recovery-layout-raw-quarantine-device layout))
+         (quarantine
+          (epi-ledger--recovery-layout-raw-final-quarantine-path layout))
+         (completion
+          (epi-ledger--recovery-quarantine-complete-path layout))
+         (evidence-path
+          (if (eq evidence-kind 'present)
+              (epi-ledger--recovery-final-source-objects-path layout)
+            (epi-ledger--recovery-final-absent-marker-path layout)))
+         (entries
+          (list (file-name-nondirectory ledger-path)
+                (file-name-nondirectory evidence-path))))
+    (when marker-identity
+      (push (file-name-nondirectory completion) entries))
+    (epi-ledger--recovery-require-directory-entries-raw quarantine entries)
+    (let ((actual
+           (epi-ledger--recovery-require-bound-directory-raw
+            quarantine quarantine-identity device #o700)))
+      (unless (equal quarantine-identity actual)
+        (epi-ledger--fail
+         'epi-ledger-conflict 'recovery-path-conflict)))
+    (epi-ledger--recovery-require-staged-source-ledger-raw
+     preflight ledger-path ledger-identity)
+    (pcase evidence-kind
+      ('present
+       (epi-ledger--recovery-require-source-object-proof-raw
+        evidence-proof device metadata-only))
+      ('absent
+       (if metadata-only
+           (epi-ledger--recovery-require-private-file-state-raw
+            evidence-path (nth 0 evidence-proof) (length (nth 1 evidence-proof))
+            'recovery-manifest-invalid t)
+         (epi-ledger--recovery-require-exact-file-bytes
+          evidence-path (nth 0 evidence-proof) (nth 1 evidence-proof)
+          'recovery-manifest-invalid)))
+      (_ (epi-ledger--recovery-manifest-invalid)))
+    (when marker-identity
+      (if metadata-only
+          (epi-ledger--recovery-require-private-file-state-raw
+           completion marker-identity (length marker-bytes)
+           'recovery-manifest-invalid t)
+        (epi-ledger--recovery-require-exact-file-bytes
+         completion marker-identity marker-bytes
+         'recovery-manifest-invalid)))
+    t))
+
+(defconst epi-ledger--recovery-wave5-phase-edges
+  '((objects-transferred . destination-objects-published)
+    (destination-objects-published . destination-ledger-published)
+    (destination-ledger-published . source-ledger-staged)
+    (source-ledger-staged . source-objects-staged)
+    (source-objects-staged . quarantine-published))
+  "Immediate durable phase edges implemented by the Wave 5 publisher.")
+
+(defun epi-ledger--recovery-phase-has-source-stage-p (phase)
+  "Return non-nil when durable PHASE retains the transaction source stage."
+  (memq phase
+        '(source-ledger-staged source-objects-staged quarantine-published)))
+
+(defun epi-ledger--recovery-phase-entry-names
+    (layout phase &optional temporaryp)
+  "Return exact transaction entry names for LAYOUT at durable PHASE.
+TEMPORARYP includes the deterministic manifest update temporary."
+  (unless (assq phase
+                '((objects-transferred)
+                  (destination-objects-published)
+                  (destination-ledger-published)
+                  (source-ledger-staged)
+                  (source-objects-staged)
+                  (quarantine-published)))
+    (epi-ledger--recovery-manifest-invalid))
+  (epi-ledger--recovery-phase-transaction-entry-names
+   layout temporaryp
+   (epi-ledger--recovery-phase-has-source-stage-p phase)))
+
+(defun epi-ledger--recovery-phase-state-successor
+    (state phase manifest-identity manifest-bytes transaction-state)
+  "Return STATE's fresh durable PHASE successor authority.
+MANIFEST-IDENTITY and MANIFEST-BYTES bind its journal generation;
+TRANSACTION-STATE binds the corresponding directory projection."
+  (epi-ledger--make-recovery-phase-state
+   :phase phase
+   :preflight (epi-ledger--recovery-phase-state-raw-preflight state)
+   :path-layout (epi-ledger--recovery-phase-state-raw-path-layout state)
+   :source-last-record
+   (epi-ledger--copy-record
+    (epi-ledger--recovery-phase-state-raw-source-last-record state))
+   :quarantine-anchor-identity
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-quarantine-anchor-identity state))
+   :quarantine-root-identity
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-quarantine-root-identity state))
+   :control-identity
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-control-identity state))
+   :directory-receipts
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-directory-receipts state))
+   :transaction-identity
+   (epi-ledger--copy-tree-and-strings
+    (plist-get transaction-state :identity))
+   :manifest-identity
+   (epi-ledger--recovery-copy-file-identity manifest-identity)
+   :manifest-bytes (substring-no-properties manifest-bytes)
+   :transaction-entry-state
+   (epi-ledger--copy-tree-and-strings transaction-state)
+   :destination-parent-identity
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-destination-parent-identity state))
+   :staged-object-root-identity
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-staged-object-root-identity state))
+   :staged-directory-receipts
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-staged-directory-receipts state))
+   :staged-object-receipts
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-staged-object-receipts state))
+   :staged-ledger-identity
+   (epi-ledger--recovery-copy-file-identity
+    (epi-ledger--recovery-phase-state-raw-staged-ledger-identity state))))
+
+(defun epi-ledger--recovery-phase-prepared
+    (state manifest-identity transaction-state)
+  "Return a prepared-shaped journal writer for durable STATE.
+MANIFEST-IDENTITY and TRANSACTION-STATE bind its current journal projection."
+  (epi-ledger--make-recovery-prepared
+   :preflight (epi-ledger--recovery-phase-state-raw-preflight state)
+   :quarantine-anchor-identity
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-quarantine-anchor-identity state))
+   :quarantine-root-identity
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-quarantine-root-identity state))
+   :control-identity
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-control-identity state))
+   :directory-receipts
+   (epi-ledger--copy-tree-and-strings
+    (epi-ledger--recovery-phase-state-raw-directory-receipts state))
+   :transaction-identity
+   (epi-ledger--copy-tree-and-strings
+    (plist-get transaction-state :identity))
+   :manifest-identity
+   (epi-ledger--recovery-copy-file-identity manifest-identity)
+   :transaction-entry-state
+   (epi-ledger--copy-tree-and-strings transaction-state)
+   :source-last-record
+   (epi-ledger--copy-record
+    (epi-ledger--recovery-phase-state-raw-source-last-record state))
+   :path-layout
+   (epi-ledger--recovery-phase-state-raw-path-layout state)))
+
+(defun epi-ledger--recovery-object-tree-proof-shape-p (proof)
+  "Return non-nil when PROOF has the exact closed object-tree plist shape."
+  (let ((tail proof))
+    (catch 'invalid
+      (dolist (key epi-ledger--recovery-object-tree-proof-keys)
+        (unless (and (consp tail) (eq key (car tail)) (consp (cdr tail)))
+          (throw 'invalid nil))
+        (setq tail (cddr tail)))
+      (null tail))))
+
+(defun epi-ledger--recovery-copy-inert-authority-value (value &optional budget)
+  "Return an ownership-isolated, allowlisted inert copy of VALUE.
+Allowed values are symbols, numbers, strings, conses, and plain vectors.
+Cycles, executable values, records, hash tables, and other opaque objects are
+rejected.  Shared acyclic substructure remains shared only within the copy.
+Optional BUDGET is a mutable vector of remaining node visits and string bytes."
+  (let ((seen (make-hash-table :test #'eq))
+        (missing (make-symbol "missing"))
+        (budget
+         (or budget
+             (vector
+              epi-ledger--recovery-publication-authority-node-limit
+              epi-ledger--recovery-publication-authority-byte-limit)))
+        (result-box (vector nil))
+        (stack (list (vector 'visit value nil 0))))
+    (cl-labels
+        ((invalid () (epi-ledger--recovery-manifest-invalid))
+         (assign
+          (parent slot copied)
+          (if parent
+              (pcase slot
+                ('car (setcar parent copied))
+                ('cdr (setcdr parent copied))
+                ((pred integerp) (aset parent slot copied))
+                (_ (invalid)))
+            (aset result-box 0 copied))))
+      (unless
+          (and (vectorp budget) (= 2 (length budget))
+               (integerp (aref budget 0)) (<= 0 (aref budget 0))
+               (integerp (aref budget 1)) (<= 0 (aref budget 1)))
+        (invalid))
+      ;; Use an explicit depth-first work stack.  Authority proofs may contain
+      ;; the full bounded evidence census, so their legitimate list depth can
+      ;; exceed `max-lisp-eval-depth'.
+      (while stack
+        (let* ((frame (pop stack))
+               (operation (aref frame 0))
+               (node (aref frame 1)))
+          (pcase operation
+            ('finish
+             (let ((entry (gethash node seen missing)))
+               (unless (and (consp entry) (eq (car entry) 'visiting))
+                 (invalid))
+               (setcar entry 'done)))
+            ('vector-step
+             (let* ((entry (gethash node seen missing))
+                    (result (aref frame 2))
+                    (index (aref frame 3)))
+               (unless
+                   (and (consp entry) (eq (car entry) 'visiting)
+                        (eq result (cdr entry)))
+                 (invalid))
+               (if (= index (length node))
+                   (setcar entry 'done)
+                 (push (vector 'vector-step node result (1+ index)) stack)
+                 (push
+                  (vector 'visit (aref node index) result index) stack))))
+            ('visit
+             (aset budget 0 (1- (aref budget 0)))
+             (when (< (aref budget 0) 0)
+               (invalid))
+             (let ((parent (or (aref frame 2) result-box))
+                   (slot (aref frame 3)))
+               (cond
+                ((or (null node) (symbolp node) (numberp node))
+                 (assign parent slot node))
+                ((stringp node)
+                 (aset budget 1 (- (aref budget 1) (string-bytes node)))
+                 (when (< (aref budget 1) 0)
+                   (invalid))
+                 (assign parent slot (substring-no-properties node)))
+                ((or (functionp node) (recordp node) (hash-table-p node))
+                 (invalid))
+                ((consp node)
+                 (let ((entry (gethash node seen missing)))
+                   (cond
+                    ((eq entry missing)
+                     (let ((result (cons nil nil)))
+                       (puthash node (cons 'visiting result) seen)
+                       (assign parent slot result)
+                       (push (vector 'finish node nil nil) stack)
+                       (push (vector 'visit (cdr node) result 'cdr) stack)
+                       (push (vector 'visit (car node) result 'car) stack)))
+                    ((eq (car entry) 'done)
+                     (assign parent slot (cdr entry)))
+                    (t (invalid)))))
+                ((eq (type-of node) 'vector)
+                 (let ((entry (gethash node seen missing)))
+                   (cond
+                    ((eq entry missing)
+                     (let ((length (length node)))
+                       (when (> length (aref budget 0))
+                         (invalid))
+                       (let ((result (make-vector length nil)))
+                         (puthash node (cons 'visiting result) seen)
+                         (assign parent slot result)
+                         (push
+                          (vector 'vector-step node result 0) stack))))
+                    ((eq (car entry) 'done)
+                     (assign parent slot (cdr entry)))
+                    (t (invalid)))))
+                (t (invalid)))))
+            (_ (invalid)))))
+      (aref result-box 0))))
+
+(defun epi-ledger--recovery-copy-budgeted-file-identity (identity budget)
+  "Return an owned canonical IDENTITY charged in full to BUDGET.
+The schema-specific validation copy is independently bounded by the closed
+file-identity representation.  The returned copy, including its path and
+device/time substructure, is made by the aggregate authority copier so every
+externally controlled node and string byte consumes the shared projection
+budget."
+  (condition-case nil
+      (epi-ledger--recovery-copy-inert-authority-value
+       (epi-ledger--recovery-copy-file-identity identity)
+       budget)
+    (error (epi-ledger--recovery-manifest-invalid))))
+
+(defun epi-ledger--recovery-copy-destination-ledger-authority
+    (authority &optional budget)
+  "Return an ownership-isolated exact scalar destination AUTHORITY.
+Optional BUDGET is shared with the enclosing publication projection copy."
+  (unless
+      (epi-ledger--recovery-exact-record-p
+       authority #'epi-ledger--recovery-destination-ledger-authority-p
+       epi-ledger--recovery-destination-ledger-authority-record-size)
+    (epi-ledger--recovery-manifest-invalid))
+  (epi-ledger--make-recovery-destination-ledger-authority
+   :canonical-path
+   (epi-ledger--recovery-copy-inert-authority-value
+    (epi-ledger--recovery-destination-ledger-authority-raw-canonical-path
+     authority)
+   budget)
+   :file-identity
+   (epi-ledger--recovery-copy-budgeted-file-identity
+    (epi-ledger--recovery-destination-ledger-authority-raw-file-identity
+     authority)
+    budget)
+   :source-size
+   (epi-ledger--recovery-copy-inert-authority-value
+    (epi-ledger--recovery-destination-ledger-authority-raw-source-size
+     authority)
+    budget)
+   :next-sequence
+   (epi-ledger--recovery-copy-inert-authority-value
+    (epi-ledger--recovery-destination-ledger-authority-raw-next-sequence
+     authority)
+    budget)
+   :session-id
+   (epi-ledger--recovery-copy-inert-authority-value
+    (epi-ledger--recovery-destination-ledger-authority-raw-session-id
+     authority)
+    budget)
+   :header-sha256
+   (epi-ledger--recovery-copy-inert-authority-value
+    (epi-ledger--recovery-destination-ledger-authority-raw-header-sha256
+     authority)
+    budget)
+   :valid-prefix-head
+   (epi-ledger--recovery-copy-inert-authority-value
+    (epi-ledger--recovery-destination-ledger-authority-raw-valid-prefix-head
+     authority)
+    budget)))
+
+(defun epi-ledger--recovery-copy-publication-projection (projection)
+  "Return an ownership-isolated inert copy of PROJECTION."
+  (unless
+      (epi-ledger--recovery-exact-record-p
+       projection #'epi-ledger--recovery-publication-projection-p
+       epi-ledger--recovery-publication-projection-record-size)
+    (epi-ledger--recovery-manifest-invalid))
+  (let* ((budget
+          (vector
+           epi-ledger--recovery-publication-authority-node-limit
+           epi-ledger--recovery-publication-authority-byte-limit))
+         (destination-proof
+          (epi-ledger--recovery-publication-projection-raw-destination-object-proof
+           projection))
+         (source-proof
+          (epi-ledger--recovery-publication-projection-raw-source-object-proof
+           projection))
+         (evidence-kind
+          (epi-ledger--recovery-publication-projection-raw-evidence-kind
+           projection))
+         (evidence-proof
+          (epi-ledger--recovery-publication-projection-raw-evidence-proof
+           projection)))
+    (unless
+        (and
+         (or (null destination-proof)
+             (epi-ledger--recovery-object-tree-proof-shape-p
+              destination-proof))
+         (or (null source-proof)
+             (epi-ledger--recovery-publication-evidence-handle-p source-proof))
+         (if (eq evidence-kind 'present)
+             (epi-ledger--recovery-publication-evidence-handle-p
+              evidence-proof)
+           t))
+      (epi-ledger--recovery-manifest-invalid))
+    (epi-ledger--make-recovery-publication-projection
+     :phase
+     (epi-ledger--recovery-copy-inert-authority-value
+      (epi-ledger--recovery-publication-projection-raw-phase projection)
+      budget)
+     :destination-object-proof
+     (epi-ledger--recovery-copy-inert-authority-value
+      destination-proof budget)
+     :destination-ledger-authority
+     (let ((authority
+            (epi-ledger--recovery-publication-projection-raw-destination-ledger-authority
+             projection)))
+       (and authority
+            (epi-ledger--recovery-copy-destination-ledger-authority
+             authority budget)))
+     :source-object-proof
+     (epi-ledger--recovery-copy-inert-authority-value source-proof budget)
+     :source-stage-identity
+     (epi-ledger--recovery-copy-inert-authority-value
+      (epi-ledger--recovery-publication-projection-raw-source-stage-identity
+       projection)
+      budget)
+     :staged-source-ledger-identity
+     (epi-ledger--recovery-copy-inert-authority-value
+      (epi-ledger--recovery-publication-projection-raw-staged-source-ledger-identity
+       projection)
+      budget)
+     :quarantine-identity
+     (epi-ledger--recovery-copy-inert-authority-value
+      (epi-ledger--recovery-publication-projection-raw-quarantine-identity
+       projection)
+      budget)
+     :evidence-kind
+     (epi-ledger--recovery-copy-inert-authority-value evidence-kind budget)
+     :evidence-proof
+     (epi-ledger--recovery-copy-inert-authority-value evidence-proof budget)
+     :final-source-ledger-identity
+     (epi-ledger--recovery-copy-inert-authority-value
+      (epi-ledger--recovery-publication-projection-raw-final-source-ledger-identity
+       projection)
+      budget)
+     :quarantine-marker-identity
+     (epi-ledger--recovery-copy-inert-authority-value
+      (epi-ledger--recovery-publication-projection-raw-quarantine-marker-identity
+       projection)
+      budget)
+     :quarantine-marker-bytes
+     (epi-ledger--recovery-copy-inert-authority-value
+      (epi-ledger--recovery-publication-projection-raw-quarantine-marker-bytes
+       projection)
+      budget))))
+
+(defun epi-ledger--recovery-publication-tree-proof-bound-p
+    (proof root marker-path)
+  "Return non-nil when PROOF names canonical ROOT and MARKER-PATH.
+Nil MARKER-PATH requires a markerless proof.  A non-nil marker path requires
+an inert marker identity and owned unibyte marker bytes; content authenticity
+is established separately by the cooperative interpreter."
+  (condition-case nil
+      (and (listp proof)
+           (equal root (plist-get proof :root))
+           (if marker-path
+               (and (equal marker-path (plist-get proof :marker-path))
+                    (plist-get proof :marker-identity)
+                    (let ((bytes (plist-get proof :marker-bytes)))
+                      (and (stringp bytes)
+                           (not (multibyte-string-p bytes)))))
+             (not (or (plist-get proof :marker-path)
+                      (plist-get proof :marker-identity)
+                      (plist-get proof :marker-bytes)))))
+    (error nil)))
+
+(defun epi-ledger--recovery-publication-evidence-bound-p (handle root)
+  "Return non-nil when opaque HANDLE's private proof names exact ROOT."
+  (condition-case nil
+      (equal
+       root
+       (epi-ledger--recovery-evidence-proof-raw-root
+        (epi-ledger--recovery-publication-evidence-resolve handle)))
+    (error nil)))
+
+(defun epi-ledger--recovery-publication-absent-proof-p (proof)
+  "Return non-nil when PROOF is one inert identity/unibyte-bytes pair."
+  (and (consp proof) (consp (cdr proof)) (null (cddr proof))
+       (car proof)
+       (stringp (cadr proof))
+       (not (multibyte-string-p (cadr proof)))))
+
+(defun epi-ledger--recovery-validate-publication-projection-owned
+    (state projection &optional transition)
+  "Return already owned, phase-valid inert PROJECTION for STATE.
+When TRANSITION is non-nil, require STATE to be the immediate predecessor of
+the projection phase; otherwise require matching durable phases.  This private
+worker never establishes ownership; its caller must do that at the preceding
+callback or seam boundary."
+  (unless
+      (epi-ledger--recovery-exact-record-p
+       projection #'epi-ledger--recovery-publication-projection-p
+       epi-ledger--recovery-publication-projection-record-size)
+    (epi-ledger--recovery-manifest-invalid))
+  (let* ((owned projection)
+         (phase
+          (epi-ledger--recovery-publication-projection-raw-phase owned))
+         (state-phase (epi-ledger--recovery-phase-state-raw-phase state))
+         (edge (assq state-phase epi-ledger--recovery-wave5-phase-edges))
+         (preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (source-state
+          (epi-ledger--recovery-preflight-raw-source-object-tree-state
+           preflight))
+         (destination-proof
+          (epi-ledger--recovery-publication-projection-raw-destination-object-proof
+           owned))
+         (destination-authority
+          (epi-ledger--recovery-publication-projection-raw-destination-ledger-authority
+           owned))
+         (source-proof
+          (epi-ledger--recovery-publication-projection-raw-source-object-proof
+           owned))
+         (source-stage
+          (epi-ledger--recovery-publication-projection-raw-source-stage-identity
+           owned))
+         (staged-ledger
+          (epi-ledger--recovery-publication-projection-raw-staged-source-ledger-identity
+           owned))
+         (quarantine
+          (epi-ledger--recovery-publication-projection-raw-quarantine-identity
+           owned))
+         (evidence-kind
+          (epi-ledger--recovery-publication-projection-raw-evidence-kind owned))
+         (evidence
+          (epi-ledger--recovery-publication-projection-raw-evidence-proof owned))
+         (final-ledger
+          (epi-ledger--recovery-publication-projection-raw-final-source-ledger-identity
+           owned))
+         (marker-identity
+          (epi-ledger--recovery-publication-projection-raw-quarantine-marker-identity
+           owned))
+         (marker-bytes
+          (epi-ledger--recovery-publication-projection-raw-quarantine-marker-bytes
+           owned)))
+    (unless
+        (and
+         (symbolp phase)
+         (member (symbol-name phase) epi-ledger--recovery-manifest-phases)
+         (if transition (and edge (eq phase (cdr edge)))
+           (eq phase state-phase))
+         (memq source-state '(present absent))
+         (if destination-proof
+             (epi-ledger--recovery-publication-tree-proof-bound-p
+              destination-proof
+              (epi-ledger--recovery-layout-raw-destination-objects-path
+               layout)
+              (epi-ledger--recovery-destination-complete-path layout))
+           t)
+         (if source-proof
+             (epi-ledger--recovery-publication-evidence-bound-p
+              source-proof
+              (epi-ledger--recovery-layout-raw-source-objects-path layout))
+           t)
+         (if
+             (memq phase
+                   '(objects-transferred destination-objects-published
+                     destination-ledger-published source-ledger-staged))
+             (eq (not (null source-proof)) (eq source-state 'present))
+           (and (null source-proof) (eq evidence-kind source-state)))
+         (if (eq evidence-kind 'present)
+             (epi-ledger--recovery-publication-evidence-bound-p
+              evidence
+              (pcase phase
+                ('source-objects-staged
+                 (epi-ledger--recovery-layout-raw-staged-source-objects-path
+                  layout))
+                ('quarantine-published
+                 (epi-ledger--recovery-final-source-objects-path layout))
+                (_ nil)))
+           (if (eq evidence-kind 'absent)
+               (epi-ledger--recovery-publication-absent-proof-p evidence)
+             (null evidence)))
+         (pcase phase
+           ('objects-transferred
+            (not (or destination-proof destination-authority
+                     source-stage staged-ledger quarantine evidence-kind
+                     evidence final-ledger marker-identity marker-bytes)))
+           ('destination-objects-published
+            (and destination-proof
+                 (not (or destination-authority source-stage
+                          staged-ledger quarantine evidence-kind evidence
+                          final-ledger marker-identity marker-bytes))))
+           ('destination-ledger-published
+            (and destination-proof destination-authority
+                 (not (or source-stage staged-ledger quarantine evidence-kind
+                          evidence final-ledger marker-identity marker-bytes))))
+           ('source-ledger-staged
+            (and destination-proof destination-authority
+                 source-stage staged-ledger quarantine
+                 (not (or evidence-kind evidence final-ledger
+                          marker-identity marker-bytes))))
+           ('source-objects-staged
+            (and destination-proof destination-authority
+                 source-stage staged-ledger quarantine
+                 (memq evidence-kind '(present absent)) evidence
+                 (not (or source-proof final-ledger
+                          marker-identity marker-bytes))))
+           ('quarantine-published
+            (and destination-proof destination-authority
+                 source-stage quarantine
+                 (memq evidence-kind '(present absent)) evidence final-ledger
+                 marker-identity (stringp marker-bytes)
+                 (not (or source-proof staged-ledger))))
+           (_ nil)))
+      (epi-ledger--recovery-manifest-invalid))
+    owned))
+
+(defun epi-ledger--recovery-validate-publication-projection
+    (state projection &optional transition)
+  "Return an ownership-isolated, phase-valid PROJECTION for STATE.
+When TRANSITION is non-nil, require STATE to be the immediate predecessor of
+the projection phase; otherwise require matching durable phases."
+  (epi-ledger--recovery-validate-publication-projection-owned
+   state
+   (epi-ledger--recovery-copy-publication-projection projection)
+   transition))
+
+(defun
+    epi-ledger--recovery-require-publication-marker-bytes-cooperative-owned
+    (state projection phase-cache)
+  "Authenticate owned PROJECTION marker bytes through private PHASE-CACHE.
+PROJECTION must already be ownership-isolated and phase-valid for STATE."
+  (let* ((preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (phase
+          (epi-ledger--recovery-publication-projection-raw-phase projection))
+         (destination-proof
+          (epi-ledger--recovery-publication-projection-raw-destination-object-proof
+           projection))
+         (evidence-kind
+          (epi-ledger--recovery-publication-projection-raw-evidence-kind
+           projection))
+         (evidence
+          (epi-ledger--recovery-publication-projection-raw-evidence-proof
+           projection)))
+    (cl-labels
+        ((require-phase-bytes
+          (bytes expected-phase)
+          (unless
+              (equal
+               bytes
+               (epi-ledger--recovery-cached-phase-bytes
+                preflight phase-cache expected-phase))
+            (epi-ledger--recovery-manifest-invalid))))
+      (when destination-proof
+        (require-phase-bytes
+         (plist-get destination-proof :marker-bytes)
+         'destination-objects-published))
+      (when (eq evidence-kind 'absent)
+        (require-phase-bytes (cadr evidence) 'source-objects-staged))
+      (when (eq phase 'quarantine-published)
+        (require-phase-bytes
+         (epi-ledger--recovery-publication-projection-raw-quarantine-marker-bytes
+          projection)
+         'quarantine-published)))
+    projection))
+
+(defun epi-ledger--recovery-require-publication-marker-bytes-cooperative
+    (state projection &optional transition phase-cache)
+  "Authenticate PROJECTION marker bytes against STATE's deterministic phases.
+TRANSITION has the meaning used by publication projection validation.  This
+cooperative boundary copies and validates projection authority once.  It uses
+PHASE-CACHE, or one fresh private cache, without exposing cached byte strings."
+  (let* ((preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (phase-cache
+          (or phase-cache
+              (epi-ledger--recovery-make-phase-byte-cache preflight)))
+         (projection
+          (epi-ledger--recovery-validate-publication-projection
+           state projection transition)))
+    (epi-ledger--recovery-require-publication-marker-bytes-cooperative-owned
+     state projection phase-cache)))
+
+(defun epi-ledger--recovery-require-phase-lock-final-raw (lock)
+  "Metadata-close exact LOCK without reading or decoding its token bytes."
+  (unless
+      (and
+       (epi-ledger--lock-p lock)
+       (equal
+        (epi-ledger--lock-file-identity lock)
+        (epi-ledger--recovery-require-private-file-state-raw
+         (epi-ledger--lock-lock-file lock)
+         (epi-ledger--lock-file-identity lock)
+         (length (epi-ledger--lock-bytes lock))
+         'lock-token-changed t)))
+    (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+  t)
+
+(defun epi-ledger--recovery-require-live-source-final-raw
+    (state source-object-proof)
+  "Metadata-close STATE's live source and optional SOURCE-OBJECT-PROOF."
+  (let* ((preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (proof (epi-ledger--recovery-preflight-raw-source-proof preflight))
+         (source (epi-ledger--recovery-layout-raw-source-path layout))
+         (identity (epi-ledger--recovery-source-proof-file-identity proof))
+         (device
+          (epi-ledger--recovery-layout-raw-quarantine-device layout)))
+    (unless
+        (equal
+         identity
+         (epi-ledger--recovery-require-private-file-state-raw
+          source identity
+          (epi-ledger--recovery-source-proof-source-size proof)
+          'recovery-preflight-changed t))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-preflight-changed))
+    (epi-ledger--recovery-reprove-source-object-state-raw preflight layout)
+    (epi-ledger--recovery-reprove-reachable-objects-raw preflight layout)
+    (when source-object-proof
+      (epi-ledger--recovery-require-source-object-proof-raw
+       source-object-proof device t))
+    t))
+
+(defun epi-ledger--recovery-require-published-destination-final-raw
+    (state projection)
+  "Metadata-close STATE's published destination described by PROJECTION."
+  (let* ((preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (destination
+          (epi-ledger--recovery-layout-raw-destination-path layout))
+         (object-proof
+          (epi-ledger--recovery-publication-projection-raw-destination-object-proof
+           projection))
+         (authority
+          (epi-ledger--recovery-publication-projection-raw-destination-ledger-authority
+           projection)))
+    (epi-ledger--recovery-require-destination-object-origin-raw
+     state object-proof)
+    (epi-ledger--recovery-require-object-tree-proof-raw object-proof t)
+    (epi-ledger--recovery-require-destination-ledger-authority
+     authority preflight destination
+     (epi-ledger--recovery-phase-state-raw-staged-ledger-identity state))
+    t))
+
+(defun epi-ledger--recovery-require-publication-projection-cooperative-owned
+    (state lock projection phase-cache)
+  "Cooperatively close owned PROJECTION against STATE and optional LOCK.
+Marker files are byte-authenticated; object leaves are metadata-restated from
+prior content-authenticated receipt authority.  PROJECTION must already be
+copied and phase-valid; nested workers do not re-establish ownership.
+PHASE-CACHE is the private canonical byte table."
+  (let* ((phase
+          (epi-ledger--recovery-publication-projection-raw-phase projection))
+         (preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (device
+          (epi-ledger--recovery-layout-raw-quarantine-device layout))
+         (source (epi-ledger--recovery-layout-raw-source-path layout))
+         (source-objects
+          (epi-ledger--recovery-layout-raw-source-objects-path layout))
+         (destination
+          (epi-ledger--recovery-layout-raw-destination-path layout))
+         (staged-destination-ledger
+          (epi-ledger--recovery-layout-raw-staged-destination-ledger-path
+           layout))
+         (staged-destination-objects
+          (epi-ledger--recovery-layout-raw-staged-destination-objects-path
+           layout))
+         (source-stage
+          (epi-ledger--recovery-layout-raw-source-stage-path layout))
+         (staged-source-ledger
+          (epi-ledger--recovery-layout-raw-staged-source-ledger-path layout))
+         (staged-source-objects
+          (epi-ledger--recovery-layout-raw-staged-source-objects-path layout))
+         (absent-marker
+          (epi-ledger--recovery-layout-raw-absent-source-objects-marker-path
+           layout))
+         (quarantine
+          (epi-ledger--recovery-layout-raw-final-quarantine-path layout))
+         (final-source-ledger
+          (epi-ledger--recovery-final-source-ledger-path layout))
+         (destination-proof
+          (epi-ledger--recovery-publication-projection-raw-destination-object-proof
+           projection))
+         (source-handle
+          (epi-ledger--recovery-publication-projection-raw-source-object-proof
+           projection))
+         (source-proof
+          (and source-handle
+               (epi-ledger--recovery-publication-evidence-resolve
+                source-handle)))
+         (source-stage-identity
+          (epi-ledger--recovery-publication-projection-raw-source-stage-identity
+           projection))
+         (staged-source-ledger-identity
+          (epi-ledger--recovery-publication-projection-raw-staged-source-ledger-identity
+           projection))
+         (quarantine-identity
+          (epi-ledger--recovery-publication-projection-raw-quarantine-identity
+           projection))
+         (evidence-kind
+          (epi-ledger--recovery-publication-projection-raw-evidence-kind
+           projection))
+         (evidence-token
+          (epi-ledger--recovery-publication-projection-raw-evidence-proof
+           projection))
+         (evidence-proof
+          (if (eq evidence-kind 'present)
+              (epi-ledger--recovery-publication-evidence-resolve evidence-token)
+            evidence-token)))
+    (setq projection
+          (epi-ledger--recovery-require-publication-marker-bytes-cooperative-owned
+           state projection phase-cache))
+    (cl-labels
+        ((require-absent
+          (path code)
+          (epi-ledger--recovery-require-absent-name path code))
+         (source-stage-proof
+          (entries)
+          (epi-ledger--recovery-require-directory-entries-raw
+           source-stage entries)
+          (unless
+              (equal
+               source-stage-identity
+               (epi-ledger--recovery-require-bound-directory-raw
+                source-stage source-stage-identity device #o700))
+            (epi-ledger--fail
+             'epi-ledger-conflict 'recovery-path-conflict)))
+         (published-destination
+         ()
+          (epi-ledger--recovery-require-published-destination-raw
+           state destination-proof
+           (epi-ledger--recovery-publication-projection-raw-destination-ledger-authority
+            projection)))
+         (live-source
+          ()
+          (epi-ledger--recovery-require-live-source-raw
+           preflight
+           (epi-ledger--recovery-phase-state-raw-source-last-record state)
+           lock)
+          (when source-proof
+            (epi-ledger--recovery-require-source-object-proof-raw
+             source-proof device))))
+      (pcase phase
+        ('objects-transferred
+         (let* ((prepared
+                 (epi-ledger--recovery-phase-prepared
+                  state
+                  (epi-ledger--recovery-phase-state-raw-manifest-identity state)
+                  (epi-ledger--recovery-phase-state-raw-transaction-entry-state
+                   state)))
+                (items (epi-ledger--recovery-transfer-items preflight)))
+           (epi-ledger--recovery-require-transfer-authority-raw
+            prepared items
+            (epi-ledger--recovery-phase-state-raw-staged-directory-receipts
+             state)
+            (epi-ledger--recovery-phase-state-raw-staged-object-receipts state)
+            (epi-ledger--recovery-phase-state-raw-staged-ledger-identity state)
+            (epi-ledger--recovery-phase-state-raw-destination-parent-identity
+             state)
+            (epi-ledger--recovery-phase-state-raw-source-last-record state)
+            lock
+            (epi-ledger--recovery-phase-state-raw-manifest-identity state)
+            (epi-ledger--recovery-phase-state-raw-transaction-entry-state state))
+           (when source-proof
+             (epi-ledger--recovery-require-source-object-proof-raw
+              source-proof device))))
+        ('destination-objects-published
+         (epi-ledger--recovery-require-destination-object-origin-raw
+          state destination-proof)
+         (epi-ledger--recovery-require-object-tree-proof-raw destination-proof)
+         (epi-ledger--recovery-require-staged-ledger-raw
+          preflight layout
+          (epi-ledger--recovery-phase-state-raw-staged-ledger-identity state))
+         (require-absent destination 'recovery-destination-exists)
+         (require-absent staged-destination-objects 'recovery-path-conflict)
+         (require-absent source-stage 'recovery-path-conflict)
+         (require-absent quarantine 'recovery-path-conflict)
+         (live-source))
+        ('destination-ledger-published
+         (published-destination)
+         (require-absent staged-destination-objects 'recovery-path-conflict)
+         (require-absent staged-destination-ledger 'recovery-path-conflict)
+         (require-absent source-stage 'recovery-path-conflict)
+         (require-absent quarantine 'recovery-path-conflict)
+         (live-source))
+        ('source-ledger-staged
+         (published-destination)
+         (require-absent staged-destination-objects 'recovery-path-conflict)
+         (require-absent staged-destination-ledger 'recovery-path-conflict)
+         (require-absent source 'recovery-preflight-changed)
+         (source-stage-proof
+          (list (file-name-nondirectory staged-source-ledger)))
+         (epi-ledger--recovery-require-staged-source-ledger-raw
+          preflight staged-source-ledger staged-source-ledger-identity)
+         (epi-ledger--recovery-require-empty-directory-raw
+          quarantine quarantine-identity device)
+         (epi-ledger--recovery-reprove-source-object-state-raw
+          preflight layout)
+         (epi-ledger--recovery-reprove-reachable-objects-raw preflight layout)
+         (when source-proof
+           (epi-ledger--recovery-require-source-object-proof-raw
+            source-proof device)))
+        ('source-objects-staged
+         (published-destination)
+         (require-absent staged-destination-objects 'recovery-path-conflict)
+         (require-absent staged-destination-ledger 'recovery-path-conflict)
+         (require-absent source 'recovery-preflight-changed)
+         (require-absent source-objects 'recovery-path-conflict)
+         (source-stage-proof
+          (list
+           (file-name-nondirectory staged-source-ledger)
+           (file-name-nondirectory
+            (if (eq evidence-kind 'present)
+                staged-source-objects absent-marker))))
+         (epi-ledger--recovery-require-staged-source-ledger-raw
+          preflight staged-source-ledger staged-source-ledger-identity)
+         (pcase evidence-kind
+           ('present
+            (require-absent absent-marker 'recovery-path-conflict)
+            (epi-ledger--recovery-require-source-object-proof-raw
+             evidence-proof device))
+           ('absent
+            (require-absent staged-source-objects 'recovery-path-conflict)
+            (epi-ledger--recovery-require-exact-file-bytes
+             absent-marker (nth 0 evidence-proof) (nth 1 evidence-proof)
+             'recovery-manifest-invalid)))
+         (epi-ledger--recovery-require-empty-directory-raw
+          quarantine quarantine-identity device))
+        ('quarantine-published
+         (published-destination)
+         (require-absent source 'recovery-preflight-changed)
+         (require-absent source-objects 'recovery-path-conflict)
+         (require-absent staged-destination-objects 'recovery-path-conflict)
+         (require-absent staged-destination-ledger 'recovery-path-conflict)
+         (source-stage-proof nil)
+         (epi-ledger--recovery-require-quarantine-raw
+          preflight quarantine-identity final-source-ledger
+          (epi-ledger--recovery-publication-projection-raw-final-source-ledger-identity
+           projection)
+          evidence-kind evidence-proof
+          (epi-ledger--recovery-publication-projection-raw-quarantine-marker-identity
+           projection)
+          (epi-ledger--recovery-publication-projection-raw-quarantine-marker-bytes
+           projection)))
+        (_ (epi-ledger--recovery-manifest-invalid))))
+    projection))
+
+(defun epi-ledger--recovery-require-publication-projection-cooperative
+    (state lock projection &optional transition phase-cache)
+  "Cooperatively close inert PROJECTION against STATE and optional LOCK.
+Marker files are byte-authenticated; object leaves are metadata-restated from
+prior content-authenticated receipt authority rather than reread.  TRANSITION
+permits the projection to describe STATE's immediate physical successor before
+its manifest rename.  This callback/seam boundary establishes ownership and
+validates once, then uses only private owned workers.  PHASE-CACHE is the
+enclosing publication's private canonical byte table."
+  (let* ((preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (phase-cache
+          (or phase-cache
+              (epi-ledger--recovery-make-phase-byte-cache preflight)))
+         (projection
+          (epi-ledger--recovery-validate-publication-projection
+           state projection transition)))
+    (epi-ledger--recovery-require-publication-projection-cooperative-owned
+     state lock projection phase-cache)))
+
+(defun epi-ledger--recovery-require-publication-projection-final-round-owned
+    (state projection)
+  "Metadata-close one physical STATE round for owned PROJECTION.
+The cooperative round already byte-authenticated journals and markers; this
+round metadata-restates their epochs and all object leaves from that authority
+without rereading content.  PROJECTION must already be phase-valid for the
+selected stable state or physical successor; this worker performs no ownership
+copy."
+  (let* ((phase
+          (epi-ledger--recovery-publication-projection-raw-phase projection))
+         (preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (device
+          (epi-ledger--recovery-layout-raw-quarantine-device layout))
+         (source (epi-ledger--recovery-layout-raw-source-path layout))
+         (source-objects
+          (epi-ledger--recovery-layout-raw-source-objects-path layout))
+         (destination
+          (epi-ledger--recovery-layout-raw-destination-path layout))
+         (staged-destination-ledger
+          (epi-ledger--recovery-layout-raw-staged-destination-ledger-path
+           layout))
+         (staged-destination-objects
+          (epi-ledger--recovery-layout-raw-staged-destination-objects-path
+           layout))
+         (source-stage
+          (epi-ledger--recovery-layout-raw-source-stage-path layout))
+         (staged-source-ledger
+          (epi-ledger--recovery-layout-raw-staged-source-ledger-path layout))
+         (staged-source-objects
+          (epi-ledger--recovery-layout-raw-staged-source-objects-path layout))
+         (absent-marker
+          (epi-ledger--recovery-layout-raw-absent-source-objects-marker-path
+           layout))
+         (quarantine
+          (epi-ledger--recovery-layout-raw-final-quarantine-path layout))
+         (final-source-ledger
+          (epi-ledger--recovery-final-source-ledger-path layout))
+         (destination-proof
+          (epi-ledger--recovery-publication-projection-raw-destination-object-proof
+           projection))
+         (source-handle
+          (epi-ledger--recovery-publication-projection-raw-source-object-proof
+           projection))
+         (source-proof
+          (and source-handle
+               (epi-ledger--recovery-publication-evidence-resolve
+                source-handle)))
+         (source-stage-identity
+          (epi-ledger--recovery-publication-projection-raw-source-stage-identity
+           projection))
+         (staged-source-ledger-identity
+          (epi-ledger--recovery-publication-projection-raw-staged-source-ledger-identity
+           projection))
+         (quarantine-identity
+          (epi-ledger--recovery-publication-projection-raw-quarantine-identity
+           projection))
+         (evidence-kind
+          (epi-ledger--recovery-publication-projection-raw-evidence-kind
+           projection))
+         (evidence-token
+          (epi-ledger--recovery-publication-projection-raw-evidence-proof
+           projection))
+         (evidence-proof
+          (if (eq evidence-kind 'present)
+              (epi-ledger--recovery-publication-evidence-resolve evidence-token)
+            evidence-token)))
+    (cl-labels
+        ((require-absent
+          (path code)
+          (epi-ledger--recovery-require-absent-name path code))
+         (source-stage-proof
+          (entries)
+          (epi-ledger--recovery-require-directory-entries-raw
+           source-stage entries)
+          (unless
+              (equal
+               source-stage-identity
+               (epi-ledger--recovery-require-bound-directory-raw
+                source-stage source-stage-identity device #o700))
+            (epi-ledger--fail
+             'epi-ledger-conflict 'recovery-path-conflict))))
+      (pcase phase
+        ('objects-transferred
+         (let ((items (epi-ledger--recovery-transfer-items preflight)))
+           (epi-ledger--recovery-require-object-stage-raw
+            layout items
+            (epi-ledger--recovery-phase-state-raw-staged-directory-receipts
+             state)
+            (epi-ledger--recovery-phase-state-raw-staged-object-receipts state)
+            (epi-ledger--recovery-phase-state-raw-destination-parent-identity
+             state)
+            t)
+           (epi-ledger--recovery-require-staged-ledger-raw
+            preflight layout
+            (epi-ledger--recovery-phase-state-raw-staged-ledger-identity state))
+           (epi-ledger--recovery-require-transferred-absences-raw layout)
+           (epi-ledger--recovery-require-live-source-final-raw
+            state source-proof)))
+        ('destination-objects-published
+         (epi-ledger--recovery-require-destination-object-origin-raw
+          state destination-proof)
+         (epi-ledger--recovery-require-object-tree-proof-raw
+          destination-proof t)
+         (epi-ledger--recovery-require-staged-ledger-raw
+          preflight layout
+          (epi-ledger--recovery-phase-state-raw-staged-ledger-identity state))
+         (require-absent destination 'recovery-destination-exists)
+         (require-absent staged-destination-objects 'recovery-path-conflict)
+         (require-absent source-stage 'recovery-path-conflict)
+         (require-absent quarantine 'recovery-path-conflict)
+         (epi-ledger--recovery-require-live-source-final-raw
+          state source-proof))
+        ('destination-ledger-published
+         (epi-ledger--recovery-require-published-destination-final-raw
+          state projection)
+         (require-absent staged-destination-objects 'recovery-path-conflict)
+         (require-absent staged-destination-ledger 'recovery-path-conflict)
+         (require-absent source-stage 'recovery-path-conflict)
+         (require-absent quarantine 'recovery-path-conflict)
+         (epi-ledger--recovery-require-live-source-final-raw
+          state source-proof))
+        ('source-ledger-staged
+         (epi-ledger--recovery-require-published-destination-final-raw
+          state projection)
+         (require-absent staged-destination-objects 'recovery-path-conflict)
+         (require-absent staged-destination-ledger 'recovery-path-conflict)
+         (require-absent source 'recovery-preflight-changed)
+         (source-stage-proof
+          (list (file-name-nondirectory staged-source-ledger)))
+         (epi-ledger--recovery-require-staged-source-ledger-raw
+          preflight staged-source-ledger staged-source-ledger-identity)
+         (epi-ledger--recovery-require-empty-directory-raw
+          quarantine quarantine-identity device)
+         (epi-ledger--recovery-reprove-source-object-state-raw
+          preflight layout)
+         (epi-ledger--recovery-reprove-reachable-objects-raw preflight layout)
+         (when source-proof
+           (epi-ledger--recovery-require-source-object-proof-raw
+            source-proof device t)))
+        ('source-objects-staged
+         (epi-ledger--recovery-require-published-destination-final-raw
+          state projection)
+         (require-absent staged-destination-objects 'recovery-path-conflict)
+         (require-absent staged-destination-ledger 'recovery-path-conflict)
+         (require-absent source 'recovery-preflight-changed)
+         (require-absent source-objects 'recovery-path-conflict)
+         (source-stage-proof
+          (list
+           (file-name-nondirectory staged-source-ledger)
+           (file-name-nondirectory
+            (if (eq evidence-kind 'present)
+                staged-source-objects absent-marker))))
+         (epi-ledger--recovery-require-staged-source-ledger-raw
+          preflight staged-source-ledger staged-source-ledger-identity)
+         (pcase evidence-kind
+           ('present
+            (require-absent absent-marker 'recovery-path-conflict)
+            (epi-ledger--recovery-require-source-object-proof-raw
+             evidence-proof device t))
+           ('absent
+            (require-absent staged-source-objects 'recovery-path-conflict)
+            (epi-ledger--recovery-require-private-file-state-raw
+             absent-marker (nth 0 evidence-proof) (length (nth 1 evidence-proof))
+             'recovery-manifest-invalid t)))
+         (epi-ledger--recovery-require-empty-directory-raw
+          quarantine quarantine-identity device))
+        ('quarantine-published
+         (epi-ledger--recovery-require-published-destination-final-raw
+          state projection)
+         (require-absent source 'recovery-preflight-changed)
+         (require-absent source-objects 'recovery-path-conflict)
+         (require-absent staged-destination-objects 'recovery-path-conflict)
+         (require-absent staged-destination-ledger 'recovery-path-conflict)
+         (source-stage-proof nil)
+         (epi-ledger--recovery-require-quarantine-raw
+          preflight quarantine-identity final-source-ledger
+          (epi-ledger--recovery-publication-projection-raw-final-source-ledger-identity
+           projection)
+          evidence-kind evidence-proof
+          (epi-ledger--recovery-publication-projection-raw-quarantine-marker-identity
+           projection)
+          (epi-ledger--recovery-publication-projection-raw-quarantine-marker-bytes
+           projection)
+          t))
+        (_ (epi-ledger--recovery-manifest-invalid))))
+    t))
+
+(defun epi-ledger--recovery-require-phase-lock-raw (preflight lock)
+  "Raw-require LOCK's exact token against PREFLIGHT's original source epoch."
+  (let* ((proof (epi-ledger--recovery-preflight-raw-source-proof preflight))
+         (verified
+          (epi-ledger--recovery-verify-lock-receipt-raw
+           lock
+           (epi-ledger--recovery-source-proof-canonical-path proof)
+           (epi-ledger--recovery-source-proof-file-identity proof)
+           (epi-ledger--recovery-source-proof-source-size proof)
+           (epi-ledger--recovery-source-proof-valid-prefix-head proof))))
+    (unless (equal verified lock)
+      (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+    verified))
+
+(defun epi-ledger--recovery-require-destination-lock-raw (state lock)
+  "Raw-require LOCK's exact absent-bound destination token for STATE."
+  (let* ((layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (destination
+          (epi-ledger--recovery-layout-raw-destination-path layout))
+         (verified
+          (epi-ledger--recovery-verify-lock-receipt-raw
+           lock destination "absent" 0 nil)))
+    (unless (equal verified lock)
+      (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+    verified))
+
+(defun epi-ledger--recovery-require-destination-lock-final-raw (state lock)
+  "Metadata-close STATE's exact absent-bound destination LOCK."
+  (let* ((layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (destination
+          (epi-ledger--recovery-layout-raw-destination-path layout))
+         (expected-lock-path (concat destination ".epi-lock")))
+    (unless
+        (and (epi-ledger--lock-p lock)
+             (equal expected-lock-path (epi-ledger--lock-lock-file lock))
+             (equal "absent" (epi-ledger--lock-expected-file lock))
+             (= 0 (epi-ledger--lock-expected-end lock))
+             (null (epi-ledger--lock-expected-head lock)))
+      (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+    (epi-ledger--recovery-require-phase-lock-final-raw lock)))
+
+(defun epi-ledger--recovery-acquire-destination-lock
+    (state &optional receipt-receiver)
+  "Acquire STATE's expected-absent destination lock and return exact authority.
+When RECEIPT-RECEIVER is non-nil, transfer it the exact received token before
+fallible return-value validation or copying.  A receiver that returns normally
+owns cleanup thereafter; direct one-argument callers retain local cleanup."
+  (let* ((layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (source (epi-ledger--recovery-layout-raw-source-path layout))
+         (destination
+          (epi-ledger--recovery-layout-raw-destination-path layout))
+         (source-lock-path (epi-ledger--lock-path source))
+         (destination-lock-path (epi-ledger--lock-path destination))
+         received returned lock handed-off)
+    (epi-ledger--recovery-require-distinct-paths
+     (list source-lock-path destination-lock-path)
+     (epi-ledger--recovery-path-set-case-insensitive-p
+      (list source-lock-path destination-lock-path)))
+    (epi-ledger--recovery-require-transferred-absences-raw layout)
+    (unwind-protect
+        (progn
+          (let ((epi-ledger--lock-acquisition-receiver nil)
+                (receiver
+                 (lambda (receipt)
+                   (when received
+                     (epi-ledger--fail
+                      'epi-ledger-conflict 'lock-token-changed))
+                   (setq received
+                         (epi-ledger--recovery-verify-lock-receipt-raw
+                          receipt destination "absent" 0 nil)))))
+            (setq returned
+                  (epi-ledger--acquire-lock
+                   destination "absent" 0 nil receiver)))
+          (when receipt-receiver
+            (let ((owned
+                   (cond
+                    ((epi-ledger--lock-p received) received)
+                    ((epi-ledger--lock-p returned) returned))))
+              (when owned
+                (let ((inhibit-quit t))
+                  (funcall receipt-receiver owned)
+                  (setq handed-off t)))))
+          (unless (and received returned
+                       (epi-ledger--lock-p returned)
+                       (equal received returned))
+            (epi-ledger--fail 'epi-ledger-conflict 'lock-token-changed))
+          (setq lock (epi-ledger--recovery-copy-lock received))
+          (epi-ledger--recovery-require-destination-lock-raw state lock)
+          (epi-ledger--recovery-require-transferred-absences-raw layout)
+          (unless receipt-receiver
+            (setq handed-off t))
+          lock)
+      (unless handed-off
+        (let ((owned
+               (cond
+                ((epi-ledger--lock-p lock) lock)
+                ((epi-ledger--lock-p received)
+                 (epi-ledger--recovery-copy-lock received))
+                ((epi-ledger--lock-p returned)
+                 (epi-ledger--recovery-copy-lock returned)))))
+          (when owned
+            (epi-ledger--recovery-release-destination-lock-raw owned)))))))
+
+(defun epi-ledger--recovery-require-phase-journal-cooperative
+    (state lock projection &optional phase-cache destination-lock)
+  "Cooperatively close STATE, LOCK, DESTINATION-LOCK, and PROJECTION twice.
+The manifest and marker files are byte-authenticated; object leaves are
+metadata-restated from prior content-authenticated receipt authority.
+PHASE-CACHE is the enclosing publication's private canonical byte table.
+DESTINATION-LOCK, when non-nil, binds the expected-absent destination token."
+  (let* ((preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (phase-cache
+          (or phase-cache
+              (epi-ledger--recovery-make-phase-byte-cache preflight)))
+         (layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (manifest (epi-ledger--recovery-layout-raw-manifest-path layout)))
+    (dotimes (_ 2)
+      (epi-ledger--recovery-require-exact-file-bytes
+       manifest
+       (epi-ledger--recovery-phase-state-raw-manifest-identity state)
+       (epi-ledger--recovery-phase-state-raw-manifest-bytes state)
+       'recovery-manifest-invalid)
+      (epi-ledger--recovery-require-transaction-entry-state-raw
+       layout
+       (epi-ledger--recovery-phase-state-raw-transaction-entry-state state)
+       t)
+      (epi-ledger--recovery-require-manifest-temporary-absent-raw layout)
+      (setq projection
+            (epi-ledger--recovery-require-publication-projection-cooperative
+             state lock projection nil phase-cache))
+      (when lock
+        (epi-ledger--recovery-require-phase-lock-raw preflight lock))
+      (when destination-lock
+        (epi-ledger--recovery-require-destination-lock-raw
+         state destination-lock))
+      (epi-ledger--recovery-require-exact-file-bytes
+       manifest
+       (epi-ledger--recovery-phase-state-raw-manifest-identity state)
+       (epi-ledger--recovery-phase-state-raw-manifest-bytes state)
+       'recovery-manifest-invalid)
+      (epi-ledger--recovery-require-transaction-entry-state-raw
+       layout
+       (epi-ledger--recovery-phase-state-raw-transaction-entry-state state)
+       t)
+      (when destination-lock
+        (epi-ledger--recovery-require-destination-lock-raw
+         state destination-lock)))
+    projection))
+
+(defun epi-ledger--recovery-require-phase-journal-final-round-owned
+    (state lock projection &optional transaction-state temporary-identity
+           destination-lock)
+  "Metadata-close one STATE journal and physical round for owned PROJECTION.
+TRANSACTION-STATE and TEMPORARY-IDENTITY bind the pre-rename journal
+generation when present.  LOCK binds the source phase-lock generation, or is
+nil after release.  DESTINATION-LOCK binds the publication lock when present."
+  (let* ((layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (device
+          (epi-ledger--recovery-layout-raw-quarantine-device layout))
+         (manifest (epi-ledger--recovery-layout-raw-manifest-path layout))
+         (temporary
+          (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+         (manifest-identity
+          (epi-ledger--recovery-phase-state-raw-manifest-identity state))
+         (entries
+          (or transaction-state
+              (epi-ledger--recovery-phase-state-raw-transaction-entry-state
+               state)))
+         (transaction-identity
+          (or (plist-get entries :identity)
+              (epi-ledger--recovery-phase-state-raw-transaction-identity
+               state))))
+    (epi-ledger--recovery-require-bound-directory-raw
+     (epi-ledger--recovery-layout-raw-quarantine-root layout)
+     (epi-ledger--recovery-phase-state-raw-quarantine-root-identity state)
+     device)
+    (epi-ledger--recovery-require-bound-directory-raw
+     (epi-ledger--recovery-layout-raw-control-directory layout)
+     (epi-ledger--recovery-phase-state-raw-control-identity state)
+     device #o700)
+    (epi-ledger--recovery-require-bound-directory-raw
+     (epi-ledger--recovery-layout-raw-transaction-directory layout)
+     transaction-identity device #o700)
+    (epi-ledger--recovery-close-destination-parent-raw
+     layout
+     (epi-ledger--recovery-phase-state-raw-destination-parent-identity state))
+    (unless
+        (equal
+         manifest-identity
+         (epi-ledger--recovery-require-private-file-state-raw
+          manifest manifest-identity
+          (length (epi-ledger--recovery-phase-state-raw-manifest-bytes state))
+          'recovery-manifest-invalid t))
+      (epi-ledger--recovery-manifest-invalid))
+    (epi-ledger--recovery-require-transaction-entry-state-raw
+     layout entries t)
+    (epi-ledger--recovery-require-publication-projection-final-round-owned
+     state projection)
+    (when lock
+      (epi-ledger--recovery-require-phase-lock-final-raw lock))
+    (when destination-lock
+      (epi-ledger--recovery-require-destination-lock-final-raw
+       state destination-lock))
+    ;; Keep the temporary epoch last so a transition round can be adjacent to
+    ;; the manifest rename without intervening byte or callback work.
+    (if temporary-identity
+        (unless
+            (equal
+             temporary-identity
+             (epi-ledger--recovery-require-private-file-state-raw
+              temporary temporary-identity
+              (plist-get temporary-identity :size)
+              'recovery-manifest-invalid t))
+          (epi-ledger--recovery-manifest-invalid))
+      (epi-ledger--recovery-require-manifest-temporary-absent-raw layout))
+    t))
+
+(defun epi-ledger--recovery-require-phase-authority-final-raw
+    (state lock projection &optional destination-lock)
+  "Metadata-close stable STATE, LOCK, DESTINATION-LOCK, and PROJECTION twice.
+This final authority boundary performs no byte read, hash, yield, hook, cold
+open, or call through projection data."
+  (let ((file-name-handler-alist nil)
+        (post-gc-hook nil)
+        (epi--yield-function #'ignore)
+        (epi--deadline-clock-function #'float-time)
+        (epi-ledger--stat-function #'epi-ledger--stat-local-file)
+        (epi-ledger--directory-stat-function
+         #'epi-ledger--stat-local-directory)
+        (epi-ledger--read-function #'epi-ledger--read-bytes)
+        (epi-ledger--nonpreemptible-observer nil))
+    (let ((projection
+           (epi-ledger--recovery-validate-publication-projection
+            state projection nil)))
+      (dotimes (_ 2)
+        (epi-ledger--recovery-require-phase-journal-final-round-owned
+         state lock projection nil nil destination-lock)))
+    t))
+
+(defun epi-ledger--recovery-require-phase-transition-final-raw
+    (state target lock projection transaction-state temporary-identity
+           &optional destination-lock)
+  "Metadata-close TARGET under STATE, LOCK, and DESTINATION-LOCK before rename.
+PROJECTION, TRANSACTION-STATE, and TEMPORARY-IDENTITY bind that successor.
+DESTINATION-LOCK binds the publication token when present."
+  (let ((file-name-handler-alist nil)
+        (post-gc-hook nil)
+        (epi--yield-function #'ignore)
+        (epi--deadline-clock-function #'float-time)
+        (epi-ledger--stat-function #'epi-ledger--stat-local-file)
+        (epi-ledger--directory-stat-function
+         #'epi-ledger--stat-local-directory)
+        (epi-ledger--read-function #'epi-ledger--read-bytes)
+        (epi-ledger--nonpreemptible-observer nil))
+    (let ((projection
+           (epi-ledger--recovery-validate-publication-projection
+            state projection t)))
+      (unless (eq target
+                  (epi-ledger--recovery-publication-projection-raw-phase
+                   projection))
+        (epi-ledger--recovery-manifest-invalid))
+      (dotimes (_ 2)
+        (epi-ledger--recovery-require-phase-journal-final-round-owned
+         state lock projection transaction-state temporary-identity
+         destination-lock)))
+    t))
+
+(defun epi-ledger--recovery-require-phase-transition-cleanup-final-raw
+    (state lock projection &optional destination-lock)
+  "Metadata-close an unresolved successor under LOCK and DESTINATION-LOCK.
+This callback-masked cleanup closure deliberately excludes journal names:
+`epi-ledger--recovery-advance-publication-phase' owns exact old/new manifest
+and optional temporary classification.  PROJECTION is inert authority for
+STATE's immediate physical successor."
+  (let ((file-name-handler-alist nil)
+        (post-gc-hook nil)
+        (epi--yield-function #'ignore)
+        (epi--deadline-clock-function #'float-time)
+        (epi-ledger--stat-function #'epi-ledger--stat-local-file)
+        (epi-ledger--directory-stat-function
+         #'epi-ledger--stat-local-directory)
+        (epi-ledger--read-function #'epi-ledger--read-bytes)
+        (epi-ledger--nonpreemptible-observer nil))
+    (let ((projection
+           (epi-ledger--recovery-validate-publication-projection
+            state projection t)))
+      (dotimes (_ 2)
+        (epi-ledger--recovery-require-publication-projection-final-round-owned
+         state projection)
+        (when lock
+          (epi-ledger--recovery-require-phase-lock-final-raw lock))
+        (when destination-lock
+          (epi-ledger--recovery-require-destination-lock-final-raw
+           state destination-lock))))
+    t))
+
+(defun epi-ledger--recovery-require-phase-authority-raw
+    (state lock projection &optional phase-cache destination-lock)
+  "Authenticate STATE, LOCK, and DESTINATION-LOCK, then close PROJECTION.
+PHASE-CACHE is the enclosing publication's private canonical byte table.
+DESTINATION-LOCK binds the expected-absent publication token when present."
+  (setq phase-cache
+        (or phase-cache
+            (epi-ledger--recovery-make-phase-byte-cache
+             (epi-ledger--recovery-phase-state-raw-preflight state))))
+  (setq projection
+        (epi-ledger--recovery-require-phase-journal-cooperative
+         state lock projection phase-cache destination-lock))
+  (epi-ledger--recovery-require-phase-authority-final-raw
+   state lock projection destination-lock))
+
+(defun epi-ledger--recovery-advance-publication-phase
+    (state target lock projection &optional successor-receiver phase-cache
+           destination-lock)
+  "Advance durable STATE once to TARGET under LOCK and DESTINATION-LOCK.
+PROJECTION is inert authority for the already constructed TARGET filesystem.
+No physical publication is rolled back by this journal procedure.  When
+non-nil, SUCCESSOR-RECEIVER receives the closed durable successor before the
+barrier so an enclosing unwind can retain the committed generation.
+PHASE-CACHE is the enclosing publication's private canonical byte table.
+DESTINATION-LOCK binds the expected-absent publication token when present."
+  (let* ((current (epi-ledger--recovery-phase-state-raw-phase state))
+         (edge (assq current epi-ledger--recovery-wave5-phase-edges))
+         (preflight (epi-ledger--recovery-phase-state-raw-preflight state))
+         (phase-cache
+          (or phase-cache
+              (epi-ledger--recovery-make-phase-byte-cache preflight)))
+         (layout (epi-ledger--recovery-phase-state-raw-path-layout state))
+         (manifest
+          (epi-ledger--recovery-layout-raw-manifest-path layout))
+         (temporary
+          (epi-ledger--recovery-layout-raw-manifest-temporary-path layout))
+         (old-identity
+          (epi-ledger--recovery-phase-state-raw-manifest-identity state))
+         (old-bytes
+          (epi-ledger--recovery-phase-state-raw-manifest-bytes state))
+         (new-bytes
+          (epi-ledger--recovery-cached-phase-bytes
+           preflight phase-cache target))
+         (transaction-state
+          (epi-ledger--recovery-capture-transaction-entry-state-core-raw
+           layout
+           (epi-ledger--recovery-phase-state-raw-transaction-identity state)
+           (epi-ledger--recovery-phase-entry-names layout target)))
+         (prepared
+          (epi-ledger--recovery-phase-prepared
+           state old-identity transaction-state))
+         temporary-identity temporary-state manifest-identity successor
+         classification body-condition complete successor-delivered
+         (epi-ledger--recovery-file-receipt-receiver nil)
+         (receipt-receiver
+          (lambda (role path identity)
+            (let ((owned
+                   (epi-ledger--recovery-copy-file-identity identity)))
+              (unless
+                  (and (eq role 'phase-temporary)
+                       (null temporary-identity)
+                       (equal path temporary)
+                       (equal path (plist-get owned :path))
+                       (equal
+                        owned
+                        (epi-ledger--recovery-require-private-file-state-raw
+                         path owned 0 'recovery-manifest-invalid t)))
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'recovery-manifest-invalid))
+              (setq temporary-identity owned)))))
+    (unless (and edge (eq target (cdr edge)))
+      (epi-ledger--recovery-manifest-invalid))
+    (setq projection
+          (epi-ledger--recovery-validate-publication-projection
+           state projection t))
+    (unwind-protect
+        (condition-case condition
+            (progn
+              (epi-ledger--recovery-require-exact-file-bytes
+               manifest old-identity old-bytes
+               'recovery-manifest-invalid)
+              (epi-ledger--recovery-require-publication-projection-cooperative
+               state lock projection t phase-cache)
+              (epi-ledger--recovery-require-phase-lock-raw preflight lock)
+              (when destination-lock
+                (epi-ledger--recovery-require-destination-lock-raw
+                 state destination-lock))
+              (let ((phase-preparation
+                     (epi-ledger--recovery-prepare-phase-manifest-temporary
+                      prepared new-bytes receipt-receiver
+                      (epi-ledger--recovery-phase-has-source-stage-p
+                       target))))
+                (unless (and temporary-identity
+                             (epi-ledger--same-file-object-p
+                              temporary-identity
+                              (nth 0 phase-preparation)))
+                  (epi-ledger--recovery-manifest-invalid))
+                (setq temporary-identity
+                      (epi-ledger--recovery-copy-file-identity
+                       (nth 0 phase-preparation))
+                      temporary-state (nth 1 phase-preparation)))
+              (epi-ledger--recovery-require-publication-projection-cooperative
+               state lock projection t phase-cache)
+              (epi-ledger--recovery-require-phase-lock-raw preflight lock)
+              (when destination-lock
+                (epi-ledger--recovery-require-destination-lock-raw
+                 state destination-lock))
+              ;; Byte verification may yield, so finish it before entering the
+              ;; callback-masked metadata epoch that immediately precedes the
+              ;; exact temporary restat and canonical rename.
+              (epi-ledger--recovery-require-exact-file-bytes
+               manifest old-identity old-bytes
+               'recovery-manifest-invalid)
+              (let ((file-name-handler-alist nil)
+                    (post-gc-hook nil)
+                    (epi--yield-function #'ignore)
+                    (epi--deadline-clock-function #'float-time)
+                    (epi-ledger--nonpreemptible-observer nil))
+                (epi-ledger--recovery-require-manifest-epoch-raw
+                 manifest old-identity)
+                (epi-ledger--recovery-require-transaction-entry-state-raw
+                 layout temporary-state t)
+                (epi-ledger--recovery-require-phase-transition-final-raw
+                 state target lock projection temporary-state
+                 temporary-identity destination-lock)
+                (setq manifest-identity
+                      (epi-ledger--recovery-commit-phase-manifest-raw
+                       temporary manifest temporary-identity)))
+              (setq transaction-state
+                    (epi-ledger--recovery-capture-transaction-entry-state-core-raw
+                     layout
+                     (plist-get temporary-state :identity)
+                     (epi-ledger--recovery-phase-entry-names layout target))
+                    successor
+                    (epi-ledger--recovery-phase-state-successor
+                     state target manifest-identity new-bytes
+                     transaction-state))
+              (epi-ledger--recovery-require-phase-authority-raw
+               successor lock projection phase-cache destination-lock)
+              (when successor-receiver
+                (funcall successor-receiver successor))
+              (setq successor-delivered t)
+              (unwind-protect
+                  (funcall epi-ledger--recovery-phase-barrier-function target)
+                (epi-ledger--recovery-require-phase-authority-raw
+                 successor lock projection phase-cache destination-lock))
+              (setq complete t))
+          ((error quit)
+           (setq body-condition condition)))
+      (unless complete
+        (if (null temporary-identity)
+            (progn
+              (epi-ledger--recovery-require-exact-file-bytes
+               manifest old-identity old-bytes
+               'recovery-manifest-invalid)
+              (epi-ledger--recovery-require-publication-projection-cooperative
+               state lock projection t phase-cache)
+              (epi-ledger--recovery-require-phase-lock-raw preflight lock)
+              (when destination-lock
+                (epi-ledger--recovery-require-destination-lock-raw
+                 state destination-lock)))
+          (setq classification
+                (epi-ledger--recovery-classify-phase-manifest
+                 layout old-identity temporary-identity new-bytes
+                 manifest-identity))
+          (pcase (plist-get classification :state)
+            ('new
+             (setq manifest-identity
+                   (plist-get classification :identity)
+                   transaction-state
+                   (epi-ledger--recovery-capture-transaction-entry-state-core-raw
+                    layout
+                    (epi-ledger--recovery-phase-state-raw-transaction-identity
+                     state)
+                    (epi-ledger--recovery-phase-entry-names layout target))
+                   successor
+                   (epi-ledger--recovery-phase-state-successor
+                    state target manifest-identity new-bytes
+                    transaction-state))
+             (epi-ledger--recovery-require-phase-authority-raw
+              successor lock projection phase-cache destination-lock)
+             (unless successor-delivered
+               (when successor-receiver
+                 (funcall successor-receiver successor))
+               (setq successor-delivered t)))
+            ('old
+             (epi-ledger--recovery-require-exact-file-bytes
+              manifest old-identity old-bytes
+              'recovery-manifest-invalid)
+             (let ((temporary-state-now
+                    (epi-ledger--raw-object-name-state temporary)))
+               (when temporary-state-now
+                 (epi-ledger--recovery-require-private-file-state-raw
+                  temporary temporary-identity
+                  (plist-get temporary-state-now :size)
+                  'recovery-manifest-invalid t)))
+             (epi-ledger--recovery-require-publication-projection-cooperative
+              state lock projection t phase-cache)
+             (epi-ledger--recovery-require-phase-lock-raw preflight lock)
+             (when destination-lock
+               (epi-ledger--recovery-require-destination-lock-raw
+                state destination-lock))
+             (when temporary-state
+               (epi-ledger--recovery-require-phase-transition-final-raw
+                state target lock projection temporary-state
+                temporary-identity destination-lock)))
+            (_ (epi-ledger--recovery-manifest-invalid))))))
+    (if body-condition
+        (signal (car body-condition) (cdr body-condition))
+      successor)))
+
+(defun epi-ledger--recovery-publish-phase-marker
+    (preflight role &optional phase-cache)
+  "Publish ROLE's closed phase marker derived solely from PREFLIGHT.
+PHASE-CACHE is the enclosing publication's private canonical byte table."
+  (let* ((layout (epi-ledger--recovery-preflight-raw-layout preflight))
+         (phase-cache
+          (or phase-cache
+              (epi-ledger--recovery-make-phase-byte-cache preflight)))
+         (binding
+          (pcase role
+            ('destination-complete
+             (list
+              (epi-ledger--recovery-destination-complete-path layout)
+              'destination-objects-published))
+            ('source-objects-absent
+             (list
+              (epi-ledger--recovery-layout-raw-absent-source-objects-marker-path
+               layout)
+              'source-objects-staged))
+            ('quarantine-complete
+             (list
+              (epi-ledger--recovery-quarantine-complete-path layout)
+              'quarantine-published))
+            (_ (epi-ledger--recovery-manifest-invalid))))
+         (phase (nth 1 binding))
+         (bytes
+          (substring-no-properties
+           (epi-ledger--recovery-cached-phase-bytes
+            preflight phase-cache phase)))
+         (identity
+          (epi-ledger--recovery-publish-marker
+           preflight (nth 0 binding) bytes role)))
+    (list (nth 0 binding) bytes identity phase)))
+
+(defun epi-ledger--recovery-reserve-publication-directory (path device)
+  "Exclusively reserve private PATH on DEVICE through one lexical receipt."
+  (let ((epi-ledger--recovery-directory-receipt-receiver nil)
+        receipt returned)
+    (setq returned
+          (epi-ledger--recovery-create-private-directory
+           path device
+           (lambda (received-path identity)
+             (let ((owned
+                    (epi-ledger--recovery-copy-directory-identity
+                     identity)))
+               (unless
+                   (and (null receipt)
+                        (equal received-path path)
+                        (equal received-path (plist-get owned :path))
+                        (equal
+                         owned
+                         (epi-ledger--recovery-require-bound-directory-raw
+                          received-path owned device #o700)))
+                 (epi-ledger--fail
+                  'epi-ledger-conflict 'recovery-path-conflict))
+               (setq receipt owned)))))
+    (unless (and receipt returned (equal receipt returned))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (epi-ledger--recovery-copy-directory-identity receipt)))
+
+(defun epi-ledger--recovery-publish (transferred)
+  "Publish and quarantine exact `objects-transferred' state TRANSFERRED.
+This Wave 5 driver is deliberately linear.  Wave 6 owns manifest scanning and
+idempotent re-entry from an interrupted physical or journal phase."
+  (epi-ledger--with-operation-work-state
+    (let* ((closed
+            (epi-ledger--recovery-close-phase-input
+             transferred "objects-transferred")))
+      (let ((current-state (nth 0 closed))
+            (lock (nth 1 closed))
+            (epi-ledger--recovery-publication-evidence-handle
+             (and (nth 2 closed) (make-symbol "epi-recovery-evidence")))
+            (epi-ledger--recovery-publication-evidence-proof (nth 2 closed))
+            destination-lock publication-result
+            outer-body-condition outer-source-unlock-condition
+            outer-destination-unlock-condition)
+        (unwind-protect
+            (condition-case condition
+                (setq publication-result
+                      (progn
+                        (let ((returned-destination-lock
+                               (epi-ledger--recovery-acquire-destination-lock
+                                current-state
+                                (lambda (receipt)
+                                  (when destination-lock
+                                    (epi-ledger--fail
+                                     'epi-ledger-conflict
+                                     'lock-token-changed))
+                                  (setq destination-lock receipt)))))
+                          (unless
+                              (and destination-lock
+                                   (equal destination-lock
+                                          returned-destination-lock))
+                            (epi-ledger--fail
+                             'epi-ledger-conflict 'lock-token-changed)))
+                        (let* ((preflight
+            (epi-ledger--recovery-phase-state-raw-preflight current-state))
+           (phase-cache
+            (epi-ledger--recovery-make-phase-byte-cache preflight))
+           (layout
+            (epi-ledger--recovery-phase-state-raw-path-layout current-state))
+           (proof
+            (epi-ledger--recovery-preflight-raw-source-proof preflight))
+           (items (epi-ledger--recovery-transfer-items preflight))
+           (quarantine-device
+            (epi-ledger--recovery-layout-raw-quarantine-device layout))
+           (source (epi-ledger--recovery-layout-raw-source-path layout))
+           (source-objects
+            (epi-ledger--recovery-layout-raw-source-objects-path layout))
+           (destination
+            (epi-ledger--recovery-layout-raw-destination-path layout))
+           (destination-objects
+            (epi-ledger--recovery-layout-raw-destination-objects-path layout))
+           (staged-destination-ledger
+            (epi-ledger--recovery-layout-raw-staged-destination-ledger-path
+             layout))
+           (staged-destination-objects
+            (epi-ledger--recovery-layout-raw-staged-destination-objects-path
+             layout))
+           (source-stage
+            (epi-ledger--recovery-layout-raw-source-stage-path layout))
+           (staged-source-ledger
+            (epi-ledger--recovery-layout-raw-staged-source-ledger-path
+             layout))
+           (staged-source-objects
+            (epi-ledger--recovery-layout-raw-staged-source-objects-path
+             layout))
+           (absent-marker
+            (epi-ledger--recovery-layout-raw-absent-source-objects-marker-path
+             layout))
+           (quarantine
+            (epi-ledger--recovery-layout-raw-final-quarantine-path layout))
+           (final-source-ledger
+            (epi-ledger--recovery-final-source-ledger-path layout))
+           (final-source-objects
+            (epi-ledger--recovery-final-source-objects-path layout))
+           (final-absent-marker
+            (epi-ledger--recovery-final-absent-marker-path layout))
+           (source-object-state
+            (epi-ledger--recovery-preflight-raw-source-object-tree-state
+             preflight))
+           (source-parent-identity
+            (epi-ledger--recovery-preflight-raw-source-parent-identity
+             preflight))
+           (source-object-proof (nth 2 closed))
+           (destination-parent-identity
+            (epi-ledger--recovery-phase-state-raw-destination-parent-identity
+             current-state))
+           (staged-directory-receipts
+            (epi-ledger--recovery-phase-state-raw-staged-directory-receipts
+             current-state))
+           (staged-object-receipts
+            (epi-ledger--recovery-phase-state-raw-staged-object-receipts
+             current-state))
+           (staged-ledger-identity
+            (epi-ledger--recovery-phase-state-raw-staged-ledger-identity
+             current-state))
+           staged-object-proof destination-object-proof
+           destination-ledger-authority
+           destination-ledger-identity
+           source-stage-identity quarantine-identity
+           staged-source-ledger-identity final-source-ledger-identity
+           evidence-kind evidence-proof
+           destination-marker-identity destination-marker-bytes
+           absent-marker-identity absent-marker-bytes
+           quarantine-marker-identity quarantine-marker-bytes
+           final-inspection result current-projection
+           phase-transition-p final-phase-p
+           body-condition closure-condition unlock-condition
+           destination-unlock-condition)
+      (cl-labels
+          ((require-absent
+            (path code)
+            (epi-ledger--recovery-require-absent-name path code))
+           (refresh-directory
+            (path identity)
+            (epi-ledger--recovery-require-bound-directory-raw
+             path identity quarantine-device #o700))
+           (move-file
+            (from to expected source-parent-receipt target-parent-receipt
+                  content-verifier)
+            (let ((move-device
+                   (plist-get source-parent-receipt :device))
+                  receipt returned)
+              (setq returned
+                    (epi-ledger--recovery-link-move-file
+                     from to expected move-device
+                     source-parent-receipt target-parent-receipt
+                     content-verifier
+                     (lambda (path identity)
+                       (let ((owned
+                              (epi-ledger--recovery-copy-file-identity
+                               identity)))
+                         (unless
+                             (and (null receipt)
+                                  (equal path to)
+                                  (equal path (plist-get owned :path))
+                                  (epi-ledger--same-file-object-p
+                                   expected owned))
+                           (epi-ledger--fail
+                            'epi-ledger-conflict 'recovery-path-conflict))
+                         (setq receipt owned)))))
+              (unless (and receipt returned
+                           (epi-ledger--same-file-object-p
+                            receipt returned))
+                (epi-ledger--fail
+                 'epi-ledger-conflict 'recovery-path-conflict))
+              (setq receipt
+                    (epi-ledger--recovery-copy-file-identity returned))))
+           (advance
+            (phase projection)
+            (setq current-projection
+                  (epi-ledger--recovery-copy-publication-projection projection)
+                  phase-transition-p t)
+            (setq current-state
+                  (epi-ledger--recovery-advance-publication-phase
+                   current-state phase lock current-projection
+                   (lambda (successor)
+                     (setq current-state successor
+                           phase-transition-p nil))
+                   phase-cache destination-lock))
+            (setq phase-transition-p nil)))
+        (setq current-projection
+              (epi-ledger--recovery-copy-publication-projection
+               (epi-ledger--make-recovery-publication-projection
+                :phase 'objects-transferred
+                :source-object-proof
+                epi-ledger--recovery-publication-evidence-handle)))
+        (unwind-protect
+            (condition-case condition
+                (progn
+                  (epi-ledger--recovery-require-phase-authority-raw
+                   current-state lock current-projection phase-cache
+                   destination-lock)
+                  (unless (eq (not (null source-object-proof))
+                              (eq source-object-state 'present))
+                    (epi-ledger--fail
+                     'epi-ledger-conflict 'recovery-object-content-changed))
+
+                  ;; Publish the object directory before the discoverable
+                  ;; destination ledger.  The marker is its final child.
+                  (setq destination-parent-identity
+                        (epi-ledger--recovery-reprove-destination-parent-raw
+                         preflight layout))
+                  (require-absent
+                   destination-objects 'recovery-destination-exists)
+                  (setq staged-object-proof
+                        (epi-ledger--recovery-object-tree-proof-from-receipts
+                         staged-destination-objects items
+                         (plist-get destination-parent-identity :device)
+                         staged-directory-receipts staged-object-receipts)
+                        destination-object-proof
+                        (epi-ledger--recovery-transfer-object-tree-no-clobber
+                         staged-object-proof destination-objects
+                         destination-parent-identity))
+                    (let ((marker
+                           (epi-ledger--recovery-publish-phase-marker
+                            preflight 'destination-complete phase-cache)))
+                      (setq destination-marker-bytes (nth 1 marker)
+                            destination-marker-identity (nth 2 marker)))
+                    (setq destination-object-proof
+                          (epi-ledger--recovery-object-tree-proof-add-marker
+                           destination-object-proof
+                           (epi-ledger--recovery-destination-complete-path
+                            layout)
+                           destination-marker-identity
+                           destination-marker-bytes))
+                  (advance
+                   'destination-objects-published
+                   (epi-ledger--make-recovery-publication-projection
+                    :phase 'destination-objects-published
+                    :destination-object-proof destination-object-proof
+                    :source-object-proof
+                    epi-ledger--recovery-publication-evidence-handle))
+
+                  ;; Publish and cold-validate the ledger only after the
+                  ;; completed object tree is externally visible.
+                  (epi-ledger--recovery-close-destination-parent-raw
+                   layout destination-parent-identity)
+                  (epi-ledger--recovery-require-destination-lock-raw
+                   current-state destination-lock)
+                  (setq destination-ledger-identity
+                        (move-file
+                        staged-destination-ledger destination
+                         staged-ledger-identity destination-parent-identity
+                         destination-parent-identity
+                         (lambda (path identity)
+                           (epi-ledger--recovery-verify-linked-destination-ledger
+                            path identity preflight))))
+                  (let ((cold
+                         (epi-ledger--recovery-inspect-complete-destination
+                          preflight destination
+                          destination-ledger-identity)))
+                    (setq destination-ledger-identity (nth 1 cold)
+                          destination-ledger-authority (nth 2 cold)))
+                  (require-absent
+                   staged-destination-ledger 'recovery-path-conflict)
+                  (advance
+                   'destination-ledger-published
+                   (epi-ledger--make-recovery-publication-projection
+                    :phase 'destination-ledger-published
+                    :destination-object-proof destination-object-proof
+                    :destination-ledger-authority
+                    destination-ledger-authority
+                    :source-object-proof
+                    epi-ledger--recovery-publication-evidence-handle))
+
+                  ;; Reserve both quarantine containers before removing the
+                  ;; only discoverable source-ledger name.
+                  (require-absent source-stage 'recovery-path-conflict)
+                  (require-absent quarantine 'recovery-path-conflict)
+                  (setq source-stage-identity
+                        (epi-ledger--recovery-reserve-publication-directory
+                         source-stage quarantine-device)
+                        quarantine-identity
+                        (epi-ledger--recovery-reserve-publication-directory
+                         quarantine quarantine-device))
+                  (epi-ledger--recovery-require-empty-directory-raw
+                   source-stage source-stage-identity quarantine-device)
+                  (epi-ledger--recovery-require-empty-directory-raw
+                   quarantine quarantine-identity quarantine-device)
+                  (setq staged-source-ledger-identity
+                        (move-file
+                         source staged-source-ledger
+                         (epi-ledger--recovery-source-proof-file-identity
+                          proof)
+                         source-parent-identity source-stage-identity
+                         (lambda (path identity)
+                           (epi-ledger--recovery-verify-linked-source-ledger
+                            path identity proof))))
+                  (let ((moved
+                         (epi-ledger--recovery-require-moved-source
+                          staged-source-ledger proof)))
+                    (unless
+                        (epi-ledger--same-file-object-p
+                         staged-source-ledger-identity (nth 1 moved))
+                      (epi-ledger--fail
+                       'epi-ledger-conflict 'recovery-preflight-changed))
+                    (setq staged-source-ledger-identity (nth 1 moved)))
+                  (setq source-stage-identity
+                        (refresh-directory
+                         source-stage source-stage-identity))
+                  (advance
+                   'source-ledger-staged
+                   (epi-ledger--make-recovery-publication-projection
+                    :phase 'source-ledger-staged
+                    :destination-object-proof destination-object-proof
+                    :destination-ledger-authority
+                    destination-ledger-authority
+                    :source-object-proof
+                    epi-ledger--recovery-publication-evidence-handle
+                    :source-stage-identity source-stage-identity
+                    :staged-source-ledger-identity
+                    staged-source-ledger-identity
+                    :quarantine-identity quarantine-identity))
+
+                  ;; Preserve the whole source object directory, including
+                  ;; unreachable evidence, or publish positive absence.
+                  (pcase source-object-state
+                    ('present
+                     (epi-ledger--recovery-require-source-object-proof-raw
+                      source-object-proof quarantine-device)
+                     (let* ((old-proof source-object-proof)
+                            (new-proof
+                             (epi-ledger--recovery-transfer-evidence-tree-no-clobber
+                              old-proof staged-source-objects
+                              source-stage-identity)))
+                       (epi-ledger--recovery-publication-evidence-replace
+                        epi-ledger--recovery-publication-evidence-handle
+                        old-proof new-proof)
+                       (setq source-object-proof new-proof
+                             evidence-kind 'present
+                             evidence-proof new-proof)))
+                    ('absent
+                     (require-absent
+                      source-objects 'recovery-path-conflict)
+                     (require-absent
+                      staged-source-objects 'recovery-path-conflict)
+                     (let ((marker
+                            (epi-ledger--recovery-publish-phase-marker
+                             preflight 'source-objects-absent phase-cache)))
+                       (setq absent-marker-bytes (nth 1 marker)
+                             absent-marker-identity (nth 2 marker)
+                             evidence-kind 'absent
+                             evidence-proof
+                             (list absent-marker-identity
+                                   absent-marker-bytes))))
+                    (_ (epi-ledger--recovery-manifest-invalid)))
+                  (setq source-stage-identity
+                        (refresh-directory
+                         source-stage source-stage-identity))
+                  (advance
+                   'source-objects-staged
+                   (epi-ledger--make-recovery-publication-projection
+                    :phase 'source-objects-staged
+                    :destination-object-proof destination-object-proof
+                    :destination-ledger-authority
+                    destination-ledger-authority
+                    :source-stage-identity source-stage-identity
+                    :staged-source-ledger-identity
+                    staged-source-ledger-identity
+                    :quarantine-identity quarantine-identity
+                    :evidence-kind evidence-kind
+                    :evidence-proof
+                    (if (eq evidence-kind 'present)
+                        epi-ledger--recovery-publication-evidence-handle
+                      evidence-proof)))
+
+                  ;; Move evidence before the ledger, then add the completion
+                  ;; marker as the last quarantine child.
+                  (if (eq evidence-kind 'present)
+                      (let* ((old-proof source-object-proof)
+                             (new-proof
+                              (epi-ledger--recovery-transfer-evidence-tree-no-clobber
+                               old-proof final-source-objects
+                               quarantine-identity)))
+                        (epi-ledger--recovery-publication-evidence-replace
+                         epi-ledger--recovery-publication-evidence-handle
+                         old-proof new-proof)
+                        (setq source-object-proof new-proof
+                              evidence-proof new-proof))
+                    (setq absent-marker-identity
+                          (move-file
+                           absent-marker final-absent-marker
+                           absent-marker-identity source-stage-identity
+                           quarantine-identity
+                           (lambda (path identity)
+                             (epi-ledger--recovery-require-exact-file-bytes
+                              path identity absent-marker-bytes
+                              'recovery-path-conflict 2)))
+                          evidence-proof
+                          (list absent-marker-identity absent-marker-bytes)))
+                  (setq final-source-ledger-identity
+                        (move-file
+                         staged-source-ledger final-source-ledger
+                         staged-source-ledger-identity source-stage-identity
+                         quarantine-identity
+                         (lambda (path identity)
+                           (epi-ledger--recovery-verify-linked-source-ledger
+                            path identity proof)))
+                        source-stage-identity
+                        (refresh-directory
+                         source-stage source-stage-identity)
+                        quarantine-identity
+                        (refresh-directory quarantine quarantine-identity))
+                  (let ((moved
+                         (epi-ledger--recovery-require-moved-source
+                          final-source-ledger proof)))
+                    (unless
+                        (epi-ledger--same-file-object-p
+                         final-source-ledger-identity (nth 1 moved))
+                      (epi-ledger--fail
+                       'epi-ledger-conflict 'recovery-preflight-changed))
+                    (setq final-source-ledger-identity (nth 1 moved)))
+                  (epi-ledger--recovery-require-empty-directory-raw
+                   source-stage source-stage-identity quarantine-device)
+                  (epi-ledger--recovery-require-quarantine-raw
+                   preflight quarantine-identity final-source-ledger
+                   final-source-ledger-identity evidence-kind evidence-proof
+                   nil nil)
+                  (let ((marker
+                         (epi-ledger--recovery-publish-phase-marker
+                          preflight 'quarantine-complete phase-cache)))
+                    (setq quarantine-marker-bytes (nth 1 marker)
+                          quarantine-marker-identity (nth 2 marker)))
+                  (setq quarantine-identity
+                        (refresh-directory quarantine quarantine-identity))
+                  (epi-ledger--recovery-require-quarantine-raw
+                   preflight quarantine-identity final-source-ledger
+                   final-source-ledger-identity evidence-kind evidence-proof
+                   quarantine-marker-identity quarantine-marker-bytes)
+                  (advance
+                   'quarantine-published
+                   (epi-ledger--make-recovery-publication-projection
+                    :phase 'quarantine-published
+                    :destination-object-proof destination-object-proof
+                    :destination-ledger-authority
+                    destination-ledger-authority
+                    :source-stage-identity source-stage-identity
+                    :quarantine-identity quarantine-identity
+                    :evidence-kind evidence-kind
+                    :evidence-proof
+                    (if (eq evidence-kind 'present)
+                        epi-ledger--recovery-publication-evidence-handle
+                      evidence-proof)
+                    :final-source-ledger-identity
+                    final-source-ledger-identity
+                    :quarantine-marker-identity quarantine-marker-identity
+                    :quarantine-marker-bytes quarantine-marker-bytes))
+                  (setq final-phase-p t))
+              ((error quit)
+               (setq body-condition condition)))
+          ;; Every exit first closes the classified generation while the lock
+          ;; is live, then releases exactly that token, and finally repeats the
+          ;; closure without trusting anything the unlock callback returned.
+          (unwind-protect
+              (condition-case condition
+                  (if phase-transition-p
+                      (unwind-protect
+                          (progn
+                            (epi-ledger--recovery-require-publication-projection-cooperative
+                             current-state lock current-projection t phase-cache)
+                            (when lock
+                              (epi-ledger--recovery-require-phase-lock-raw
+                               preflight lock))
+                            (epi-ledger--recovery-require-destination-lock-raw
+                             current-state destination-lock))
+                        (epi-ledger--recovery-require-phase-transition-cleanup-final-raw
+                         current-state lock current-projection
+                         destination-lock))
+                    (epi-ledger--recovery-require-phase-authority-raw
+                     current-state lock current-projection phase-cache
+                     destination-lock))
+                ((error quit)
+                 (setq closure-condition condition)))
+            (unwind-protect
+                (unwind-protect
+                    (when lock
+                      (condition-case condition
+                          (epi-ledger--recovery-release-phase-lock-raw lock)
+                        ((error quit)
+                         (setq unlock-condition condition))))
+                  (setq lock nil)
+                  (condition-case condition
+                      (progn
+                        (if phase-transition-p
+                            (unwind-protect
+                                (progn
+                                  (epi-ledger--recovery-require-publication-projection-cooperative
+                                   current-state nil current-projection t
+                                   phase-cache)
+                                  (epi-ledger--recovery-require-destination-lock-raw
+                                   current-state destination-lock))
+                              (epi-ledger--recovery-require-phase-transition-cleanup-final-raw
+                               current-state nil current-projection
+                               destination-lock))
+                          (epi-ledger--recovery-require-phase-authority-raw
+                           current-state nil current-projection phase-cache
+                           destination-lock))
+                        (when final-phase-p
+                          (let ((cold
+                                 (epi-ledger--recovery-inspect-complete-destination
+                                  preflight destination
+                                  destination-ledger-identity)))
+                            (setq final-inspection (nth 0 cold)
+                                  destination-ledger-identity (nth 1 cold)
+                                  destination-ledger-authority (nth 2 cold)))
+                          (setq result
+                                (epi-ledger--ledger-from-inspection
+                                 final-inspection))
+                          (epi-ledger--recovery-require-phase-authority-raw
+                           current-state nil current-projection phase-cache
+                           destination-lock)))
+                    ((error quit)
+                     (unless closure-condition
+                       (setq closure-condition condition)))))
+              ;; Keep destination exclusion through source release, result
+              ;; construction, and the last artifact closure.  No artifact
+              ;; proof may follow this unlock because a normal appender may
+              ;; then acquire the destination lock and extend the ledger.
+              (unwind-protect
+                  (when destination-lock
+                    (condition-case condition
+                        (epi-ledger--recovery-release-destination-lock-raw
+                         destination-lock)
+                      ((error quit)
+                       (setq destination-unlock-condition condition))))
+                (setq destination-lock nil))
+              ;; A final-closure failure must override an arbitrary nonlocal
+              ;; exit whose continuation would skip the normal condition
+              ;; precedence below.  Ordinary unlock failures follow the same
+              ;; nonlocal-exit rule as the source lock and are selected below
+              ;; for normal and caught error/quit exits.
+              (when closure-condition
+                (signal
+                 (car closure-condition) (cdr closure-condition))))))
+        (cond
+         (closure-condition
+          (signal (car closure-condition) (cdr closure-condition)))
+         (body-condition
+          (signal (car body-condition) (cdr body-condition)))
+         (destination-unlock-condition
+          (signal (car destination-unlock-condition)
+                  (cdr destination-unlock-condition)))
+         (unlock-condition
+          (signal (car unlock-condition) (cdr unlock-condition)))
+         ((not final-phase-p)
+         (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-manifest-invalid))
+         (t result))
+        result))))
+              ((error quit)
+               (setq outer-body-condition condition)))
+          ;; Failures before the classified cleanup exists still release both
+          ;; tokens.  Source goes first; destination exclusion remains the
+          ;; final guard.  Caught cleanup conditions are selected only after
+          ;; both attempts, so an earlier body condition retains precedence.
+          (unwind-protect
+              (when lock
+                (condition-case condition
+                    (epi-ledger--recovery-release-phase-lock-raw lock)
+                  ((error quit)
+                   (setq outer-source-unlock-condition condition))))
+            (when destination-lock
+              (condition-case condition
+                  (epi-ledger--recovery-release-destination-lock-raw
+                   destination-lock)
+                ((error quit)
+                 (setq outer-destination-unlock-condition condition))))))
+        (cond
+         (outer-body-condition
+          (signal (car outer-body-condition) (cdr outer-body-condition)))
+         (outer-destination-unlock-condition
+          (signal (car outer-destination-unlock-condition)
+                  (cdr outer-destination-unlock-condition)))
+         (outer-source-unlock-condition
+          (signal (car outer-source-unlock-condition)
+                  (cdr outer-source-unlock-condition))))
+        publication-result))))
+
 (defun epi-ledger--create-validate-draft-shape (drafts session-id)
   "Require owned DRAFTS to lead with session-info for SESSION-ID."
   (when (= 0 (length drafts))
