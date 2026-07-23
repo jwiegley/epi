@@ -24291,6 +24291,72 @@ TOPOLOGY defaults to `objects'.  The empty variants are `empty-root',
             :items items :proof proof :source-shape shape
             :source-directories directories :source-files files))))
 
+(defun epi-test-wave6--reachable-references (items)
+  "Return ITEMS as fresh closed recovery-manifest object references."
+  (vconcat
+   (mapcar
+    (lambda (item)
+      `(("hash" . ,(plist-get item :hash))
+        ("size" . ,(plist-get item :size))
+        ("media_type" . "application/octet-stream")
+        ("role" . "recovery-fragment")))
+    items)))
+
+(ert-deftest
+    epi-ledger-recovery-converge-evidence-tree-converges-source-only ()
+  "Converge a complete source-only evidence tree into a fresh target proof."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--tree-transfer-fixture root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (device (plist-get case :device))
+           (required-references
+            (epi-test-wave6--reachable-references
+             (plist-get case :items)))
+           (source-files (plist-get case :source-files))
+           (source-snapshots
+            (mapcar
+             (lambda (entry)
+               (list (car entry) (cdr entry)
+                     (epi-test-ledger-io--literal-file-bytes (car entry))))
+             source-files))
+           (source-parent-identity
+            (epi-test-wave6--file-parent-identity source))
+           (target-parent-identity
+            (epi-test-wave6--file-parent-identity target))
+           (result
+            (epi-ledger--recovery-converge-evidence-tree
+             source target device
+             source-parent-identity target-parent-identity
+             required-references)))
+      (should (epi-ledger--recovery-evidence-proof-p result))
+      (should
+       (equal target
+              (epi-ledger--recovery-evidence-proof-raw-root result)))
+      (should
+       (equal device
+              (epi-ledger--recovery-evidence-proof-raw-device result)))
+      (should (= 2 (epi-ledger--recovery-evidence-proof-raw-count result)))
+      (should
+       (epi-ledger--recovery-require-source-object-proof-raw result device))
+      (should-not (file-exists-p source))
+      (dolist (snapshot source-snapshots)
+        (let* ((hash (file-name-nondirectory (nth 0 snapshot)))
+               (target-path
+                (epi-ledger--recovery-object-path-under-root target hash))
+               (target-identity
+                (epi-ledger--stat-local-file target-path)))
+          (should (consp target-identity))
+          (should
+           (epi-ledger--same-file-object-p
+            (nth 1 snapshot) target-identity))
+          (should (= 1 (plist-get target-identity :links)))
+          (should (= #o600 (epi-ledger--recovery-raw-mode target-path)))
+          (should
+           (equal
+            (nth 2 snapshot)
+            (epi-test-ledger-io--literal-file-bytes target-path))))))))
+
 (ert-deftest
     epi-ledger-recovery-tree-transfer-requires-exact-linked-object-verifier-return
     ()

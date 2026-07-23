@@ -651,3 +651,58 @@ Task 6 progress facts:
   evidence-tree ERT, demonstrate the intended missing-function red result, and
   then implement the smallest Wave 6a.2 production surface. Run `fess` after
   every completed resumed subtask.
+
+## Halt checkpoint refresh — 2026-07-23 16:47 PDT
+
+- Work resumed from clean pushed checkpoint
+  `890ce2b7c42d5d7d26b2218795f136959064de47`. The user invoked
+  `command-halt` while the first Wave 6a.2 production draft was being written;
+  no further behavioral work was performed after that request.
+- The first TDD gate is now durable. One test helper and one ERT were added,
+  selecting exactly
+  `epi-ledger-recovery-converge-evidence-tree-converges-source-only`. Its first
+  and only observed failure was the required
+  `(void-function epi-ledger--recovery-converge-evidence-tree)` result. The
+  fixture, selector, setup, and provisional six-argument call shape all loaded
+  correctly.
+- `epi-ledger.el` contains an in-flight private
+  `epi-ledger--recovery-converge-evidence-tree` draft. It uses a local two-root
+  census, the Wave 6a.1 leaf converger, exclusive target-directory receipts, a
+  fresh settled-target census, and exact-empty bottom-up pruning. This draft is
+  **not green, not compiled, not reviewed, and not complete**. Do not treat its
+  presence as a completed Wave 6a.2 implementation. Halt hygiene established
+  only that both edited Lisp files have balanced delimiters and that
+  `git diff --check` passes; an extra closing delimiter found by that audit was
+  corrected without running the feature test.
+- A read-only closure review corrected the earlier guidance: the settled
+  evidence-proof raw closer is metadata closure, not a content read. The draft
+  therefore performs a fresh complete target content census before building
+  and raw-closing the returned proof. It also brackets absent roots with stable
+  parent authority and calls Wave 6a.1 for target-only leaves when their source
+  prefix still exists; a truly missing source prefix remains a mutation-free
+  tree-level target-only case.
+- Fresh preflight passed 26/26. GPTel passed 79/79, package passed 30/30,
+  warning-as-error compilation and Checkdoc passed before the Wave 6a.2 edits.
+  The long ledger-I/O baseline was explicitly interrupted at 362/504 passing
+  tests with no reported failure after the halt request. The earlier codec/JCS
+  session's terminal result was not retained and must not be credited. These
+  long-suite prefixes are diagnostic only; rerun both complete suites from zero
+  after the focused Wave 6a.2 test first reaches green.
+- The remaining test process exited with interrupt status 130, and a process
+  audit found no Epi batch test left running. Anvil again failed its readiness
+  probe before dispatch. The fallback found no default live Emacs server and no
+  worktree lockfile; no editor buffer was modified through this run.
+- Read-only resume artifacts remain at
+  `/var/tmp/wg-epi-wave6a2-resume3/impl-map/report.md`,
+  `/var/tmp/wg-epi-wave6a2-resume3/closure-review/report.md`,
+  `/var/tmp/wg-epi-wave6a2-resume3/test-draft/report.md`, and
+  `/var/tmp/wg-epi-wave6a2-resume3/followup-tests/report.md`. They made no
+  shared-worktree edits. The frozen handoff and Task 6 execution brief remain
+  authoritative where any advisory report differs.
+- Resume in this linked worktree, never on `main`. The first action is to run
+  only the source-only selector against the parseable WIP, record its actual
+  post-definition RED, and make the minimum production correction to green it.
+  Do not add the mixed-union ERT until that source-only selector is green. Then
+  continue the committed order: mixed union, inert refusal table, empty topology
+  and pruning, target-only repeat, followed by the remaining Wave 6a.2
+  hardening. Run `fess` only after a genuinely completed subtask.

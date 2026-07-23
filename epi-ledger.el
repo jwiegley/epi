@@ -19400,6 +19400,724 @@ name is removed.  Return fresh chunked authority rooted at TARGET-ROOT."
      source-parent source-parent-identity device)
     target-proof))
 
+(defun epi-ledger--recovery-converge-evidence-tree
+    (source-root target-root device source-parent-identity
+                 target-parent-identity required-references)
+  "Converge one interrupted evidence-tree move into TARGET-ROOT.
+SOURCE-ROOT and TARGET-ROOT are disjoint canonical directory names whose
+containing directories are bound by SOURCE-PARENT-IDENTITY and
+TARGET-PARENT-IDENTITY on DEVICE.  REQUIRED-REFERENCES is the historical
+manifest's `reachable_objects' vector; the complete valid physical union,
+including unreachable leaves and empty topology, remains authoritative.
+Return a fresh settled evidence proof rooted at TARGET-ROOT."
+  (let* ((owned-source
+          (and (stringp source-root)
+               (directory-file-name
+                (substring-no-properties source-root))))
+         (owned-target
+          (and (stringp target-root)
+               (directory-file-name
+                (substring-no-properties target-root))))
+         (owned-device
+          (and (epi-ledger--device-token-p device)
+               (epi-ledger--copy-device-token device)))
+         (owned-source-parent
+          (condition-case nil
+              (epi-ledger--recovery-copy-directory-identity
+               source-parent-identity)
+            (error nil)))
+         (owned-target-parent
+          (condition-case nil
+              (epi-ledger--recovery-copy-directory-identity
+               target-parent-identity)
+            (error nil)))
+         (source-parent
+          (and owned-source
+               (directory-file-name
+                (file-name-directory owned-source))))
+         (target-parent
+          (and owned-target
+               (directory-file-name
+                (file-name-directory owned-target))))
+         references source-census target-census union-rows union-hashes
+         union-relatives final-shape source-directory-table
+         target-directory-table target-proof)
+    (unless
+        (and owned-source owned-target owned-device
+             owned-source-parent owned-target-parent
+             (not (equal owned-source owned-target))
+             (equal source-parent
+                    (plist-get owned-source-parent :path))
+             (equal target-parent
+                    (plist-get owned-target-parent :path))
+             (equal owned-device
+                    (plist-get owned-source-parent :device))
+             (equal owned-device
+                    (plist-get owned-target-parent :device))
+             (equal
+              owned-source
+              (condition-case nil
+                  (epi-ledger--resolve-local-directory-path owned-source)
+                (error nil)))
+             (equal
+              owned-target
+              (condition-case nil
+                  (epi-ledger--resolve-local-directory-path owned-target)
+                (error nil))))
+      (epi-ledger--fail
+       'epi-ledger-conflict 'recovery-path-conflict))
+    (epi-ledger--recovery-require-separated-top-level-paths
+     (list owned-source owned-target)
+     (epi-ledger--recovery-path-set-case-insensitive-p
+      (list owned-source owned-target)))
+    ;; Reference ownership may yield, so finish it before capturing any
+    ;; filesystem epoch.
+    (setq references
+          (epi-ledger--recovery-manifest-reachable required-references)
+          owned-source-parent
+          (epi-ledger--recovery-require-bound-directory-raw
+           source-parent owned-source-parent owned-device)
+          owned-target-parent
+          (epi-ledger--recovery-require-bound-directory-raw
+           target-parent owned-target-parent owned-device))
+    (cl-labels
+        ((content-fail
+          ()
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-object-content-changed))
+         (path-fail
+          ()
+          (epi-ledger--fail
+           'epi-ledger-conflict 'recovery-path-conflict))
+         (directory-names
+          (path)
+          (condition-case condition
+              (let ((file-name-handler-alist nil)
+                    names)
+                (dolist
+                    (name
+                     (directory-files
+                      path nil directory-files-no-dot-files-regexp t))
+                  (unless
+                      (and (stringp name)
+                           (not (member name '("." "..")))
+                           (not (string-match-p "[\0/\r\n]" name)))
+                    (content-fail))
+                  (push (substring-no-properties name) names))
+                (sort names #'string<))
+            (epi-limit-exceeded
+             (signal (car condition) (cdr condition)))
+            (quit
+             (signal (car condition) (cdr condition)))
+            (error (content-fail))))
+         (capture-directory
+          (path)
+          (let* ((observed
+                  (epi-ledger--recovery-raw-directory-stat path))
+                 (before
+                  (and observed
+                       (epi-ledger--recovery-require-bound-directory-raw
+                        path observed owned-device #o700)))
+                 (names (and before (directory-names path)))
+                 (after
+                  (and before
+                       (epi-ledger--recovery-require-bound-directory-raw
+                        path before owned-device #o700))))
+            (unless (and before after (equal before after))
+              (content-fail))
+            (list
+             (substring-no-properties path)
+             (epi-ledger--recovery-copy-directory-identity before)
+             names)))
+         (capture-leaf
+          (path hash)
+          (let* ((identity (epi-ledger--raw-object-name-state path))
+                 (size (and (listp identity)
+                            (plist-get identity :size)))
+                 (links (and (listp identity)
+                             (plist-get identity :links))))
+            (unless
+                (and (listp identity)
+                     (epi-ledger--recovery-bounded-unsigned-p size)
+                     (<= size epi-object-byte-limit))
+              (content-fail))
+            (unless
+                (and (equal owned-device
+                            (plist-get identity :device))
+                     (memq links '(1 2))
+                     (= #o600 (epi-ledger--recovery-raw-mode path)))
+              (path-fail))
+            (unless
+                (equal
+                 identity
+                 (epi-ledger--recovery-require-private-file-state-raw
+                  path identity size 'recovery-object-content-changed
+                  t links))
+              (content-fail))
+            (epi-ledger--make-recovery-evidence-leaf
+             :hash (substring-no-properties hash)
+             :size size
+             :identity
+             (epi-ledger--recovery-copy-file-identity identity))))
+         (capture-root
+          (root parent parent-identity)
+          (let* ((parent-before
+                  (epi-ledger--recovery-require-bound-directory-raw
+                   parent parent-identity owned-device))
+                 (kind (epi-ledger--recovery-name-kind root))
+                 directories leaves result)
+            (pcase kind
+              ('nil (setq result nil))
+              ('directory
+               (let* ((root-record (capture-directory root))
+                      (root-names (nth 2 root-record)))
+                 (push root-record directories)
+                 (unless (or (null root-names)
+                             (equal root-names '("sha256")))
+                   (content-fail))
+                 (when root-names
+                   (let* ((sha
+                           (expand-file-name
+                            "sha256" (file-name-as-directory root)))
+                          (sha-record (capture-directory sha))
+                          (prefixes (nth 2 sha-record)))
+                     (push sha-record directories)
+                     (dolist (prefix prefixes)
+                       (unless
+                           (let ((case-fold-search nil))
+                             (string-match-p
+                              "\\`[0-9a-f]\\{2\\}\\'" prefix))
+                         (content-fail))
+                       (let* ((prefix-path
+                               (expand-file-name
+                                prefix (file-name-as-directory sha)))
+                              (prefix-record
+                               (capture-directory prefix-path)))
+                         (push prefix-record directories)
+                         (dolist (hash (nth 2 prefix-record))
+                           (unless
+                               (and (epi-ledger--hash-p hash)
+                                    (string-prefix-p prefix hash))
+                             (content-fail))
+                           (push
+                            (capture-leaf
+                             (expand-file-name
+                              hash (file-name-as-directory prefix-path))
+                             hash)
+                            leaves)))))))
+                 (setq result
+                       (list (nreverse directories)
+                             (nreverse leaves)))))
+              (_ (path-fail)))
+            (let ((parent-after
+                   (epi-ledger--recovery-require-bound-directory-raw
+                    parent parent-before owned-device)))
+              (unless (equal parent-before parent-after)
+                (path-fail)))
+            result))
+         (census-directories
+          (census) (and census (nth 0 census)))
+         (census-leaves
+          (census) (and census (nth 1 census)))
+         (relative-directory
+          (path root)
+          (if (equal path root)
+              ""
+            (let ((prefix (file-name-as-directory root)))
+              (unless (string-prefix-p prefix path)
+                (content-fail))
+              (substring-no-properties
+               (substring path (length prefix))))))
+         (directory-relatives
+          (census root)
+          (mapcar
+           (lambda (record)
+             (relative-directory (nth 0 record) root))
+           (census-directories census)))
+         (directory-table
+          (census)
+          (let ((table (make-hash-table :test #'equal)))
+            (dolist (record (census-directories census))
+              (puthash (nth 0 record) (nth 1 record) table))
+            table))
+         (leaf-table
+          (census)
+          (let ((table (make-hash-table :test #'equal)))
+            (dolist (leaf (census-leaves census))
+              (let ((hash
+                     (epi-ledger--recovery-evidence-leaf-raw-hash leaf)))
+                (when (gethash hash table)
+                  (content-fail))
+                (puthash hash leaf table)))
+            table))
+         (directory-shape
+          (root relatives hashes)
+          (let* ((sha-present (member "sha256" relatives))
+                 (prefix-relatives
+                  (seq-filter
+                   (lambda (relative)
+                     (string-match-p
+                      "\\`sha256/[0-9a-f]\\{2\\}\\'" relative))
+                   relatives))
+                 (prefixes
+                  (mapcar #'file-name-nondirectory prefix-relatives)))
+            (mapcar
+             (lambda (relative)
+               (cons
+                (if (string-empty-p relative)
+                    (substring-no-properties root)
+                  (expand-file-name
+                   relative (file-name-as-directory root)))
+                (cond
+                 ((string-empty-p relative)
+                  (and sha-present '("sha256")))
+                 ((equal relative "sha256") prefixes)
+                 (t
+                  (let ((prefix (file-name-nondirectory relative)))
+                    (seq-filter
+                     (lambda (hash)
+                       (string-prefix-p prefix hash))
+                     hashes))))))
+             relatives)))
+         (rawly
+          (function)
+          (let ((inhibit-quit t)
+                (file-name-handler-alist nil)
+                (post-gc-hook nil)
+                (epi--yield-function #'ignore)
+                (epi--deadline-clock-function #'float-time)
+                (epi-ledger--stat-function #'epi-ledger--stat-local-file)
+                (epi-ledger--directory-stat-function
+                 #'epi-ledger--stat-local-directory)
+                (epi-ledger--read-function #'epi-ledger--read-bytes)
+                (epi-ledger--nonpreemptible-observer nil))
+            (funcall function)))
+         (close-absence
+          (root parent parent-identity)
+          (let ((before
+                 (epi-ledger--recovery-require-bound-directory-raw
+                  parent parent-identity owned-device)))
+            (epi-ledger--recovery-require-directory-state-raw root nil)
+            (let ((after
+                   (epi-ledger--recovery-require-bound-directory-raw
+                    parent before owned-device)))
+              (unless (equal before after)
+                (path-fail)))
+            t))
+         (close-census
+          (root census parent parent-identity)
+          (if (null census)
+              (close-absence root parent parent-identity)
+            (let ((parent-before
+                   (epi-ledger--recovery-require-bound-directory-raw
+                    parent parent-identity owned-device)))
+              (dolist (record (census-directories census))
+                (epi-ledger--recovery-require-directory-entries-raw
+                 (nth 0 record) (nth 2 record)
+                 'recovery-object-content-changed)
+                (unless
+                    (equal
+                     (nth 1 record)
+                     (epi-ledger--recovery-require-bound-directory-raw
+                      (nth 0 record) (nth 1 record)
+                      owned-device #o700))
+                  (content-fail)))
+              (dolist (leaf (census-leaves census))
+                (let* ((identity
+                        (epi-ledger--recovery-evidence-leaf-raw-identity
+                         leaf))
+                       (path (plist-get identity :path))
+                       (size
+                        (epi-ledger--recovery-evidence-leaf-raw-size leaf))
+                       (links (plist-get identity :links)))
+                  (unless
+                      (equal
+                       identity
+                       (epi-ledger--recovery-require-private-file-state-raw
+                        path identity size
+                        'recovery-object-content-changed t links))
+                    (content-fail))))
+              (let ((parent-after
+                     (epi-ledger--recovery-require-bound-directory-raw
+                      parent parent-before owned-device)))
+                (unless (equal parent-before parent-after)
+                  (path-fail)))
+              t)))
+         (verify-content
+          (path expected size hash links)
+          (condition-case condition
+              (let* ((post-gc-hook nil)
+                     (epi-ledger--stat-function
+                      #'epi-ledger--stat-local-file)
+                     (epi-ledger--read-function #'epi-ledger--read-bytes)
+                     (verified
+                      (epi-ledger--object-read-verified-state
+                       path size hash 'proof))
+                     (identity
+                      (epi-ledger--recovery-copy-file-identity
+                       (plist-get verified :identity))))
+                (unless (equal expected identity)
+                  (content-fail))
+                (epi-ledger--recovery-require-private-file-state-raw
+                 path identity size 'recovery-object-content-changed
+                 t links))
+            (epi-limit-exceeded
+             (signal (car condition) (cdr condition)))
+            (quit
+             (signal (car condition) (cdr condition)))
+            (error (content-fail))))
+         (close-directory-shape
+          (shape table parent parent-identity)
+          (let ((parent-before
+                 (epi-ledger--recovery-require-bound-directory-raw
+                  parent parent-identity owned-device)))
+            (dolist (entry shape)
+              (let* ((path (car entry))
+                     (expected (gethash path table))
+                     (before
+                      (and expected
+                           (epi-ledger--recovery-require-bound-directory-raw
+                            path expected owned-device #o700))))
+                (unless before (content-fail))
+                (epi-ledger--recovery-require-directory-entries-raw
+                 path (cdr entry) 'recovery-object-content-changed)
+                (let ((after
+                       (epi-ledger--recovery-require-bound-directory-raw
+                        path before owned-device #o700)))
+                  (unless (equal before after)
+                    (content-fail))
+                  (puthash path after table))))
+            (let ((parent-after
+                   (epi-ledger--recovery-require-bound-directory-raw
+                    parent parent-before owned-device)))
+              (unless (equal parent-before parent-after)
+                (path-fail)))
+            t))
+         (proof-from-census
+          (census)
+          (let* ((directories
+                  (mapcar
+                   (lambda (record)
+                     (cons
+                      (substring-no-properties (nth 0 record))
+                      (epi-ledger--recovery-copy-directory-identity
+                       (nth 1 record))))
+                   (census-directories census)))
+                 (leaves
+                  (mapcar
+                   (lambda (leaf)
+                     (epi-ledger--make-recovery-evidence-leaf
+                      :hash
+                      (substring-no-properties
+                       (epi-ledger--recovery-evidence-leaf-raw-hash leaf))
+                      :size
+                      (epi-ledger--recovery-evidence-leaf-raw-size leaf)
+                      :identity
+                      (epi-ledger--recovery-copy-file-identity
+                       (epi-ledger--recovery-evidence-leaf-raw-identity
+                        leaf))))
+                   (census-leaves census))))
+            (epi-ledger--make-recovery-evidence-proof
+             :root (substring-no-properties owned-target)
+             :device (epi-ledger--copy-device-token owned-device)
+             :directories directories
+             :chunks
+             (epi-ledger--recovery-evidence-chunk-leaves leaves)
+             :count (length leaves)))))
+      (let ((post-gc-hook nil))
+        (setq source-census
+              (capture-root
+               owned-source source-parent owned-source-parent)
+              target-census
+              (capture-root
+               owned-target target-parent owned-target-parent)))
+      (when (and (null source-census) (null target-census))
+        (path-fail))
+      (let* ((source-leaves (leaf-table source-census))
+             (target-leaves (leaf-table target-census))
+             hashes row-table)
+        (dolist (leaf (census-leaves source-census))
+          (push
+           (epi-ledger--recovery-evidence-leaf-raw-hash leaf)
+           hashes))
+        (dolist (leaf (census-leaves target-census))
+          (push
+           (epi-ledger--recovery-evidence-leaf-raw-hash leaf)
+           hashes))
+        (setq union-hashes
+              (sort (delete-dups hashes) #'string<)
+              row-table (make-hash-table :test #'equal))
+        (dolist (hash union-hashes)
+          (let* ((source-leaf (gethash hash source-leaves))
+                 (target-leaf (gethash hash target-leaves))
+                 (source-identity
+                  (and source-leaf
+                       (epi-ledger--recovery-evidence-leaf-raw-identity
+                        source-leaf)))
+                 (target-identity
+                  (and target-leaf
+                       (epi-ledger--recovery-evidence-leaf-raw-identity
+                        target-leaf)))
+                 (source-size
+                  (and source-leaf
+                       (epi-ledger--recovery-evidence-leaf-raw-size
+                        source-leaf)))
+                 (target-size
+                  (and target-leaf
+                       (epi-ledger--recovery-evidence-leaf-raw-size
+                        target-leaf)))
+                 (size (or source-size target-size))
+                 (row (list hash source-leaf target-leaf size)))
+            (cond
+             ((and source-leaf (null target-leaf))
+              (unless (= 1 (plist-get source-identity :links))
+                (path-fail)))
+             ((and (null source-leaf) target-leaf)
+              (unless (= 1 (plist-get target-identity :links))
+                (path-fail)))
+             ((and source-leaf target-leaf)
+              (unless
+                  (and (= source-size target-size)
+                       (epi-ledger--same-file-object-p
+                        source-identity target-identity)
+                       (= 2 (plist-get source-identity :links))
+                       (= 2 (plist-get target-identity :links)))
+                (path-fail)))
+             (t (content-fail)))
+            (puthash hash row row-table)
+            (push row union-rows)))
+        (setq union-rows (nreverse union-rows))
+        (dotimes (index (length references))
+          (let* ((reference (aref references index))
+                 (hash (epi-ledger--object-value reference "hash"))
+                 (size (epi-ledger--object-value reference "size"))
+                 (row (gethash hash row-table)))
+            (unless (and row (= size (nth 3 row)))
+              (content-fail)))))
+      (setq union-relatives
+            (sort
+             (delete-dups
+              (append
+               (directory-relatives source-census owned-source)
+               (directory-relatives target-census owned-target)))
+             #'string<)
+            final-shape
+            (directory-shape owned-target union-relatives union-hashes))
+      ;; Hash the complete admitted union before the first mutation.
+      (dolist (row union-rows)
+        (let* ((leaf (or (nth 2 row) (nth 1 row)))
+               (identity
+                (epi-ledger--recovery-evidence-leaf-raw-identity leaf)))
+          (verify-content
+           (plist-get identity :path) identity (nth 3 row) (nth 0 row)
+           (plist-get identity :links))))
+      (rawly
+       (lambda ()
+         (close-census
+          owned-source source-census source-parent owned-source-parent)
+         (close-census
+          owned-target target-census target-parent owned-target-parent)))
+      (setq source-directory-table (directory-table source-census)
+            target-directory-table (directory-table target-census))
+      ;; Reserve only the missing union directories, in canonical top-down
+      ;; order.  A partial successful prefix is valid restart evidence.
+      (dolist (relative union-relatives)
+        (let ((path
+               (if (string-empty-p relative)
+                   owned-target
+                 (expand-file-name
+                  relative (file-name-as-directory owned-target)))))
+          (unless (gethash path target-directory-table)
+            (let* ((parent
+                    (directory-file-name (file-name-directory path)))
+                   (top-parent-p (equal parent target-parent))
+                   (parent-identity
+                    (if top-parent-p
+                        owned-target-parent
+                      (gethash parent target-directory-table)))
+                   (before
+                    (and parent-identity
+                         (epi-ledger--recovery-require-bound-directory-raw
+                          parent parent-identity owned-device
+                          (and (not top-parent-p) #o700)))))
+              (unless before (path-fail))
+              (let ((receipt
+                     (epi-ledger--recovery-reserve-publication-directory
+                      path owned-device)))
+                (puthash path receipt target-directory-table)
+                (let ((after
+                       (epi-ledger--recovery-require-bound-directory-raw
+                        parent before owned-device
+                        (and (not top-parent-p) #o700))))
+                  (if top-parent-p
+                      (setq owned-target-parent after)
+                    (puthash parent after target-directory-table))))))))
+      (let ((target-initial-hashes
+             (mapcar
+              #'car
+              (seq-filter (lambda (row) (nth 2 row)) union-rows))))
+        (rawly
+         (lambda ()
+           (close-directory-shape
+            (directory-shape
+             owned-target union-relatives target-initial-hashes)
+            target-directory-table target-parent owned-target-parent)
+           (close-census
+            owned-source source-census source-parent owned-source-parent)
+           (dolist (leaf (census-leaves target-census))
+             (let* ((identity
+                     (epi-ledger--recovery-evidence-leaf-raw-identity leaf))
+                    (size
+                     (epi-ledger--recovery-evidence-leaf-raw-size leaf)))
+               (unless
+                   (equal
+                    identity
+                    (epi-ledger--recovery-require-private-file-state-raw
+                     (plist-get identity :path) identity size
+                     'recovery-object-content-changed t
+                     (plist-get identity :links)))
+                 (content-fail)))))))
+      ;; Delegate every row with an available source-prefix authority to the
+      ;; committed Wave 6a.1 state machine.  A truly missing source prefix is
+      ;; legal only for an already target-only row and requires no mutation.
+      (dolist (row union-rows)
+        (let* ((hash (nth 0 row))
+               (source-leaf (nth 1 row))
+               (target-leaf (nth 2 row))
+               (size (nth 3 row))
+               (source
+                (epi-ledger--recovery-object-path-under-root
+                 owned-source hash))
+               (target
+                (epi-ledger--recovery-object-path-under-root
+                 owned-target hash))
+               (source-leaf-parent
+                (directory-file-name (file-name-directory source)))
+               (target-leaf-parent
+                (directory-file-name (file-name-directory target)))
+               (source-parent-receipt
+                (gethash source-leaf-parent source-directory-table))
+               (target-parent-receipt
+                (gethash target-leaf-parent target-directory-table))
+               moved)
+          (unless target-parent-receipt (content-fail))
+          (if source-parent-receipt
+              (setq moved
+                    (epi-ledger--recovery-converge-file-move
+                     source target owned-device
+                     source-parent-receipt target-parent-receipt
+                     (lambda (path identity links)
+                       (verify-content path identity size hash links))))
+            (unless (and (null source-leaf) target-leaf)
+              (content-fail)))
+          (when moved
+            (let ((authority
+                   (epi-ledger--recovery-evidence-leaf-raw-identity
+                    (or target-leaf source-leaf))))
+              (unless
+                  (and (equal target (plist-get moved :path))
+                       (epi-ledger--same-file-object-p authority moved)
+                       (= size (or (plist-get moved :size) -1))
+                       (= 1 (or (plist-get moved :links) -1))
+                       (= #o600
+                          (epi-ledger--recovery-raw-mode target)))
+                (content-fail))))))
+      ;; Independently observe and hash the complete settled target.  The
+      ;; returned proof is built from this observation, never from intent.
+      (let ((final-target-census
+             (let ((post-gc-hook nil))
+               (capture-root
+                owned-target target-parent owned-target-parent))))
+        (unless final-target-census (content-fail))
+        (let ((records (census-directories final-target-census))
+              (leaves (census-leaves final-target-census)))
+          (unless
+              (and
+               (equal (mapcar #'car final-shape)
+                      (mapcar (lambda (record) (nth 0 record)) records))
+               (equal (mapcar #'cdr final-shape)
+                      (mapcar (lambda (record) (nth 2 record)) records))
+               (equal
+                union-hashes
+                (mapcar
+                 #'epi-ledger--recovery-evidence-leaf-raw-hash leaves)))
+            (content-fail))
+          (dolist (record records)
+            (let ((authority
+                   (gethash (nth 0 record) target-directory-table)))
+              (unless
+                  (and authority
+                       (epi-ledger--recovery-same-directory-object-p
+                        (nth 0 record) authority (nth 1 record)))
+                (content-fail))))
+          (cl-mapc
+           (lambda (row leaf)
+             (let* ((identity
+                     (epi-ledger--recovery-evidence-leaf-raw-identity leaf))
+                    (authority-leaf (or (nth 2 row) (nth 1 row)))
+                    (authority
+                     (epi-ledger--recovery-evidence-leaf-raw-identity
+                      authority-leaf)))
+               (unless
+                   (and (= (nth 3 row)
+                           (epi-ledger--recovery-evidence-leaf-raw-size leaf))
+                        (= 1 (plist-get identity :links))
+                        (epi-ledger--same-file-object-p authority identity))
+                 (content-fail))
+               (verify-content
+                (plist-get identity :path) identity (nth 3 row) (nth 0 row)
+                1)))
+           union-rows leaves))
+        (rawly
+         (lambda ()
+           (close-census
+            owned-target final-target-census
+            target-parent owned-target-parent)))
+        (setq target-proof (proof-from-census final-target-census))
+        (rawly
+         (lambda ()
+           (epi-ledger--recovery-require-source-object-proof-raw
+            target-proof owned-device))))
+      ;; Before pruning, prove that the source contains only its captured
+      ;; directory objects and no remaining leaves or debris.
+      (if source-census
+          (rawly
+           (lambda ()
+             (close-directory-shape
+              (directory-shape
+               owned-source
+               (directory-relatives source-census owned-source)
+               nil)
+              source-directory-table source-parent owned-source-parent)))
+        (rawly
+         (lambda ()
+           (close-absence
+            owned-source source-parent owned-source-parent))))
+      (dolist
+          (record (reverse (copy-sequence
+                            (census-directories source-census))))
+        (let* ((path (nth 0 record))
+               (authority (gethash path source-directory-table))
+               (actual
+                (epi-ledger--recovery-require-bound-directory-raw
+                 path authority owned-device #o700)))
+          (epi-ledger--recovery-require-directory-entries-raw path nil)
+          (epi-ledger--recovery-delete-exact-empty-directory path actual)
+          (epi-ledger--recovery-require-bound-directory-raw
+           target-parent owned-target-parent owned-device)
+          (epi-ledger--recovery-require-bound-directory-raw
+           source-parent owned-source-parent owned-device)))
+      (rawly
+       (lambda ()
+         (close-absence owned-source source-parent owned-source-parent)
+         (epi-ledger--recovery-require-source-object-proof-raw
+          target-proof owned-device)
+         (epi-ledger--recovery-require-bound-directory-raw
+          target-parent owned-target-parent owned-device)
+         (epi-ledger--recovery-require-bound-directory-raw
+          source-parent owned-source-parent owned-device)))
+      target-proof))
+
 (defun epi-ledger--recovery-require-empty-directory-raw
     (path identity device)
   "Raw-require exact private directory PATH as empty IDENTITY on DEVICE."
