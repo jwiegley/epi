@@ -706,3 +706,45 @@ Task 6 progress facts:
   continue the committed order: mixed union, inert refusal table, empty topology
   and pruning, target-only repeat, followed by the remaining Wave 6a.2
   hardening. Run `fess` only after a genuinely completed subtask.
+
+## Halt checkpoint refresh — 2026-07-23 17:04 PDT
+
+- The user invoked `command-halt` during Wave 6a.2 hardening. All three
+  read-only workers were interrupted immediately. The codec/JCS process had
+  already completed 342/342 with the independent goldens current. The
+  ledger-I/O process was interrupted after 272/505 passing tests with no
+  reported failure. That prefix is diagnostic only and the complete
+  ledger-I/O suite must restart from zero.
+- The in-flight evidence-tree work is now durable at
+  `114ebbf7ea7c3d0879ab6b7a4fe0b03494f17c9a`
+  (`Harden evidence-tree convergence`). It repairs the local `cl-labels`
+  closure, removes the whole-census `inhibit-quit` binding, and adds the
+  mixed-union, inert-invalid-union, empty-topology/pruning, inert target-only
+  repeat, invalid-metadata, empty-root/sha, and cooperative-exit ERTs. Together
+  with the committed source-only ERT, the exact tree-converger selector passes
+  8/8.
+- The exact checkpoint also passes warning-as-error compilation, Checkdoc over
+  the three production files, and preflight 26/26. The codec/JCS run began
+  before the final one-line quit-policy correction was loaded, so it is useful
+  regression evidence but not an exact-tip completion gate. No complete
+  exact-tip ledger-I/O result exists at this stop.
+- Wave 6a.2 is **not complete**. Resume test-first with the still-missing
+  hardening cases: noncanonical/overlapping/wrong-device root authority;
+  parent or root replacement during verification before mutation; exact
+  propagation of `quit` and `epi-limit-exceeded`; Wave 6a.1
+  `storage-publication-failed :published t` propagation without pruning; and a
+  foreign source entry injected before bottom-up pruning that survives a
+  nonrecursive refusal. Then rerun the entire tree-converger selector, the
+  Wave 6a.1 and evidence-proof adjacency selectors, the frozen recovery
+  selector, and all complete repository gates.
+- The interrupted cooperative-exit reviewer left an advisory artifact at
+  `/var/tmp/wg-epi-wave6a2-hardening/exit-gc/report.md`. Its actionable
+  production finding was the broad quit mask, which is fixed and covered by
+  the 8/8 selector. Its unimplemented restart-error cases are enumerated in the
+  preceding bullet so the resume path does not depend on `/var/tmp`. The other
+  two interrupted workers produced no report and made no shared-worktree edit.
+- Continue only in this linked worktree, never on `main`. Keep Task 15's actual
+  process deaths, exhaustive schedules, counters, scale, and performance work
+  out of Wave 6a.2. Run `fess` at the end of every genuinely completed resumed
+  subtask. The refreshed comprehensive scope report remains at
+  `/Users/johnw/dl/20260723T1551-EPI-PHASE1-HALT-REMAINING-SCOPE.md`.
