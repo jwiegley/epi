@@ -19604,7 +19604,7 @@ Return a fresh settled evidence proof rooted at TARGET-ROOT."
                              (expand-file-name
                               hash (file-name-as-directory prefix-path))
                              hash)
-                            leaves)))))))
+                            leaves))))))
                  (setq result
                        (list (nreverse directories)
                              (nreverse leaves)))))
@@ -19681,8 +19681,7 @@ Return a fresh settled evidence proof rooted at TARGET-ROOT."
              relatives)))
          (rawly
           (function)
-          (let ((inhibit-quit t)
-                (file-name-handler-alist nil)
+          (let ((file-name-handler-alist nil)
                 (post-gc-hook nil)
                 (epi--yield-function #'ignore)
                 (epi--deadline-clock-function #'float-time)
@@ -20116,7 +20115,7 @@ Return a fresh settled evidence proof rooted at TARGET-ROOT."
           target-parent owned-target-parent owned-device)
          (epi-ledger--recovery-require-bound-directory-raw
           source-parent owned-source-parent owned-device)))
-      target-proof))
+      target-proof)))
 
 (defun epi-ledger--recovery-require-empty-directory-raw
     (path identity device)

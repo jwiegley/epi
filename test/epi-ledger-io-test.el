@@ -24358,6 +24358,613 @@ TOPOLOGY defaults to `objects'.  The empty variants are `empty-root',
             (epi-test-ledger-io--literal-file-bytes target-path))))))))
 
 (ert-deftest
+    epi-ledger-recovery-converge-evidence-tree-converges-mixed-union ()
+  "Resume admits the complete source/target union and retains unreachable evidence."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--tree-transfer-fixture root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (device (plist-get case :device))
+           (items (plist-get case :items))
+           (references (epi-test-wave6--reachable-references items))
+           (source-files (plist-get case :source-files))
+           (source-only (caar source-files))
+           (source-only-hash (file-name-nondirectory source-only))
+           (target-only-source (car (cadr source-files)))
+           (target-only-hash (file-name-nondirectory target-only-source))
+           (target-only
+            (epi-ledger--recovery-object-path-under-root
+             target target-only-hash))
+           (target-sha
+            (expand-file-name "sha256" (file-name-as-directory target)))
+           (target-only-prefix
+            (directory-file-name (file-name-directory target-only)))
+           (unreachable-bytes
+            (encode-coding-string
+             "wave6-unreachable-evidence" 'utf-8-unix))
+           (unreachable-hash (secure-hash 'sha256 unreachable-bytes))
+           (unreachable-source
+            (epi-ledger--recovery-object-path-under-root
+             source unreachable-hash))
+           (unreachable-target
+            (epi-ledger--recovery-object-path-under-root
+             target unreachable-hash))
+           (unreachable-source-prefix
+            (directory-file-name (file-name-directory unreachable-source)))
+           (unreachable-target-prefix
+            (directory-file-name (file-name-directory unreachable-target))))
+      (dolist (path (list target target-sha target-only-prefix))
+        (unless (file-directory-p path)
+          (make-directory path nil))
+        (set-file-modes path #o700))
+      (add-name-to-file target-only-source target-only nil)
+      (delete-file target-only-source)
+      (dolist (path (list unreachable-source-prefix
+                          unreachable-target-prefix))
+        (unless (file-directory-p path)
+          (make-directory path nil))
+        (set-file-modes path #o700))
+      (epi-ledger--write-bytes
+       unreachable-source unreachable-bytes 'exclusive-create t)
+      (set-file-modes unreachable-source #o600)
+      (add-name-to-file unreachable-source unreachable-target nil)
+      (let* ((expected
+              (mapcar
+               (lambda (entry)
+                 (let ((path (cdr entry)))
+                   (list
+                    :hash (car entry)
+                    :identity (epi-ledger--raw-object-name-state path)
+                    :size
+                    (plist-get
+                     (epi-ledger--raw-object-name-state path) :size)
+                    :bytes
+                    (epi-test-ledger-io--literal-file-bytes path))))
+               (list (cons source-only-hash source-only)
+                     (cons target-only-hash target-only)
+                     (cons unreachable-hash unreachable-source))))
+             (real-converger
+              (symbol-function
+               'epi-ledger--recovery-converge-file-move))
+             (real-link-move
+              (symbol-function 'epi-ledger--recovery-link-move-file))
+             inside-file-converger converger-sources result)
+        (cl-letf
+            (((symbol-function
+               'epi-ledger--recovery-converge-file-move)
+              (lambda (from to &rest arguments)
+                (push from converger-sources)
+                (let ((previous inside-file-converger))
+                  (setq inside-file-converger t)
+                  (unwind-protect
+                      (apply real-converger from to arguments)
+                    (setq inside-file-converger previous)))))
+             ((symbol-function 'epi-ledger--recovery-link-move-file)
+              (lambda (&rest arguments)
+                (unless inside-file-converger
+                  (ert-fail
+                   (format
+                    "Tree converger called the old link mover directly: %S"
+                    arguments)))
+                (apply real-link-move arguments))))
+          (setq result
+                (epi-ledger--recovery-converge-evidence-tree
+                 source target device
+                 (epi-test-wave6--file-parent-identity source)
+                 (epi-test-wave6--file-parent-identity target)
+                 references)))
+        (let ((target-only-calls
+               (cl-count target-only-source converger-sources
+                         :test #'equal)))
+          (should
+           (= 1 (cl-count source-only converger-sources :test #'equal)))
+          (should
+           (= 1
+              (cl-count unreachable-source converger-sources
+                        :test #'equal)))
+          (should (memq target-only-calls '(0 1)))
+          (should (= (+ 2 target-only-calls)
+                     (length converger-sources))))
+        (should (epi-ledger--recovery-evidence-proof-p result))
+        (should
+         (equal target
+                (epi-ledger--recovery-evidence-proof-raw-root result)))
+        (should
+         (equal device
+                (epi-ledger--recovery-evidence-proof-raw-device result)))
+        (should
+         (= 3 (epi-ledger--recovery-evidence-proof-raw-count result)))
+        (should
+         (epi-ledger--recovery-require-source-object-proof-raw
+          result device))
+        (let ((proof-hashes
+               (cl-loop
+                for chunk in
+                (epi-ledger--recovery-evidence-proof-raw-chunks result)
+                append
+                (cl-loop
+                 for leaf across chunk
+                 collect
+                 (epi-ledger--recovery-evidence-leaf-raw-hash leaf)))))
+          (should
+           (equal proof-hashes
+                  (sort
+                   (list source-only-hash target-only-hash unreachable-hash)
+                   #'string<))))
+        (should-not (file-exists-p source))
+        (dolist (entry expected)
+          (let* ((hash (plist-get entry :hash))
+                 (path
+                  (epi-ledger--recovery-object-path-under-root target hash))
+                 (identity (epi-ledger--raw-object-name-state path)))
+            (should (listp identity))
+            (should
+             (epi-ledger--same-file-object-p
+              (plist-get entry :identity) identity))
+            (should (= (plist-get entry :size)
+                       (plist-get identity :size)))
+            (should (= 1 (plist-get identity :links)))
+            (should (= #o600 (epi-ledger--recovery-raw-mode path)))
+            (should
+             (equal (plist-get entry :bytes)
+                    (epi-test-ledger-io--literal-file-bytes path)))))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-evidence-tree-rejects-invalid-union-inertly
+    ()
+  "Reject incomplete, dirty, or inode-ambiguous unions before mutation."
+  (dolist (shape '(missing-reachable late-target-debris
+                   distinct-inode-dual))
+    (epi-test-with-temporary-root (root)
+      (let* ((case (epi-test-wave5--tree-transfer-fixture root))
+             (source (plist-get case :source))
+             (target (plist-get case :target))
+             (device (plist-get case :device))
+             (references
+              (epi-test-wave6--reachable-references
+               (plist-get case :items)))
+             (source-files (plist-get case :source-files)))
+        (pcase shape
+          ('missing-reachable
+           (delete-file (caar source-files)))
+          ('late-target-debris
+           (make-directory target nil)
+           (set-file-modes target #o700)
+           (let ((debris (expand-file-name "foreign" target)))
+             (epi-ledger--write-bytes
+              debris (string-as-unibyte "foreign") 'exclusive-create t)
+             (set-file-modes debris #o600)))
+          ('distinct-inode-dual
+           (let* ((source-path (caar source-files))
+                  (hash (file-name-nondirectory source-path))
+                  (target-path
+                   (epi-ledger--recovery-object-path-under-root target hash))
+                  (target-sha
+                   (expand-file-name
+                    "sha256" (file-name-as-directory target)))
+                  (target-prefix
+                   (directory-file-name
+                    (file-name-directory target-path))))
+             (dolist (path (list target target-sha target-prefix))
+               (unless (file-directory-p path)
+                 (make-directory path nil))
+               (set-file-modes path #o700))
+             (epi-ledger--write-bytes
+              target-path
+              (epi-test-ledger-io--literal-file-bytes source-path)
+              'exclusive-create t)
+             (set-file-modes target-path #o600))))
+        (let* ((source-parent-identity
+                (epi-test-wave6--file-parent-identity source))
+               (target-parent-identity
+                (epi-test-wave6--file-parent-identity target))
+               (before
+                (epi-test-ledger-io--recovery-tree-snapshot root))
+               (expected-code
+                (if (eq shape 'distinct-inode-dual)
+                    'recovery-path-conflict
+                  'recovery-object-content-changed))
+               (forbidden
+                (lambda (&rest arguments)
+                  (ert-fail
+                   (format
+                    "Invalid union %S reached mutation: %S"
+                    shape arguments))))
+               condition)
+          (setq condition
+                (cl-letf
+                    (((symbol-function 'make-directory) forbidden)
+                     ((symbol-function 'add-name-to-file) forbidden)
+                     ((symbol-function 'delete-file) forbidden)
+                     ((symbol-function 'delete-directory) forbidden)
+                     ((symbol-function 'rename-file) forbidden)
+                     ((symbol-function 'copy-file) forbidden)
+                     ((symbol-function 'write-region) forbidden)
+                     ((symbol-function 'set-file-modes) forbidden))
+                  (should-error
+                   (epi-ledger--recovery-converge-evidence-tree
+                    source target device
+                    source-parent-identity target-parent-identity
+                    references)
+                   :type 'epi-ledger-conflict)))
+          (ert-info ((format "invalid union: %S" shape))
+            (should
+             (eq expected-code
+                 (epi-test-ledger-io--condition-code condition)))
+            (should
+             (equal before
+                    (epi-test-ledger-io--recovery-tree-snapshot root)))))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-evidence-tree-preserves-empty-topology-and-prunes
+    ()
+  "Resume retains empty union topology and prunes only owned source directories."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--tree-transfer-fixture root 'empty-prefix))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (device (plist-get case :device))
+           (target-sha
+            (expand-file-name "sha256" (file-name-as-directory target)))
+           (target-ab
+            (expand-file-name "ab" (file-name-as-directory target-sha)))
+           (target-cd
+            (expand-file-name "cd" (file-name-as-directory target-sha)))
+           (source-directories (plist-get case :source-directories))
+           (expected-delete-order
+            (reverse (mapcar #'car source-directories)))
+           (expected-target-directories
+            (list target target-sha target-ab target-cd)))
+      (dolist (path (list target target-sha target-cd))
+        (make-directory path nil)
+        (set-file-modes path #o700))
+      (let* ((source-parent-identity
+              (epi-test-wave6--file-parent-identity source))
+             (target-parent-identity
+              (epi-test-wave6--file-parent-identity target))
+             (shared-parent (plist-get source-parent-identity :path))
+             (shared-parent-before
+              (epi-ledger--recovery-raw-directory-stat shared-parent))
+             (real-delete (symbol-function 'delete-directory))
+             deleted result)
+        (cl-letf
+            (((symbol-function 'delete-directory)
+              (lambda (path &optional recursive trash)
+                (let* ((owned (directory-file-name path))
+                       (expected (cdr (assoc owned source-directories)))
+                       (actual
+                        (epi-ledger--recovery-raw-directory-stat owned)))
+                  (should expected)
+                  (should-not (equal owned shared-parent))
+                  (should-not recursive)
+                  (should-not
+                   (epi-ledger--recovery-raw-directory-entry-names
+                    owned 0))
+                  (should
+                   (epi-ledger--recovery-same-directory-object-p
+                    owned expected actual))
+                  (setq deleted (append deleted (list owned)))
+                  (funcall real-delete path recursive trash)))))
+          (setq result
+                (epi-ledger--recovery-converge-evidence-tree
+                 source target device
+                 source-parent-identity target-parent-identity [])))
+        (should (equal expected-delete-order deleted))
+        (should (epi-ledger--recovery-evidence-proof-p result))
+        (should
+         (equal target
+                (epi-ledger--recovery-evidence-proof-raw-root result)))
+        (should
+         (= 0 (epi-ledger--recovery-evidence-proof-raw-count result)))
+        (should
+         (equal
+          expected-target-directories
+          (mapcar
+           #'car
+           (epi-ledger--recovery-evidence-proof-raw-directories result))))
+        (should
+         (epi-ledger--recovery-require-source-object-proof-raw
+          result device))
+        (should-not (file-exists-p source))
+        (dolist (path expected-target-directories)
+          (should (file-directory-p path))
+          (should (= #o700 (epi-ledger--recovery-raw-mode path))))
+        (should
+         (epi-ledger--recovery-same-directory-object-p
+          shared-parent shared-parent-before
+          (epi-ledger--recovery-raw-directory-stat shared-parent)))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-evidence-tree-repeats-target-only-inertly ()
+  "A completed target-only tree re-entry is proof- and byte-exactly inert."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--tree-transfer-fixture root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (device (plist-get case :device))
+           (items (plist-get case :items))
+           (references (epi-test-wave6--reachable-references items))
+           (first
+            (epi-ledger--recovery-converge-evidence-tree
+             source target device
+             (epi-test-wave6--file-parent-identity source)
+             (epi-test-wave6--file-parent-identity target)
+             references))
+           (before
+            (epi-test-ledger-io--recovery-tree-snapshot root))
+           (source-parent-identity
+            (epi-test-wave6--file-parent-identity source))
+           (target-parent-identity
+            (epi-test-wave6--file-parent-identity target))
+           (forbidden
+            (lambda (&rest arguments)
+              (ert-fail
+               (format
+                "Repeated target-only tree reached mutation: %S"
+                arguments))))
+           second)
+      (setq second
+            (cl-letf
+                (((symbol-function 'make-directory) forbidden)
+                 ((symbol-function 'add-name-to-file) forbidden)
+                 ((symbol-function 'delete-file) forbidden)
+                 ((symbol-function 'delete-directory) forbidden)
+                 ((symbol-function 'rename-file) forbidden)
+                 ((symbol-function 'copy-file) forbidden)
+                 ((symbol-function 'write-region) forbidden)
+                 ((symbol-function 'set-file-modes) forbidden))
+              (epi-ledger--recovery-converge-evidence-tree
+               source target device
+               source-parent-identity target-parent-identity
+               references)))
+      (should (equal first second))
+      (should (epi-ledger--recovery-evidence-proof-p second))
+      (should
+       (equal target
+              (epi-ledger--recovery-evidence-proof-raw-root second)))
+      (should
+       (equal device
+              (epi-ledger--recovery-evidence-proof-raw-device second)))
+      (should
+       (= (length items)
+          (epi-ledger--recovery-evidence-proof-raw-count second)))
+      (should
+       (epi-ledger--recovery-require-source-object-proof-raw
+        second device))
+      (should
+       (equal before
+              (epi-test-ledger-io--recovery-tree-snapshot root)))
+      (should-not (file-exists-p source))
+      (dotimes (index (length items))
+        (let* ((hash (plist-get (aref items index) :hash))
+               (path
+                (epi-ledger--recovery-object-path-under-root target hash))
+               (identity (epi-ledger--raw-object-name-state path)))
+          (should (listp identity))
+          (should (= 1 (plist-get identity :links)))
+          (should (= #o600 (epi-ledger--recovery-raw-mode path))))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-evidence-tree-rejects-invalid-metadata-inertly
+    ()
+  "Reject invalid modes, links, and names before entering mutation."
+  (dolist (shape '(leaf-mode root-mode prefix-mode source-extra-link
+                   target-extra-link dual-third-link malformed-prefix
+                   malformed-hash foreign-symlink))
+    (epi-test-with-temporary-root (root)
+      (let* ((case (epi-test-wave5--tree-transfer-fixture root))
+             (source (plist-get case :source))
+             (target (plist-get case :target))
+             (device (plist-get case :device))
+             (references
+              (epi-test-wave6--reachable-references
+               (plist-get case :items)))
+             (source-path (caar (plist-get case :source-files)))
+             (hash (file-name-nondirectory source-path))
+             (source-prefix
+              (directory-file-name (file-name-directory source-path)))
+             (target-path
+              (epi-ledger--recovery-object-path-under-root target hash))
+             (target-sha
+              (expand-file-name "sha256" (file-name-as-directory target)))
+             (target-prefix
+              (directory-file-name (file-name-directory target-path)))
+             (third (expand-file-name (format "third-%s" shape) root)))
+        (cl-labels
+            ((make-target-prefix
+              ()
+              (dolist (path (list target target-sha target-prefix))
+                (unless (file-directory-p path)
+                  (make-directory path nil))
+                (set-file-modes path #o700))))
+          (pcase shape
+            ('leaf-mode (set-file-modes source-path #o640))
+            ('root-mode (set-file-modes source #o750))
+            ('prefix-mode (set-file-modes source-prefix #o750))
+            ('source-extra-link
+             (add-name-to-file source-path third nil))
+            ('target-extra-link
+             (make-target-prefix)
+             (add-name-to-file source-path target-path nil)
+             (delete-file source-path)
+             (add-name-to-file target-path third nil))
+            ('dual-third-link
+             (make-target-prefix)
+             (add-name-to-file source-path target-path nil)
+             (add-name-to-file source-path third nil))
+            ('malformed-prefix
+             (rename-file
+              source-prefix
+              (expand-file-name
+               "zz" (file-name-directory source-prefix)) nil))
+            ('malformed-hash
+             (rename-file
+              source-path
+              (expand-file-name
+               "not-a-hash" (file-name-as-directory source-prefix)) nil))
+            ('foreign-symlink
+             (make-symbolic-link
+              source-path (expand-file-name "foreign" source) nil)))
+          (let* ((source-parent-identity
+                  (epi-test-wave6--file-parent-identity source))
+                 (target-parent-identity
+                  (epi-test-wave6--file-parent-identity target))
+                 (before
+                  (epi-test-ledger-io--recovery-tree-snapshot root))
+                 (expected-code
+                  (if (memq shape
+                            '(malformed-prefix malformed-hash foreign-symlink))
+                      'recovery-object-content-changed
+                    'recovery-path-conflict))
+                 (forbidden
+                  (lambda (&rest arguments)
+                    (ert-fail
+                     (format
+                      "Invalid metadata %S reached mutation: %S"
+                      shape arguments))))
+                 condition)
+            (setq condition
+                  (cl-letf
+                      (((symbol-function 'make-directory) forbidden)
+                       ((symbol-function 'add-name-to-file) forbidden)
+                       ((symbol-function 'delete-file) forbidden)
+                       ((symbol-function 'delete-directory) forbidden)
+                       ((symbol-function 'rename-file) forbidden)
+                       ((symbol-function 'copy-file) forbidden)
+                       ((symbol-function 'write-region) forbidden)
+                       ((symbol-function 'set-file-modes) forbidden))
+                    (should-error
+                     (epi-ledger--recovery-converge-evidence-tree
+                      source target device
+                      source-parent-identity target-parent-identity
+                      references)
+                     :type 'epi-ledger-conflict)))
+            (ert-info ((format "invalid metadata: %S" shape))
+              (should
+               (eq expected-code
+                   (epi-test-ledger-io--condition-code condition)))
+              (should
+               (equal before
+                      (epi-test-ledger-io--recovery-tree-snapshot root))))))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-evidence-tree-preserves-empty-root-and-sha
+    ()
+  "Converge empty root-only and root-plus-sha topologies exactly."
+  (dolist (topology '(empty-root empty-sha))
+    (epi-test-with-temporary-root (root)
+      (let* ((case (epi-test-wave5--tree-transfer-fixture root topology))
+             (source (plist-get case :source))
+             (target (plist-get case :target))
+             (device (plist-get case :device))
+             (expected-directories
+              (mapcar
+               (lambda (entry)
+                 (epi-ledger--recovery-rebase-object-tree-path
+                  (car entry) source target))
+               (plist-get case :source-shape)))
+             (result
+              (epi-ledger--recovery-converge-evidence-tree
+               source target device
+               (epi-test-wave6--file-parent-identity source)
+               (epi-test-wave6--file-parent-identity target) [])))
+        (ert-info ((format "empty topology: %S" topology))
+          (should (epi-ledger--recovery-evidence-proof-p result))
+          (should
+           (equal target
+                  (epi-ledger--recovery-evidence-proof-raw-root result)))
+          (should
+           (= 0 (epi-ledger--recovery-evidence-proof-raw-count result)))
+          (should
+           (equal
+            expected-directories
+            (mapcar
+             #'car
+             (epi-ledger--recovery-evidence-proof-raw-directories result))))
+          (should
+           (epi-ledger--recovery-require-source-object-proof-raw
+            result device))
+          (should-not (file-exists-p source))
+          (dolist (path expected-directories)
+            (should (file-directory-p path))
+            (should (= #o700 (epi-ledger--recovery-raw-mode path)))))))))
+
+(ert-deftest
+    epi-ledger-recovery-converge-evidence-tree-walks-cooperatively-and-quittably
+    ()
+  "Keep content walks cooperative and whole-tree metadata closure quittable."
+  (epi-test-with-temporary-root (root)
+    (let* ((case (epi-test-wave5--tree-transfer-fixture root))
+           (source (plist-get case :source))
+           (target (plist-get case :target))
+           (device (plist-get case :device))
+           (references
+            (epi-test-wave6--reachable-references
+             (plist-get case :items)))
+           (real-read-state
+            (symbol-function 'epi-ledger--object-read-verified-state))
+           (real-entries
+            (symbol-function
+             'epi-ledger--recovery-require-directory-entries-raw))
+           read-observations raw-observations active-read
+           (yields 0)
+           (gcs 0)
+           (hook-runs 0))
+      (let ((gc-cons-threshold 12345)
+            (post-gc-hook
+             (list
+              (lambda ()
+                (when active-read
+                  (setq hook-runs (1+ hook-runs))))))
+            (epi-ledger-work-byte-limit 1)
+            (epi-ledger-work-time-budget 1000.0)
+            (epi--yield-function
+             (lambda ()
+               (setq yields (1+ yields))
+               (when (and active-read (= gcs 0))
+                 (setq gcs (1+ gcs))
+                 (garbage-collect)))))
+        (cl-letf
+            (((symbol-function 'epi-ledger--object-read-verified-state)
+              (lambda (&rest arguments)
+                (push
+                 (list gc-cons-threshold post-gc-hook inhibit-quit)
+                 read-observations)
+                (let ((previous active-read))
+                  (setq active-read t)
+                  (unwind-protect
+                      (apply real-read-state arguments)
+                    (setq active-read previous)))))
+             ((symbol-function
+               'epi-ledger--recovery-require-directory-entries-raw)
+              (lambda (&rest arguments)
+                (when (eq epi--yield-function #'ignore)
+                  (push
+                   (list gc-cons-threshold post-gc-hook inhibit-quit)
+                   raw-observations))
+                (apply real-entries arguments))))
+          (should
+           (epi-ledger--recovery-evidence-proof-p
+            (epi-ledger--recovery-converge-evidence-tree
+             source target device
+             (epi-test-wave6--file-parent-identity source)
+             (epi-test-wave6--file-parent-identity target)
+             references)))))
+      (should (> yields 0))
+      (should (> gcs 0))
+      (should (= 0 hook-runs))
+      (should read-observations)
+      (dolist (observation read-observations)
+        (should (= 12345 (nth 0 observation)))
+        (should-not (nth 1 observation))
+        (should-not (nth 2 observation)))
+      (should raw-observations)
+      (dolist (observation raw-observations)
+        (should (= 12345 (nth 0 observation)))
+        (should-not (nth 1 observation))
+        (should-not (nth 2 observation))))))
+
+(ert-deftest
     epi-ledger-recovery-tree-transfer-requires-exact-linked-object-verifier-return
     ()
   "Object publication rejects a forged semantic-verifier receipt exactly."
